@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DeepScope</title>
+  <link rel="stylesheet" href="./panel.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand"><span class="dot"></span><strong>DeepScope</strong><span id="scopeLabel" class="scope">scope: —</span></div>
+    <div id="membar" class="membar" title="Live RAM accounting (session only, never persisted)">
+      <div class="mem-numbers"><span id="memText">0 MB / 256 MB</span><span id="memDetail" class="muted"></span></div>
+      <div class="mem-track"><div id="memFill" class="mem-fill"></div></div>
+    </div>
+    <div class="top-actions">
+      <button id="btnTheme" title="Toggle light / dark theme">◐ Light</button>
+      <button id="btnPause" title="Pause/resume capture">Pause</button>
+      <button id="btnDeep" class="primary" title="Start bounded same-origin Deep Scan">Deep Scan</button>
+      <button id="btnClear" title="Clear current session (RAM only)">Clear</button>
+    </div>
+  </header>
+  <div id="budgetWarn" class="warn hidden"></div>
+  <nav id="tabs" role="tablist">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="search" class="">Search</button>
+    <button data-tab="routes">Routes <span id="cRoutes" class="pill">0</span></button>
+    <button data-tab="resources">Resources <span id="cRes" class="pill">0</span></button>
+    <button data-tab="network">Network <span id="cNet" class="pill">0</span></button>
+    <button data-tab="graph">Graph</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <main>
+    <section id="tab-overview" class="tab active">
+      <div id="statGrid" class="stat-grid"></div>
+      <div class="cols">
+        <div class="card"><h3>Session</h3><div id="sessionInfo" class="mono small"></div>
+          <div class="row"><button id="btnRecapture">Recapture / reload</button><button id="btnReindex">Reindex</button><button id="btnMemClean">Memory cleanup</button><button id="btnExport">Export JSON</button></div>
+          <p class="muted small">RAM-only: everything below lives in this panel's memory and is destroyed when DevTools closes. Export only happens when you click it.</p>
+        </div>
+        <div class="card"><h3>Diagnostics</h3><div id="diagList" class="diag"></div></div>
+      </div>
+    </section>
+    <section id="tab-search" class="tab">
+      <div class="search-row">
+        <input id="q" type="text" placeholder="Universal fuzzy search — try gpt-6 …" autocomplete="off" spellcheck="false" />
+        <select id="mode" title="Search mode">
+          <option value="fuzzy" selected>fuzzy</option>
+          <option value="normalized">normalized</option>
+          <option value="substring">substring</option>
+          <option value="exact">exact</option>
+          <option value="regex">regex</option>
+        </select>
+        <button id="btnSearch" class="primary">Search</button>
+      </div>
+      <div id="scopeRow" class="scope-row"></div>
+      <div id="resultMeta" class="muted small"></div>
+      <div id="results" class="results"></div>
+    </section>
+    <section id="tab-routes" class="tab">
+      <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small"></span></div>
+      <div id="routeTree" class="mono small"></div>
+    </section>
+    <section id="tab-resources" class="tab">
+      <div class="row">
+        <input id="resFilter" placeholder="filter resources…" />
+        <select id="resType" title="Filter by resource type (built live from what was captured)"><option value="ALL">all types</option></select>
+      </div>
+      <div class="row">
+        <button id="btnResCopyUrls" title="Copy filtered resource URLs (up to 1000 lines)">Copy URLs</button>
+        <button id="btnResCopyAll" title="Copy filtered URLs + metadata + contents preview (bounded)">Copy URLs + contents</button>
+        <span id="resCount" class="muted small"></span>
+      </div>
+      <div class="table-wrap"><table id="resTable"><thead><tr><th>URL</th><th>Type</th><th>Status</th><th>Size</th><th>Route</th><th>Via</th><th>Map</th><th>Indexed</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+    </section>
+    <section id="tab-network" class="tab">
+      <div class="row">
+        <select id="netMethod" title="Filter by HTTP method (built live from observed traffic)">
+          <option value="ALL" selected>all methods</option>
+        </select>
+        <select id="netKind" title="Filter by content type (built live from observed traffic)"><option value="ALL">all types</option></select>
+        <input id="netFilter" type="text" placeholder="filter url / mime…" />
+      </div>
+      <div class="row">
+        <button id="btnNetCopyUrls" title="Copy filtered request URLs (up to 1000 lines)">Copy URLs</button>
+        <button id="btnNetCopyAll" title="Copy filtered URLs + metadata + bodies preview (bounded)">Copy URLs + contents</button>
+        <span id="netCount" class="muted small"></span>
+      </div>
+      <div class="table-wrap"><table id="netTable"><thead><tr><th>Method</th><th>URL</th><th>Status</th><th>MIME</th><th>Route</th><th>Body</th><th>Note</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+    </section>
+    <section id="tab-graph" class="tab">
+      <p class="muted small" style="max-width:760px">The discovery graph is the <b>provenance map</b>: every node is a route, resource, JS chunk, API endpoint or frame, and every edge records <b>how it was found</b> (dom-link, dynamic-import, sourcemap-ref, deep-scan…). Use case: pick a search hit, then trace its chain here — e.g. <span class="mono">route /models → chunk assets/x.js → endpoint /api/models</span> — to see exactly which file and discovery step exposed a string, and what else that file pulled in.</p>
+      <div class="row"><span id="graphStats" class="muted small"></span><button id="btnGraphClear">Clear graph</button></div>
+      <div id="graphList" class="mono small graph"></div>
+    </section>
+    <section id="tab-settings" class="tab">
+      <div class="cols">
+        <div class="card"><h3>Memory budget</h3><div id="budgetRow" class="row"></div>
+          <label>Max response bytes <input id="setMaxResp" type="number" min="1024" step="1024" /></label>
+          <label>Max indexed chars / resource <input id="setMaxIdx" type="number" min="1024" step="1000" /></label>
+          <label>Max resources <input id="setMaxRes" type="number" min="10" step="10" /></label>
+          <label><input id="setRetainRaw" type="checkbox" /> retain raw response bodies</label>
+          <label><input id="setSrcMap" type="checkbox" /> analyze source maps</label>
+          <label><input id="setAdvJs" type="checkbox" /> advanced JS analysis</label>
+          <label><input id="setBinMeta" type="checkbox" /> catalog binary/media/font metadata</label>
+          <label>On budget <select id="setOnBudget"><option value="discard-oldest-raw">discard oldest raw</option><option value="stop-capture">stop capture</option><option value="stop-deep-analysis">stop deep analysis</option></select></label>
+        </div>
+        <div class="card"><h3>Capture toggles</h3><div id="capRow" class="checks"></div>
+          <h3>Deep Scan</h3><div id="deepRow" class="checks"></div>
+          <label>Max depth <input id="setDepth" type="number" min="0" max="5" /></label>
+          <label>Max pages <input id="setPages" type="number" min="1" max="200" /></label>
+          <label>Per-page request cap <input id="setPerPage" type="number" min="1" max="200" /></label>
+          <div class="row"><button id="btnDeep2">Start Deep Scan</button><button id="btnDeepStop">Stop</button></div>
+          <div id="deepStatus" class="mono small"></div>
+        </div>
+        <div class="card"><h3>Permissions &amp; privacy</h3>
+          <div id="permInfo" class="small"></div>
+          <div class="row"><button id="btnGrant">Grant site access</button><button id="btnDebugger">Enable Deep Capture (CDP)</button></div>
+          <p class="muted small">Deep Capture via chrome.debugger is strictly opt-in and announces a debugging banner in the tab. Base capture uses devtools.network + page-context eval and needs no extra grants.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+  <div id="viewer" class="viewer hidden" role="dialog" aria-label="Resource content preview">
+    <div class="viewer-card">
+      <div class="viewer-head"><strong id="viewerTitle" class="mono">preview</strong>
+        <span class="viewer-actions"><button id="viewerOpen" title="Open this URL">Open ↗</button><button id="viewerCopy" title="Copy shown content">Copy</button><button id="viewerClose" title="Close preview">Close</button><button id="viewerX" title="Close preview (Esc)">✕</button></span>
+      </div>
+      <div id="viewerMeta" class="muted small mono"></div>
+      <pre id="viewerBody" class="viewer-body mono"></pre>
+    </div>
+  </div>
+  <script type="module" src="./dist/panel.js"></script>
+</body>
+</html>

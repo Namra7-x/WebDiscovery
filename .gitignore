@@ -1,0 +1,11 @@
+# Dev-only tooling — never part of the extension payload.
+node_modules/
+# Generated build output (rebuilt via `npm run build`).
+dist/
+# Clean loadable payload (rebuilt via `node scripts/package.mjs`).
+# Load unpacked in Edge/Chrome from release/deepscope/, never the repo root.
+release/
+# OS / editor noise.
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "DeepScope — Web App Discovery & Fuzzy Search",
+  "version": "1.3.0",
+  "description": "RAM-only, developer-focused discovery and universal fuzzy search across DOM, JS, CSS, network, routes and source maps. No backend, no persistence.",
+  "minimum_chrome_version": "116",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "DeepScope",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "scripting", "webNavigation", "webRequest", "storage"],
+  "optional_permissions": ["debugger"],
+  "optional_host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "devtools_page": "devtools.html",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}
