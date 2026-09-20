@@ -6,8 +6,7 @@
 
 ## v1.3.0 — 2026-09-20 (Resources/Network URL flexibility + dynamic filters)
 
-### Hotfix (same day): preview modal couldn't be dismissed
-- Root cause: CSS specificity — `.viewer { display:flex }` is defined AFTER `.hidden { display:none }` with equal specificity, so the hide rule never won. The overlay stayed on screen and Close appeared dead.
+### Hotfix (same day): preview modal couldn't be dismissed- Root cause: CSS specificity — `.viewer { display:flex }` is defined AFTER `.hidden { display:none }` with equal specificity, so the hide rule never won. The overlay stayed on screen and Close appeared dead.
 - Fix: `panel.css` `.viewer.hidden { display:none; }` (0,2,0 beats 0,1,0); added explicit `✕` button (`#viewerX`); all dismiss paths (Close / ✕ / backdrop / Esc) funnel through one `closeViewer()` helper; viewer wiring moved to the TOP of `wire()` via null-safe `on()` helper so a stale `panel.html` can never half-attach listeners and kill dismissal; `clearSession()` now closes the modal too. Rebuilt + repackaged (`release/deepscope/` ≈ 154.5 KB).
 
 ### What changed
@@ -88,3 +87,9 @@
 1. `edge://extensions` → Developer mode → DeepScope card → Reload ⟳ (point it at `release/deepscope/` once; Resolved from v1.2 packaging fix)
 2. Reload inspected site tab → F12 → DeepScope panel
 3. Re-select folder only if extension was removed or folder moved.
+
+---
+
+## GitHub — pushed 2026-09-20
+- Remote `origin` = `https://github.com/Namra7-x/WebDiscovery.git` (was empty; pushed `master` → `25110bc`, 36 files, source only — `node_modules/`, `dist/`, `release/` gitignored and rebuilt via `npm install` + `npm run build` + `node scripts/package.mjs`).
+- README made GitHub-ready: clone URL, project structure map, consistent ~0.15 MB payload note.
