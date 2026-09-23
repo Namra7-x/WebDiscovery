@@ -60,10 +60,10 @@
       <div id="results" class="results"></div>
     </section>
     <section id="tab-routes" class="tab">
-      <p class="muted small">Every route seen on this origin. Filter the list, then Open a route or Copy URLs to export.</p>
+      <p class="muted small">Every route seen on this origin. <b>Seen ×N</b> = times observed this session. Filter the list, then Open a route or Copy URLs to export.</p>
       <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small"></span></div>
       <div class="row"><input id="routeFilter" type="text" placeholder="filter routes…" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><span id="routeCount" class="muted small"></span></div>
-      <div id="routeTree" class="mono small"></div>
+      <div class="table-wrap"><table id="routeTable"><thead><tr><th>Route</th><th title="How many times this route was seen this session">Seen</th><th>Via</th><th>Actions</th></tr></thead><tbody id="routeBody"></tbody></table></div>
     </section>
     <section id="tab-resources" class="tab">
       <p class="muted small">Every captured file. Click a URL to open it, View to preview contents.</p>

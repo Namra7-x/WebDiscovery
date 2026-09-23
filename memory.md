@@ -4,6 +4,13 @@
 
 ---
 
+## v1.4.1 — 2026-09-23 (table row fixes: ellipsis URLs, aligned Routes)
+
+- **Resources/Network URL cells**: single-line with `…` ellipsis (`max-width` + `nowrap` + `text-overflow`), full URL kept in hover tooltip — rows no longer grow vertically. Applies to both tables.
+- **Routes tab rebuilt as a real table**: Route | Seen | Via | Actions columns; hierarchy indent via cell padding (no more ragged `&nbsp;`); `×N` ("Seen") = times that route was observed this session, now explained in the tab header; full URL in link + tooltip; Open/Copy per row kept via existing delegation. Removed now-unused `routeDisplay()`.
+- Verified: tsc clean, `verify.mjs` 21/21, manifest check clean, `release/deepscope/` ≈ 194KB.
+- Plus (from user screenshots): W3C XML namespaces (`/1999/xhtml`, `/2000/svg`, `/1998/Math/MathML`) rejected in `looksLikeRoutePath()` — they polluted Routes on real sites (seen on arena.ai). Screenshots kept out of the repo.
+
 ## v1.4.0 — 2026-09-23 (64MB default + universal discovery batch + Analyze panel)
 
 Built by 3 parallel subagents with strict file ownership (A: extractors.ts · B: rules.ts/tables.ts/verify/check-manifest · C: content.ts/panel.ts/panel.html/panel.css), contracts fixed up-front in types.ts, integrated + verified by lead. No file overlaps, no conflicts.

@@ -85,6 +85,7 @@ export function looksLikeRoutePath(s: string): boolean {
   if (!GENERIC_PATH_RE.test(s)) return false;
   if (!/[A-Za-z]/.test(s)) return false; // need at least one letter (skip "/123")
   if (/^\/[0-9.,;:\s]+$/.test(s)) return false;
+  if (/^\/(19\d{2}|2000)\//.test(s)) return false; // W3C XML namespaces (e.g. /1999/xhtml), not routes
   return true;
 }
 

@@ -245,4 +245,12 @@ ok('secrets scan', () => {
   assert.equal(isPlaceholder('test-key-xxx'), true);
 });
 
+// 21. v1.4.1: W3C XML namespaces are not routes.
+ok('namespace paths rejected', () => {
+  assert.equal(classifyPath('/1999/xhtml'), null);
+  assert.equal(classifyPath('/2000/svg'), null);
+  assert.equal(classifyPath('/1998/Math/MathML'), null);
+  assert.equal(classifyPath('/dashboard/settings'), 'route'); // real routes unaffected
+});
+
 console.log(`\n${pass} checks passed.`);

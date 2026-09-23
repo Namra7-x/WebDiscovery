@@ -812,11 +812,6 @@ function routeFullUrl(r: string): string {
   return `${sessionOrigin}/${r.replace(/^\/*/, '')}`;
 }
 
-function routeDisplay(r: string): string {
-  const full = routeFullUrl(r);
-  return full.length > 110 ? `…${full.slice(-109)}` : full;
-}
-
 function filteredRoutes(): Array<[string, { method: DiscoveryMethod; count: number }]> {
   const f = ((document.getElementById('routeFilter') as HTMLInputElement | null)?.value ?? '').toLowerCase();
   const out: Array<[string, { method: DiscoveryMethod; count: number }]> = [];
@@ -830,19 +825,19 @@ function filteredRoutes(): Array<[string, { method: DiscoveryMethod; count: numb
 }
 
 function renderRoutes(): void {
-  // Hierarchical indent by path segments; each row links the full URL and
-  // reuses tableClick('route') for Open/Copy delegation.
+  // Aligned table: one row per route, indent via padding (not &nbsp;), full
+  // URL in link + tooltip, ×count in its own column. Reuses tableClick('route').
   const all = filteredRoutes();
   const rows = all.slice(0, 300);
-  $('routeTree').innerHTML = rows.map(([r, v]) => {
-    const depth = r.split('/').filter(Boolean).length;
+  ($('routeBody') as HTMLElement).innerHTML = rows.map(([r, v]) => {
+    const depth = Math.min(r.split('/').filter(Boolean).length, 8);
     const full = routeFullUrl(r);
-    const indent = '&nbsp;'.repeat(Math.min(depth, 8) * 3);
-    return `<div>${indent}├ <a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(routeDisplay(r))}</a> `
-      + `<span class="muted">×${v.count}</span> <span class="badge kind">${esc(v.method)}</span> `
-      + `<button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
-      + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></div>`;
-  }).join('') || '<span class="muted">no routes yet — browse the page or run Deep Scan</span>';
+    return `<tr><td class="rt"><span style="display:inline-block;padding-left:${depth * 14}px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;" title="${esc(full)}"><a href="#" data-act="open" data-url="${esc(full)}">${esc(r)}</a></span></td>`
+      + `<td class="num" title="Times seen this session">×${v.count}</td>`
+      + `<td><span class="badge kind">${esc(v.method)}</span></td>`
+      + `<td class="acts"><button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
+      + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted">no routes yet — browse the page or run Deep Scan</td></tr>';
   const rc = document.getElementById('routeCount');
   if (rc) rc.textContent = `${all.length} shown${routes.size > all.length ? ` of ${routes.size}` : ''}`;
 }
@@ -1264,7 +1259,7 @@ function wire(): void {
   $('btnDiscoverRoutes').addEventListener('click', () => void discoverRoutesNow());
   on('routeFilter', 'input', () => renderRoutes());
   on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
-  on('routeTree', 'click', (e) => tableClick(e, 'route'));
+  on('routeBody', 'click', (e) => tableClick(e, 'route'));
   on('btnSecCopy', 'click', () => void copySecFindings());
   on('secList', 'click', secClick);
   $('btnTheme').addEventListener('click', () => {
@@ -1325,7 +1320,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.4.0', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.4.1', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],

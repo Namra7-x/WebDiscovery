@@ -42,8 +42,12 @@ select,input[type=number],input[type=text] { background:#0d1017; border:1px soli
 .prov { color:var(--mut); font-size:11px; word-break:break-all; }
 .table-wrap { overflow:auto; max-height:60vh; border:1px solid var(--line); border-radius:8px; }
 table { width:100%; border-collapse:collapse; font-size:11px; } th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; } th { position:sticky; top:0; background:var(--panel); color:var(--mut); }
-td.url { word-break:break-all; font-family:Consolas,monospace; }
-td.url a { color:var(--acc); text-decoration:none; } td.url a:hover { text-decoration:underline; }
+td.url { font-family:Consolas,monospace; max-width:380px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+td.url a { color:var(--acc); text-decoration:none; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
+td.url a:hover { text-decoration:underline; }
+td.rt { font-family:Consolas,monospace; max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+td.rt a { color:var(--acc); text-decoration:none; } td.rt a:hover { text-decoration:underline; }
+td.num { font-variant-numeric:tabular-nums; white-space:nowrap; }
 td.acts { white-space:nowrap; } td.acts button { font-size:10px; padding:2px 7px; margin-right:4px; }
 .checks { display:grid; grid-template-columns:1fr 1fr; gap:4px; } .checks label { display:flex; gap:6px; align-items:center; }
 .graph { display:flex; flex-direction:column; gap:3px; max-height:60vh; overflow:auto; }
