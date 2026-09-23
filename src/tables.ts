@@ -2,6 +2,8 @@
 // so they stay tiny, testable, and cheap to call on every render.
 // Dynamic filters are derived from LIVE data (never a hardcoded type list).
 
+import type { Severity } from './types.js';
+
 export type CountRow = { value: string; count: number };
 
 /** Count occurrences of a derived key in one pass. Returns sorted desc rows. */
@@ -67,4 +69,31 @@ function escapeHtml(s: string): string {
 
 function escapeAttr(s: string): string {
   return escapeHtml(s).replace(/`/g, '&#96;');
+}
+
+/** Build a `curl -X METHOD 'url'` command with `-H 'K: V'` per header. */
+export function buildCurl(method: string, url: string, headers?: Record<string, string>): string {
+  const m = (method || 'GET').toUpperCase();
+  const esc = (s: string): string => s.replace(/'/g, "'\\''");
+  let out = `curl -X ${m} '${esc(url)}'`;
+  if (headers) {
+    let n = 0;
+    for (const k of Object.keys(headers)) {
+      if (n >= 20) break;
+      const v = String(headers[k] ?? '').slice(0, 500);
+      out += ` -H '${esc(k + ': ' + v)}'`;
+      n++;
+    }
+  }
+  return out;
+}
+
+/** Rank severities for sorting: critical 0, high 1, medium 2, info 3. */
+export function severityRank(s: Severity): number {
+  switch (s) {
+    case 'critical': return 0;
+    case 'high': return 1;
+    case 'medium': return 2;
+    case 'info': return 3;
+  }
 }

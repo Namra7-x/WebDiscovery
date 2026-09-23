@@ -7,6 +7,8 @@
 // RAM stays flat. Line numbers are rebased per chunk.
 
 import { extractCss, extractHtml, extractJs, extractJsAdvanced, extractJson, lineStarts, offsetToLineCol } from './extractors.js';
+import { scanTextForSecrets } from './rules.js';
+import type { Severity } from './types.js';
 
 interface IndexRequest {
   type: 'index-text';
@@ -17,9 +19,10 @@ interface IndexRequest {
   mime: string;
   kind: string;
   advancedJs: boolean;
+  scanSecrets: boolean;
 }
 
-interface Unit { text: string; line: number; column: number; kind: string; extra?: string }
+interface Unit { text: string; line: number; column: number; kind: string; extra?: string; sec?: { rule: string; sev: Severity; label: string } }
 
 const ctx = globalThis as unknown as {
   onmessage: ((ev: MessageEvent<IndexRequest>) => void) | null;
@@ -51,23 +54,36 @@ function computeUnits(m: IndexRequest): Unit[] {
   const isJson = kind === 'api-json' || /json/.test(mime);
   const isHtml = kind === 'document' || kind === 'dom' || /html/.test(mime);
 
-  if (isJson) return extractJson(text).map(toUnit);
-  if (isCss) return extractCss(text).map(toUnit);
-  if (isHtml) return extractHtml(text, url).units.map(toUnit);
-  if (isJs) {
-    if (text.length > STREAM_THRESHOLD) return extractJsStreamed(text, advancedJs);
-    const base = extractJs(text);
-    const extra = advancedJs ? extractJsAdvanced(text) : [];
-    return base.concat(extra).map(toUnit);
+  let units: Unit[];
+  if (isJson) units = extractJson(text).map(toUnit);
+  else if (isCss) units = extractCss(text).map(toUnit);
+  else if (isHtml) units = extractHtml(text, url).units.map(toUnit);
+  else if (isJs) {
+    if (text.length > STREAM_THRESHOLD) units = extractJsStreamed(text, advancedJs);
+    else {
+      const base = extractJs(text);
+      const extra = advancedJs ? extractJsAdvanced(text) : [];
+      units = base.concat(extra).map(toUnit);
+    }
+  } else {
+    // Generic text: line-chunked units (also streamed for huge blobs)
+    units = [];
+    const lines = text.length > STREAM_THRESHOLD ? text.slice(0, STREAM_THRESHOLD).split('\n') : text.split('\n');
+    for (let i = 0; i < lines.length && units.length < 2000; i++) {
+      const ln = lines[i].trim();
+      if (ln.length >= 3 && ln.length <= 320) units.push({ text: ln.slice(0, 320), line: i + 1, column: 1, kind: 'text-line' });
+    }
   }
-  // Generic text: line-chunked units (also streamed for huge blobs)
-  const out: Unit[] = [];
-  const lines = text.length > STREAM_THRESHOLD ? text.slice(0, STREAM_THRESHOLD).split('\n') : text.split('\n');
-  for (let i = 0; i < lines.length && out.length < 2000; i++) {
-    const ln = lines[i].trim();
-    if (ln.length >= 3 && ln.length <= 320) out.push({ text: ln.slice(0, 320), line: i + 1, column: 1, kind: 'text-line' });
+  // Secret/rule scan off the UI thread: first hit only, attached for the
+  // panel's Analyze tab. Bounded (scanTextForSecrets caps hits + length).
+  if (m.scanSecrets) {
+    for (const u of units) {
+      if (u.sec) continue;
+      const hits = scanTextForSecrets(u.text, 1);
+      if (hits.length) u.sec = { rule: hits[0].rule, sev: hits[0].sev, label: hits[0].label };
+    }
   }
-  return out;
+  return units;
 }
 
 /** Streamed JS extraction: overlapping windows, line numbers rebased, deduped. */

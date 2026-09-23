@@ -14,6 +14,7 @@ interface DomBatch {
   iframes: Array<{ src: string }>;
   routes: string[];
   manifest?: string | null;
+  manifests: string[];
   chunks: string[];
   apis: string[];
   textSample: string;
@@ -78,6 +79,57 @@ function scanJsStrings(): { chunks: string[]; apis: string[] } {
   return { chunks: chunks.slice(0, 80), apis: apis.slice(0, 80) };
 }
 
+/** Next.js build/ssg manifests: script srcs whose filename contains
+ *  'buildmanifest' or 'ssgmanifest' (case-insensitive, absolute URLs, cap 8). */
+function collectManifests(): string[] {
+  const out: string[] = [];
+  try {
+    document.querySelectorAll?.('script[src]').forEach((el) => {
+      if (out.length >= 8) return;
+      const s = (el as HTMLScriptElement).src;
+      if (!s) return;
+      const low = s.toLowerCase();
+      if (low.includes('buildmanifest') || low.includes('ssgmanifest')) {
+        try {
+          const abs = new URL(s, location.href).toString();
+          if (abs.length < 600) out.push(abs);
+        } catch { /* ignore */ }
+      }
+    });
+  } catch { /* ignore */ }
+  return out.slice(0, 8);
+}
+
+/** Importmap blocks: JSON.parse tolerant, take .imports values that are
+ *  http(s) or start with '/' → resolve via new URL(v, location.href) (cap 20). */
+function collectImportmapLinks(): string[] {
+  const out: string[] = [];
+  try {
+    document.querySelectorAll?.('script[type="importmap"]').forEach((el) => {
+      if (out.length >= 20) return;
+      const raw = el.textContent ?? '';
+      if (!raw.trim()) return;
+      let parsed: { imports?: unknown };
+      try { parsed = JSON.parse(raw.slice(0, 20000)); } catch { return; }
+      const imports = (parsed as { imports?: Record<string, unknown> })?.imports;
+      if (!imports || typeof imports !== 'object') return;
+      for (const v of Object.values(imports)) {
+        if (out.length >= 20) break;
+        if (typeof v !== 'string') continue;
+        const t = v.trim();
+        if (!t) continue;
+        if (/^https?:\/\//i.test(t) || t.startsWith('/')) {
+          try {
+            const abs = new URL(t, location.href).toString();
+            if (abs.length < 600) out.push(abs);
+          } catch { /* ignore */ }
+        }
+      }
+    });
+  } catch { /* ignore */ }
+  return out.slice(0, 20);
+}
+
 function snapshot(reason: string): void {
   try {
     const out = { links: [] as string[], scripts: [] as string[], iframes: [] as Array<{ src: string }>, routes: [] as string[] };
@@ -88,15 +140,17 @@ function snapshot(reason: string): void {
       if (i < 40) forms.push(`${(f as HTMLFormElement).action || location.href} [${(f as HTMLFormElement).method || 'get'}]`);
     });
     const manifest = document.querySelector('link[rel="manifest"]')?.getAttribute('href') ?? null;
+    const manifests = collectManifests();
+    const importmapLinks = collectImportmapLinks();
     const textSample = (document.body?.innerText ?? '').slice(0, 4000);
     const batch: DomBatch = {
       type: 'content-batch', url: location.href, route: routeOf(),
       htmlLen: document.documentElement?.outerHTML?.length ?? 0,
-      links: [...new Set(out.links)].slice(0, 300),
+      links: [...new Set([...out.links, ...importmapLinks])].slice(0, 300),
       scripts: [...new Set(out.scripts)].slice(0, 120),
       forms, iframes: out.iframes.slice(0, 40),
       routes: [...new Set(out.routes)].slice(0, 200),
-      manifest, chunks: [...new Set(chunks)], apis: [...new Set(apis)],
+      manifest, manifests, chunks: [...new Set(chunks)], apis: [...new Set(apis)],
       textSample, ts: Date.now(),
     };
     try {

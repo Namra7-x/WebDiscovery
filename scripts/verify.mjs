@@ -6,7 +6,8 @@ import { fuzzyScore, fuzzyMatch } from '../dist/fuzzy.js';
 import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
-import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts } from '../dist/tables.js';
+import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank } from '../dist/tables.js';
+import { SECRET_RULES, scanTextForSecrets, isPlaceholder } from '../dist/rules.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { defaultScope } from '../dist/types.js';
 
@@ -178,6 +179,70 @@ ok('tables helpers (dynamic filters)', () => {
   const o2 = optionsHtml([{ value: 'script', count: 3 }], 'ALL', 'all types');
   assert.notEqual(o1.sig, o2.sig); // sig changes -> dropdown refreshes
   assert.ok(o1.html.includes('script (2)'));
+});
+
+// 14. graphql-op facets.
+ok('graphql-op facets', () => {
+  const src = 'const q=`query GetUser($id:ID!){user(id:$id){name}}`; const m="mutation Checkout{}"; const x={"sha256Hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}';
+  const units = extractJs(src);
+  const extras = units.map((u) => u.extra);
+  assert.ok(units.some((u) => u.kind === 'graphql-op' && u.extra === 'graphql:query:GetUser'), JSON.stringify(extras));
+  assert.ok(units.some((u) => u.kind === 'graphql-op' && u.extra === 'graphql:mutation:Checkout'), JSON.stringify(extras));
+  assert.ok(extras.includes('graphql:persisted:01234567'), JSON.stringify(extras));
+});
+
+// 15. baseURL join.
+ok('baseURL join', () => {
+  const units = extractJs('const api=axios.create({baseURL:"https://api.x.test/v1"}); api.get("/users");');
+  const hit = units.find((u) => u.kind === 'endpoint' && u.text === 'https://api.x.test/v1/users');
+  assert.ok(hit && typeof hit.extra === 'string' && hit.extra.startsWith('via-base:'), JSON.stringify(units.map((u) => [u.kind, u.text, u.extra])));
+});
+
+// 16. param facets.
+ok('param facets', () => {
+  const units = extractJs('fetch("/api/s?redirect=/x&debug=1")');
+  const kinds = units.filter((u) => u.kind === 'param').map((u) => u.text);
+  assert.ok(kinds.includes('redirect'), JSON.stringify(kinds));
+  assert.ok(kinds.includes('debug'), JSON.stringify(kinds));
+});
+
+// 17. importmap/meta.
+ok('importmap/meta', () => {
+  const res = extractHtml('<script type="importmap">{"imports":{"react":"https://cdn.test/react.js"}}</script><meta name="csrf-token" content="ABC"><input name="email">', 'https://s.test/');
+  assert.ok(res.importmap && res.importmap.some((u) => String(u).includes('https://cdn.test/react.js')), JSON.stringify(res.importmap));
+  const kinds = new Set(res.units.map((u) => u.kind));
+  assert.ok(kinds.has('meta-tag'), JSON.stringify([...kinds]));
+  assert.ok(kinds.has('form-input'), JSON.stringify([...kinds]));
+});
+
+// 18. trpc facets.
+ok('trpc facets', () => {
+  const units = extractJs('fetch("/api/trpc/user.byId?batch=1&input={\\"0\\":{\\"json\\":1}}")');
+  const hasProc0 = units.some((u) => u.kind === 'trpc-proc' && u.text === '0');
+  const hasTrpcEndpoint = units.some((u) => u.kind === 'endpoint' && u.text.includes('trpc'));
+  assert.ok(hasProc0 || hasTrpcEndpoint, JSON.stringify(units.map((u) => [u.kind, u.text, u.extra])));
+});
+
+// 19. buildCurl + severityRank.
+ok('buildCurl + severityRank', () => {
+  const c = buildCurl('post', 'https://x.test/a', { 'X-A': "b'b" });
+  assert.ok(c.includes('curl -X POST'), c);
+  assert.ok(c.includes("'\\''"), c);
+  assert.ok(severityRank('critical') < severityRank('high') && severityRank('high') < severityRank('medium') && severityRank('medium') < severityRank('info'), 'order');
+});
+
+// 20. secrets scan.
+ok('secrets scan', () => {
+  assert.ok(SECRET_RULES.length >= 35 && SECRET_RULES.length <= 50, `rules=${SECRET_RULES.length}`);
+  assert.ok(SECRET_RULES.every((r) => !r.pattern.global), 'patterns non-global');
+  const aws = scanTextForSecrets('aws_key = "AKIAIOSFODNN7EXAMPLEX"');
+  assert.ok(aws.length >= 1 && aws[0].rule.includes('aws'), JSON.stringify(aws));
+  assert.deepEqual(scanTextForSecrets('example-key-xxx'), []);
+  assert.deepEqual(scanTextForSecrets('test'), []);
+  const jwt = scanTextForSecrets('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c');
+  assert.ok(jwt.length >= 1 && jwt[0].rule === 'jwt', JSON.stringify(jwt));
+  assert.equal(isPlaceholder('AKIAIOSFODNN7EXAMPLEX'), false);
+  assert.equal(isPlaceholder('test-key-xxx'), true);
 });
 
 console.log(`\n${pass} checks passed.`);

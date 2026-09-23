@@ -96,7 +96,6 @@ no CDN, no bundler, no framework.
    follows JS-discovered routes/endpoints/chunks too).
 
 ## Resources / Network flexibility
-
 - Every URL is a **clickable link** (Sources-panel jump when possible, new tab otherwise).
 - Per-row **Open / Copy / View**: copy a single URL or preview its content (retained
   body first, on-demand same-origin fetch otherwise, 20 KB truncation; binary and
@@ -106,6 +105,17 @@ no CDN, no bundler, no framework.
 - **Dynamic filters**: resource-kind, request-method, and content-type dropdowns are
   built live from captured traffic with counts — never a fixed list. Renders stay
   capped (300/250 rows) with `shown X of Y` counters.
+
+## Analyze (security / exposure)
+
+- New **Analyze tab**: 41-pattern secret engine (cloud keys, tokens, JWT, private
+  keys, connection strings) with placeholder/false-positive guards, severity
+  grouped critical → info with plain-language blurbs, Open/Copy per finding.
+- Detection runs in the worker at ingest; findings reference indexed records
+  (no text duplication, ~32B each). Toggle via Settings → scan for exposed secrets.
+- Universal discovery behind it: GraphQL operations, axios baseURL joining,
+  query-param facets, import maps, framework manifests, tRPC/gRPC, meta/form
+  inputs, copy-as-cURL, and a rebuilt Routes tab (full links + Open/Copy).
 
 ## Project structure
 

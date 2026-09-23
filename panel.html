@@ -27,6 +27,7 @@
     <button data-tab="routes">Routes <span id="cRoutes" class="pill">0</span></button>
     <button data-tab="resources">Resources <span id="cRes" class="pill">0</span></button>
     <button data-tab="network">Network <span id="cNet" class="pill">0</span></button>
+    <button data-tab="analyze">Analyze <span id="cAnalyze" class="pill">0</span></button>
     <button data-tab="graph">Graph</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -42,6 +43,7 @@
       </div>
     </section>
     <section id="tab-search" class="tab">
+      <p class="muted small">Search everything captured in RAM. Type to fuzzy-match strings across JS, JSON, DOM and headers.</p>
       <div class="search-row">
         <input id="q" type="text" placeholder="Universal fuzzy search — try gpt-6 …" autocomplete="off" spellcheck="false" />
         <select id="mode" title="Search mode">
@@ -58,10 +60,13 @@
       <div id="results" class="results"></div>
     </section>
     <section id="tab-routes" class="tab">
+      <p class="muted small">Every route seen on this origin. Filter the list, then Open a route or Copy URLs to export.</p>
       <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small"></span></div>
+      <div class="row"><input id="routeFilter" type="text" placeholder="filter routes…" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><span id="routeCount" class="muted small"></span></div>
       <div id="routeTree" class="mono small"></div>
     </section>
     <section id="tab-resources" class="tab">
+      <p class="muted small">Every captured file. Click a URL to open it, View to preview contents.</p>
       <div class="row">
         <input id="resFilter" placeholder="filter resources…" />
         <select id="resType" title="Filter by resource type (built live from what was captured)"><option value="ALL">all types</option></select>
@@ -74,6 +79,7 @@
       <div class="table-wrap"><table id="resTable"><thead><tr><th>URL</th><th>Type</th><th>Status</th><th>Size</th><th>Route</th><th>Via</th><th>Map</th><th>Indexed</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
     </section>
     <section id="tab-network" class="tab">
+      <p class="muted small">Every observed request. Filter by method or type, View a body or copy one as cURL.</p>
       <div class="row">
         <select id="netMethod" title="Filter by HTTP method (built live from observed traffic)">
           <option value="ALL" selected>all methods</option>
@@ -87,6 +93,11 @@
         <span id="netCount" class="muted small"></span>
       </div>
       <div class="table-wrap"><table id="netTable"><thead><tr><th>Method</th><th>URL</th><th>Status</th><th>MIME</th><th>Route</th><th>Body</th><th>Note</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+    </section>
+    <section id="tab-analyze" class="tab">
+      <p class="muted small">Possible secrets found in captured text, grouped by severity — critical means likely live credentials, high sensitive tokens, medium review-worthy, info low-risk context. All analysis stays local in this panel's RAM.</p>
+      <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><span id="secCount" class="muted small"></span></div>
+      <div id="secList" class="results"></div>
     </section>
     <section id="tab-graph" class="tab">
       <p class="muted small" style="max-width:760px">The discovery graph is the <b>provenance map</b>: every node is a route, resource, JS chunk, API endpoint or frame, and every edge records <b>how it was found</b> (dom-link, dynamic-import, sourcemap-ref, deep-scan…). Use case: pick a search hit, then trace its chain here — e.g. <span class="mono">route /models → chunk assets/x.js → endpoint /api/models</span> — to see exactly which file and discovery step exposed a string, and what else that file pulled in.</p>
@@ -102,6 +113,7 @@
           <label><input id="setRetainRaw" type="checkbox" /> retain raw response bodies</label>
           <label><input id="setSrcMap" type="checkbox" /> analyze source maps</label>
           <label><input id="setAdvJs" type="checkbox" /> advanced JS analysis</label>
+          <label><input id="setSecrets" type="checkbox" /> scan for exposed secrets (Analyze tab)</label>
           <label><input id="setBinMeta" type="checkbox" /> catalog binary/media/font metadata</label>
           <label>On budget <select id="setOnBudget"><option value="discard-oldest-raw">discard oldest raw</option><option value="stop-capture">stop capture</option><option value="stop-deep-analysis">stop deep analysis</option></select></label>
         </div>

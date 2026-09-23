@@ -32,6 +32,10 @@ select,input[type=number],input[type=text] { background:#0d1017; border:1px soli
 .score { background:#12345c; border:1px solid var(--acc); border-radius:8px; padding:0 7px; font-variant-numeric:tabular-nums; }
 .badge { background:#2a3348; border:1px solid var(--line); border-radius:8px; padding:0 7px; font-size:10px; white-space:nowrap; }
 .badge.kind { background:#12345c; border-color:var(--acc); }
+.sev-critical { border-color:var(--bad); }
+.sev-high { border-color:var(--warn); }
+.sev-medium { border-color:var(--acc); }
+.sev-info { border-color:var(--mut); }
 .open { margin-left:auto; font-size:11px; white-space:nowrap; }
 .ctx-line { margin:4px 0; }
 .orig { font-family:Consolas,monospace; word-break:break-all; flex:1; min-width:120px; } .ctx { color:var(--mut); word-break:break-all; } .ctx mark { background:#3d2f07; color:#ffe1a8; border-radius:3px; padding:0 1px; }

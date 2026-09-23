@@ -6,8 +6,9 @@ import { RamIndex } from './indexer.js';
 import { MemoryLedger, formatBytes } from './memory.js';
 import { displayNameFor, searchIndex } from './search.js';
 import { extractHtml, resolveUrl } from './extractors.js';
-import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts } from './tables.js';
-import type { SearchResult } from './types.js';
+import { scanTextForSecrets } from './rules.js';
+import { buildCurl, groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts } from './tables.js';
+import type { SearchResult, Severity, TextRecord } from './types.js';
 import {
   DEFAULT_SETTINGS, defaultScope,
   type DiscoveryMethod, type NetEntry, type ResourceKind, type ResourceMeta,
@@ -32,6 +33,17 @@ const netEntries: NetEntry[] = [];
 const routes = new Map<string, { method: DiscoveryMethod; count: number }>();
 const reqMetaByUrl = new Map<string, { method: string; initiator?: string }>();
 const diags: Array<{ ts: number; note: string; url?: string }> = [];
+// Secret findings (Analyze tab): snapshots of indexed units that arrived with
+// a worker/fallback `sec` hit attached. Bounded; drops counted + diag-once.
+interface SecFinding { text: string; prov: TextRecord['prov']; rule: string; sev: Severity; label: string }
+const secFindings: SecFinding[] = [];
+let secDropped = 0;
+let secDiagOnce = false;
+/** Last rendered Analyze slice (backs Open/Copy buttons by index). */
+const renderedSec: SecFinding[] = [];
+/** Units arriving at commitUnits() / the worker 'units' message. `sec` is the
+ *  first secret hit attached by the worker/fallback via scanTextForSecrets. */
+interface IndexUnit { text: string; line: number; column: number; kind: string; extra?: string; sec?: { rule: string; sev: Severity; label: string } }
 let worker: Worker | null = null;
 let workerSeq = 0;
 const workerPending = new Map<number, { url: string; route: string; kind: ResourceKind; mime: string; prov: Omit<import('./types.js').Provenance, 'resourceUrl' | 'resourceKind' | 'route'> & { method: DiscoveryMethod; initiator?: string; parentUrl?: string; detail?: string } }>();
@@ -80,7 +92,7 @@ function evalInPage<T>(expr: string): Promise<T> {
 function initWorker(): void {
   try {
     worker = new Worker(chrome.runtime.getURL('dist/worker-indexer.js'), { type: 'module' });
-    worker.onmessage = (ev: MessageEvent<{ type: string; id: number; units: Array<{ text: string; line: number; column: number; kind: string; extra?: string }>; error?: string }>) => {
+    worker.onmessage = (ev: MessageEvent<{ type: string; id: number; units: IndexUnit[]; error?: string }>) => {
       const m = ev.data;
       if (!m || m.type !== 'units') return;
       const p = workerPending.get(m.id);
@@ -212,15 +224,23 @@ async function ingestText(
   if (worker) {
     const id = ++workerSeq;
     workerPending.set(id, { url, route, kind, mime, prov });
-    worker.postMessage({ type: 'index-text', id, text: indexedSlice, url, route, mime, kind, advancedJs: settings.advancedJsAnalysis });
+    worker.postMessage({ type: 'index-text', id, text: indexedSlice, url, route, mime, kind, advancedJs: settings.advancedJsAnalysis, scanSecrets: settings.analyzeSecrets });
   } else {
     const { extractCss, extractJs, extractJsAdvanced, extractJson } = await import('./extractors.js');
-    const units = kind === 'api-json' ? extractJson(indexedSlice)
+    const rawUnits = kind === 'api-json' ? extractJson(indexedSlice)
       : (kind === 'script' || kind === 'chunk') ? extractJs(indexedSlice).concat(settings.advancedJsAnalysis ? extractJsAdvanced(indexedSlice) : [])
       : kind === 'stylesheet' ? extractCss(indexedSlice)
       : kind === 'document' || kind === 'dom' ? extractHtml(indexedSlice, url).units
       : extractJson(indexedSlice);
-    commitUnits(url, route, kind, mime, prov, units.map((u) => ({ text: u.text, line: u.line, column: u.column, kind: u.kind, extra: u.extra })));
+    // No-worker fallback: attach the same first-hit `sec` the worker would add.
+    const units: IndexUnit[] = rawUnits.map((u) => ({ text: u.text, line: u.line, column: u.column, kind: u.kind, extra: u.extra }));
+    if (settings.analyzeSecrets) {
+      for (const u of units) {
+        const hits = scanTextForSecrets(u.text, 1);
+        if (hits.length) u.sec = { rule: hits[0].rule, sev: hits[0].sev, label: hits[0].label };
+      }
+    }
+    commitUnits(url, route, kind, mime, prov, units);
   }
 
   // Follow-up discovery: imports / fetch targets / links (bounded, same-origin default)
@@ -230,7 +250,7 @@ async function ingestText(
 function commitUnits(
   url: string, route: string, kind: ResourceKind, mime: string,
   provBase: { method: DiscoveryMethod; initiator?: string; parentUrl?: string; detail?: string; jsonPath?: string },
-  units: Array<{ text: string; line: number; column: number; kind: string; extra?: string }>,
+  units: IndexUnit[],
 ): void {
   let added = 0;
   for (const u of units) {
@@ -243,10 +263,20 @@ function commitUnits(
     };
     // URL-kind units also feed the discovery queue — v1.2 includes the
     // two-pass route/endpoint/asset facets so NOTHING hides in bundles.
-    if ((u.kind === 'url' || u.kind === 'endpoint' || u.kind === 'route' || u.kind === 'asset-ref' || u.kind === 'fetch-target' || u.kind.endsWith('-import') || u.kind === 'dom-link' || u.kind === 'css-reference' || u.kind === 'css-import') && u.text) {
+    if ((u.kind === 'url' || u.kind === 'endpoint' || u.kind === 'route' || u.kind === 'asset-ref' || u.kind === 'fetch-target' || u.kind.endsWith('-import') || u.kind === 'importmap' || u.kind === 'dom-data-url' || u.kind === 'dom-link' || u.kind === 'css-reference' || u.kind === 'css-import') && u.text) {
       considerDiscoveredUrl(url, u.text, route, u.kind);
     }
-    if (index.add(u.text, prov) !== null) added++;
+    if (index.add(u.text, prov) !== null) {
+      added++;
+      if (u.sec) {
+        if (secFindings.length < 2000) {
+          secFindings.push({ text: u.text, prov, rule: u.sec.rule, sev: u.sec.sev, label: u.sec.label });
+        } else {
+          secDropped++;
+          if (!secDiagOnce) { secDiagOnce = true; diag('secret findings cap reached (2000 kept); further hits dropped — use Copy findings promptly'); }
+        }
+      }
+    }
     void mime;
   }
   const meta = resources.get(url);
@@ -299,7 +329,7 @@ function considerDiscoveredUrl(from: string, raw: string, route: string, kind: s
   // Graph edge for provenance
   const isEndpoint = abs.includes('/api/') || kind === 'endpoint' || kind === 'fetch-target';
   graph.addNode(abs, shortLabel(abs), isEndpoint ? 'endpoint' : 'resource', abs);
-  const via: DiscoveryMethod = kind === 'dynamic-import' ? 'dynamic-import' : kind === 'static-import' ? 'static-import'
+  const via: DiscoveryMethod = kind === 'dynamic-import' ? 'dynamic-import' : kind === 'static-import' || kind === 'importmap' ? 'static-import'
     : kind === 'fetch-target' || kind === 'endpoint' ? 'fetch-target' : kind === 'route' ? 'router' : kind === 'dom-link' ? 'dom-link'
     : kind === 'css-reference' || kind === 'css-import' ? 'css-reference' : kind === 'asset-ref' ? 'js-string' : 'js-string';
   graph.link(from, abs, via, kind);
@@ -360,7 +390,7 @@ function connectBackground(): void {
 interface ContentBatch {
   type: string; url: string; route: string; htmlLen: number;
   links: string[]; scripts: string[]; forms: string[]; iframes: Array<{ src: string }>;
-  routes: string[]; manifest?: string | null; chunks: string[]; apis: string[]; textSample: string;
+  routes: string[]; manifest?: string | null; manifests?: string[]; chunks: string[]; apis: string[]; textSample: string;
 }
 
 async function handleContentBatch(b: ContentBatch): Promise<void> {
@@ -385,6 +415,15 @@ async function handleContentBatch(b: ContentBatch): Promise<void> {
   }
   if (b.manifest) {
     const mUrl = resolveUrl(b.url, b.manifest);
+    graph.addNode(mUrl, shortLabel(mUrl), 'resource', mUrl);
+    graph.link(b.url, mUrl, 'manifest-ref');
+    if (settings.capture.dom) void fetchViaPage(mUrl, sessionRoute, 'manifest-ref');
+  }
+  // Next.js build/ssg manifests spotted by the content script (absolute URLs).
+  for (const m of (b.manifests ?? []).slice(0, 8)) {
+    let mUrl = '';
+    try { mUrl = new URL(m, b.url).toString(); } catch { continue; }
+    try { if (new URL(mUrl).origin !== new URL(b.url).origin) continue; } catch { continue; }
     graph.addNode(mUrl, shortLabel(mUrl), 'resource', mUrl);
     graph.link(b.url, mUrl, 'manifest-ref');
     if (settings.capture.dom) void fetchViaPage(mUrl, sessionRoute, 'manifest-ref');
@@ -732,7 +771,7 @@ function scheduleRender(): void {
 }
 
 function renderAll(): void {
-  renderMem(); renderOverview(); renderRoutes(); renderResources(); renderNetwork(); renderGraph();
+  renderMem(); renderOverview(); renderRoutes(); renderResources(); renderNetwork(); renderAnalyze(); renderGraph();
 }
 
 function renderMem(): void {
@@ -763,15 +802,55 @@ function renderDiags(): void {
   $('diagList').innerHTML = diags.slice(0, 40).map((d) => `<div><span class="muted">${new Date(d.ts).toLocaleTimeString()}</span> ${esc(d.note)}${d.url ? `<br/><span class="muted">${esc(shortLabel(d.url))}</span>` : ''}</div>`).join('') || '<span class="muted">no issues</span>';
 }
 
+/** Full URL for a route key: sessionOrigin + route for '/…' routes,
+ *  hash-routes as-is, absolute URLs untouched, relative fallback when origin
+ *  is still unknown. */
+function routeFullUrl(r: string): string {
+  if (/^https?:\/\//i.test(r) || r.startsWith('#')) return r;
+  if (!sessionOrigin) return r;
+  if (r.startsWith('/')) return sessionOrigin + r;
+  return `${sessionOrigin}/${r.replace(/^\/*/, '')}`;
+}
+
+function routeDisplay(r: string): string {
+  const full = routeFullUrl(r);
+  return full.length > 110 ? `…${full.slice(-109)}` : full;
+}
+
+function filteredRoutes(): Array<[string, { method: DiscoveryMethod; count: number }]> {
+  const f = ((document.getElementById('routeFilter') as HTMLInputElement | null)?.value ?? '').toLowerCase();
+  const out: Array<[string, { method: DiscoveryMethod; count: number }]> = [];
+  for (const [r, v] of routes) {
+    if (f && !r.toLowerCase().includes(f)) continue;
+    out.push([r, v]);
+    if (out.length >= 1200) break;
+  }
+  out.sort((a, b) => a[0].localeCompare(b[0]));
+  return out;
+}
+
 function renderRoutes(): void {
-  // Hierarchical tree by path segments
-  const tree = new Map<string, number>();
-  for (const [r, v] of routes) { tree.set(r, v.count); }
-  const sorted = [...tree.entries()].sort((a, b) => a[0].localeCompare(b[0])).slice(0, 300);
-  $('routeTree').innerHTML = sorted.map(([r, c]) => {
+  // Hierarchical indent by path segments; each row links the full URL and
+  // reuses tableClick('route') for Open/Copy delegation.
+  const all = filteredRoutes();
+  const rows = all.slice(0, 300);
+  $('routeTree').innerHTML = rows.map(([r, v]) => {
     const depth = r.split('/').filter(Boolean).length;
-    return `${'&nbsp;'.repeat(depth * 3)}├ ${esc(r)} <span class="muted">×${c} · ${esc(routes.get(r)?.method ?? '')}</span>`;
-  }).join('<br/>') || '<span class="muted">no routes yet — browse the page or run Deep Scan</span>';
+    const full = routeFullUrl(r);
+    const indent = '&nbsp;'.repeat(Math.min(depth, 8) * 3);
+    return `<div>${indent}├ <a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(routeDisplay(r))}</a> `
+      + `<span class="muted">×${v.count}</span> <span class="badge kind">${esc(v.method)}</span> `
+      + `<button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
+      + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></div>`;
+  }).join('') || '<span class="muted">no routes yet — browse the page or run Deep Scan</span>';
+  const rc = document.getElementById('routeCount');
+  if (rc) rc.textContent = `${all.length} shown${routes.size > all.length ? ` of ${routes.size}` : ''}`;
+}
+
+async function copyFilteredRouteUrls(): Promise<void> {
+  const urls = filteredRoutes().slice(0, 1000).map(([r]) => routeFullUrl(r));
+  if (!urls.length) { diag('nothing to copy — route filter matches zero routes'); return; }
+  await copyText(urls.join('\n'), `${urls.length} route URLs`);
 }
 
 function filteredResources(): ResourceMeta[] {
@@ -860,7 +939,8 @@ function renderNetwork(): void {
     + `<td class="muted">${esc(n.note ?? '')}</td>`
     + `<td class="acts"><button data-act="open" data-url="${esc(n.url)}" title="Open ${esc(shortLabel(n.url))}">Open</button>`
     + `<button data-act="copy" data-url="${esc(n.url)}" title="Copy URL">Copy</button>`
-    + `<button data-act="view" data-url="${esc(n.url)}" title="Preview captured content">View</button></td></tr>`).join('')
+    + `<button data-act="view" data-url="${esc(n.url)}" title="Preview captured content">View</button>`
+    + `<button data-act="curl" data-url="${esc(n.url)}" title="Copy as cURL">cURL</button></td></tr>`).join('')
     || '<tr><td colspan="8" class="muted">no requests match — browse the page, or clear the filters</td></tr>';
   $('netCount').textContent = `${all.length} shown${netEntries.length > all.length ? ` of ${netEntries.length}` : ''}`;
 }
@@ -927,7 +1007,7 @@ async function viewUrl(url: string): Promise<void> {
   ($('viewerBody') as HTMLElement).textContent = text;
 }
 
-function tableClick(e: Event, kind: 'res' | 'net'): void {
+function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
   const t = (e.target as HTMLElement).closest?.('[data-act]') as HTMLElement | null;
   if (!t) return;
   e.preventDefault();
@@ -935,8 +1015,14 @@ function tableClick(e: Event, kind: 'res' | 'net'): void {
   if (!url) return;
   const act = t.dataset.act;
   if (act === 'open') openUrl(url);
-  else if (act === 'copy') void copyText(url, kind === 'res' ? 'resource URL' : 'request URL');
+  else if (act === 'copy') void copyText(url, kind === 'res' ? 'resource URL' : kind === 'net' ? 'request URL' : 'route URL');
   else if (act === 'view') void viewUrl(url);
+  else if (act === 'curl' && kind === 'net') {
+    const n = netEntries.find((x) => x.url === url);
+    if (!n) { diag('cURL: request no longer in buffer', url); return; }
+    try { void copyText(buildCurl(n.method, n.url, n.reqHeaders ?? {}), 'cURL'); }
+    catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
+  }
 }
 
 async function copyFilteredResUrls(): Promise<void> {
@@ -976,6 +1062,66 @@ async function copyFilteredNetAll(): Promise<void> {
   await copyText(parts.join('\n\n'), `${items.length} requests with contents (bounded)`);
 }
 
+// ---------- analyze (secret findings) ----------
+const SEC_BLURB: Record<Severity, string> = {
+  critical: 'critical — likely live credentials or private keys; rotate immediately if exposed',
+  high: 'high — sensitive tokens or session secrets; verify and revoke if leaked',
+  medium: 'medium — internal endpoints or keys worth reviewing',
+  info: 'info — interesting but low-risk strings; review for context',
+};
+
+function renderAnalyze(): void {
+  const pill = document.getElementById('cAnalyze');
+  if (pill) pill.textContent = String(secFindings.length);
+  const box = document.getElementById('secList');
+  if (!box) return;
+  const total = secFindings.length;
+  renderedSec.length = 0;
+  let html = '';
+  for (const sev of ['critical', 'high', 'medium', 'info'] as Severity[]) {
+    const items = secFindings.filter((f) => f.sev === sev);
+    if (!items.length) continue;
+    html += `<div><span class="badge sev-${sev}">${sev}</span> <span class="muted small">${esc(SEC_BLURB[sev])} (${items.length})</span></div>`;
+    for (const f of items) {
+      if (renderedSec.length >= 150) break;
+      const i = renderedSec.length;
+      renderedSec.push(f);
+      const p = f.prov;
+      const loc = p.line && p.line > 0 ? ` · L${p.line}${p.column ? ':' + p.column : ''}` : '';
+      const rule = f.label && f.label !== f.rule ? `${f.rule} · ${f.label}` : f.rule;
+      html += `<div class="res"><div class="head"><span class="badge sev-${f.sev}">${esc(f.sev)}</span>`
+        + `<span class="badge" title="rule">${esc(rule)}</span>`
+        + `<span class="orig" title="${esc(f.text.slice(0, 400))}">${esc(displayNameFor(f.text, 120))}</span>`
+        + `<span class="open"><button data-act="open" data-i="${i}" title="Open source">Open</button> <button data-act="copy" data-i="${i}" title="Copy finding">Copy</button></span></div>`
+        + `<div class="prov">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div></div>`;
+    }
+    if (renderedSec.length >= 150) break;
+  }
+  if (!html) html = '<span class="muted">no secret findings — enable “scan for exposed secrets” in Settings, then browse or Deep Scan</span>';
+  else if (total > renderedSec.length) html += `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports up to 100</div>`;
+  box.innerHTML = html;
+  const sc = document.getElementById('secCount');
+  if (sc) sc.textContent = `${total} findings${secDropped ? ` · ${secDropped} dropped at cap` : ''}`;
+}
+
+/** Delegated Open/Copy for Analyze rows (indexes into the last rendered slice). */
+function secClick(e: Event): void {
+  const t = (e.target as HTMLElement).closest?.('[data-act]') as HTMLElement | null;
+  if (!t) return;
+  e.preventDefault();
+  const f = renderedSec[Number(t.dataset.i)];
+  if (!f) return;
+  if (t.dataset.act === 'open') openUrl(f.prov.resourceUrl);
+  else if (t.dataset.act === 'copy') void copyText(f.text, 'secret finding');
+}
+
+async function copySecFindings(): Promise<void> {
+  if (!secFindings.length) { diag('nothing to copy — no secret findings'); return; }
+  const items = secFindings.slice(0, 100);
+  const parts = items.map((f) => `[${f.sev}] ${f.rule}${f.label && f.label !== f.rule ? ` (${f.label})` : ''}\n${f.text}\n— ${f.prov.resourceUrl} · route ${f.prov.route} · via ${f.prov.method}`);
+  await copyText(parts.join('\n\n'), `${items.length} secret findings`);
+}
+
 function renderGraph(): void {
   $('graphStats').textContent = `${graph.nodes.size} nodes · ${graph.edges.length} edges`;
   $('graphList').innerHTML = graph.summarize(250).map((s) => `<div>${esc(s)}</div>`).join('') || '<span class="muted">graph is empty — relationships appear as discovery proceeds</span>';
@@ -992,7 +1138,7 @@ function shortLabel(u: string): string {
 
 // ---------- settings UI ----------
 function buildSettings(): void {
-  const budgets: Array<SessionSettings['budgetMB']> = [128, 256, 512, 1024];
+  const budgets: Array<SessionSettings['budgetMB']> = [64, 128, 256, 512, 1024];
   $('budgetRow').innerHTML = budgets.map((b) => `<button data-b="${b}" class="${settings.budgetMB === b ? 'primary' : ''}">${b} MB</button>`).join('');
   $('budgetRow').querySelectorAll('button').forEach((el) => el.addEventListener('click', () => {
     settings.budgetMB = Number((el as HTMLElement).dataset.b) as SessionSettings['budgetMB'];
@@ -1004,6 +1150,7 @@ function buildSettings(): void {
   ($('setRetainRaw') as HTMLInputElement).checked = settings.retainRaw;
   ($('setSrcMap') as HTMLInputElement).checked = settings.analyzeSourceMaps;
   ($('setAdvJs') as HTMLInputElement).checked = settings.advancedJsAnalysis;
+  ($('setSecrets') as HTMLInputElement).checked = settings.analyzeSecrets;
   ($('setBinMeta') as HTMLInputElement).checked = settings.includeBinaryMeta;
   ($('setOnBudget') as HTMLSelectElement).value = settings.onBudget;
   ($('setDepth') as HTMLInputElement).value = String(settings.deepScan.maxDepth);
@@ -1036,6 +1183,7 @@ function buildSettings(): void {
   ($('setRetainRaw') as HTMLInputElement).addEventListener('change', (e) => settings.retainRaw = (e.target as HTMLInputElement).checked);
   ($('setSrcMap') as HTMLInputElement).addEventListener('change', (e) => settings.analyzeSourceMaps = (e.target as HTMLInputElement).checked);
   ($('setAdvJs') as HTMLInputElement).addEventListener('change', (e) => settings.advancedJsAnalysis = (e.target as HTMLInputElement).checked);
+  ($('setSecrets') as HTMLInputElement).addEventListener('change', (e) => settings.analyzeSecrets = (e.target as HTMLInputElement).checked);
   ($('setBinMeta') as HTMLInputElement).addEventListener('change', (e) => settings.includeBinaryMeta = (e.target as HTMLInputElement).checked);
   ($('setOnBudget') as HTMLSelectElement).addEventListener('change', (e) => settings.onBudget = (e.target as HTMLSelectElement).value as SessionSettings['onBudget']);
   $('permInfo').innerHTML = `base: activeTab · scripting · webNavigation · webRequest · storage<br/>optional: <b>&lt;all_urls&gt;</b> (site access, on demand) · <b>debugger</b> (Deep Capture, on demand)<br/>processing: <b>100% local</b> · storage: <b>RAM only</b> (settings use chrome.storage.local; captures never touch disk)`;
@@ -1114,6 +1262,11 @@ function wire(): void {
   $('btnNetCopyUrls').addEventListener('click', () => void copyFilteredNetUrls());
   $('btnNetCopyAll').addEventListener('click', () => void copyFilteredNetAll());
   $('btnDiscoverRoutes').addEventListener('click', () => void discoverRoutesNow());
+  on('routeFilter', 'input', () => renderRoutes());
+  on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
+  on('routeTree', 'click', (e) => tableClick(e, 'route'));
+  on('btnSecCopy', 'click', () => void copySecFindings());
+  on('secList', 'click', secClick);
   $('btnTheme').addEventListener('click', () => {
     settings.theme = settings.theme === 'light' ? 'dark' : 'light';
     applyTheme();
@@ -1140,6 +1293,7 @@ function wire(): void {
 function clearSession(): void {
   index.clear(); graph.clear(); resources.clear(); rawBodies.clear(); rawOrder.length = 0;
   contentHash.clear(); netEntries.length = 0; routes.clear(); diags.length = 0;
+  secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0;
   lastResults = []; lastResultsById.clear();
   resType = 'ALL'; netMethod = 'ALL'; netKind = 'ALL';
@@ -1171,7 +1325,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.3.0', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.4.0', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],

@@ -4,6 +4,31 @@
 
 ---
 
+## v1.4.0 — 2026-09-23 (64MB default + universal discovery batch + Analyze panel)
+
+Built by 3 parallel subagents with strict file ownership (A: extractors.ts · B: rules.ts/tables.ts/verify/check-manifest · C: content.ts/panel.ts/panel.html/panel.css), contracts fixed up-front in types.ts, integrated + verified by lead. No file overlaps, no conflicts.
+
+### 64MB budget (new default)
+- `types.ts`: `budgetMB` union + `DEFAULT_SETTINGS` now **64MB** (was 256). UI list `panel.ts` → 64/128/256/512/1024. Ledger untouched (works in bytes) — same warn/stop policies.
+
+### Universal discovery (all 9 MUST gaps)
+- `extractors.ts`: `extractGraphql()` (named/anonymous ops, persisted sha256 hashes → `graphql-op` facet) · axios-style **baseURL join** (base path preserved, `via-base:` — fixed post-agent `new URL()` path-drop bug) · **param facets** from query strings · meta-tag/form-input/data-* URL facets · **tRPC** proc segments + input keys · **importmap** resolve (`HtmlFindings.importmap`) · inline JSON script blocks · `extractFrameworkRoutes()` (build/ssg manifests, `__NEXT_DATA__` pages, `__NUXT__` flag).
+- `content.ts`: `manifests[]` (build/ssg manifest srcs → fetched as `manifest-ref`) + importmap links merged into discovery.
+- `tables.ts` + rows: **Copy-as-cURL** per network row (pure `buildCurl`, quoted/escaped, capped).
+- Routes tab rebuilt: full absolute links, Open/Copy per row, Copy-all (≤1000), text filter, `shown` counter.
+- `verify.mjs` 13→**20 checks** (graphql, baseURL, params, importmap/meta, tRPC, curl+severity, secrets).
+
+### Analyze tab (security/criticality)
+- New `rules.ts`: **41 high-precision secret rules** (cloud keys, tokens, JWT, private keys, connection strings) + `isPlaceholder()` FP guard + `scanTextForSecrets()` (len-gated, capped). Runs in **worker** at ingest (first hit attached as `sec`), panel fallback covered too.
+- Panel: `secFindings` snapshots (text+prov, cap 2000, drop-counted) grouped critical/high/medium/info with plain-language blurbs, Open/Copy per finding, Copy-findings (≤100), `cAnalyze` pill, Settings `setSecrets` toggle (`analyzeSecrets`, default on).
+- RAM impact: findings ≈32B each (IDs, no text dup); rules static ~6KB; new facets share the existing 6000-unit cap. Release `release/deepscope/` ≈ **194KB**, runtime deps still 0.
+- Deliberately NOT built: bulk active probing, 1600-rule dragnet, dataflow analysis, WS/replay (opt-in phase).
+
+### UI legibility pass
+- One-line muted explainers atop Search/Routes/Resources/Network/Analyze tabs; severity badge colors; viewer hotfix lineage kept. `manifest.json`/`package.json`/export stamp → 1.4.0. `check-manifest.mjs` asserts `dist/rules.js`.
+
+---
+
 ## v1.3.0 — 2026-09-20 (Resources/Network URL flexibility + dynamic filters)
 
 ### Hotfix (same day): preview modal couldn't be dismissed- Root cause: CSS specificity — `.viewer { display:flex }` is defined AFTER `.hidden { display:none }` with equal specificity, so the hide rule never won. The overlay stayed on screen and Close appeared dead.
@@ -90,6 +115,5 @@
 
 ---
 
-## GitHub — pushed 2026-09-20
-- Remote `origin` = `https://github.com/Namra7-x/WebDiscovery.git` (was empty; pushed `master` → `25110bc`, 36 files, source only — `node_modules/`, `dist/`, `release/` gitignored and rebuilt via `npm install` + `npm run build` + `node scripts/package.mjs`).
+## GitHub — pushed 2026-09-20- Remote `origin` = `https://github.com/Namra7-x/WebDiscovery.git` (was empty; pushed `master` → `25110bc`, 36 files, source only — `node_modules/`, `dist/`, `release/` gitignored and rebuilt via `npm install` + `npm run build` + `node scripts/package.mjs`).
 - README made GitHub-ready: clone URL, project structure map, consistent ~0.15 MB payload note.

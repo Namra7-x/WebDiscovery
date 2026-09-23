@@ -90,6 +90,9 @@ export interface SearchScope {
 
 export type SearchMode = 'exact' | 'substring' | 'normalized' | 'regex' | 'fuzzy';
 
+/** Finding severity for the Analyze tab (rules.ts maps every rule to one). */
+export type Severity = 'critical' | 'high' | 'medium' | 'info';
+
 export interface SearchResult {
   recordId: number;
   text: string;                // original
@@ -104,7 +107,7 @@ export interface SearchResult {
 }
 
 export interface SessionSettings {
-  budgetMB: 128 | 256 | 512 | 1024;
+  budgetMB: 64 | 128 | 256 | 512 | 1024;
   theme: 'dark' | 'light';
   maxResponseBytes: number;    // per-resource cap
   maxIndexedChars: number;     // per-resource indexed text cap
@@ -112,6 +115,7 @@ export interface SessionSettings {
   retainRaw: boolean;
   analyzeSourceMaps: boolean;
   advancedJsAnalysis: boolean;
+  analyzeSecrets: boolean;   // rules.ts engine over indexed units (Analyze tab)
   includeBinaryMeta: boolean;
   onBudget: 'stop-capture' | 'discard-oldest-raw' | 'stop-deep-analysis';
   deepScan: {
@@ -134,7 +138,7 @@ export interface SessionSettings {
 }
 
 export const DEFAULT_SETTINGS: SessionSettings = {
-  budgetMB: 256,
+  budgetMB: 64,
   theme: 'dark',
   maxResponseBytes: 2_000_000,
   maxIndexedChars: 400_000,
@@ -142,6 +146,7 @@ export const DEFAULT_SETTINGS: SessionSettings = {
   retainRaw: false,
   analyzeSourceMaps: true,
   advancedJsAnalysis: false,
+  analyzeSecrets: true,
   includeBinaryMeta: true,
   onBudget: 'discard-oldest-raw',
   deepScan: {
