@@ -4,6 +4,12 @@
 
 ---
 
+## v1.4.2 — 2026-09-23 (flat Routes, fixed table columns)
+
+- **Routes tab flat + full URLs**: indent removed entirely (was pushing nested routes right on route-heavy sites); first cell shows the complete URL, wrapping in place — entire URL always visible, full value also in tooltip.
+- **Fixed table layouts** (`table-layout: fixed; width: 100%` on all three tables): Route column in Resources/Network capped at 130px with `…` ellipsis (was stretching the whole table even for `/`); small columns pinned (Type 92, Status 62, Actions 158/196, etc.); hover any truncated cell for the full text via new `title` tooltips on Type/Route/Via/Indexed/MIME/Note. `.table-wrap` scroll kept as narrow-panel fallback. Built by 2 parallel agents (CSS-only × renders-only, no overlap).
+- Verified: tsc clean, `verify.mjs` 21/21, `release/deepscope/` ≈ 198KB.
+
 ## v1.4.1 — 2026-09-23 (table row fixes: ellipsis URLs, aligned Routes)
 
 - **Resources/Network URL cells**: single-line with `…` ellipsis (`max-width` + `nowrap` + `text-overflow`), full URL kept in hover tooltip — rows no longer grow vertically. Applies to both tables.

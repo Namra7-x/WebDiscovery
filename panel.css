@@ -49,6 +49,33 @@ td.rt { font-family:Consolas,monospace; max-width:420px; overflow:hidden; text-o
 td.rt a { color:var(--acc); text-decoration:none; } td.rt a:hover { text-decoration:underline; }
 td.num { font-variant-numeric:tabular-nums; white-space:nowrap; }
 td.acts { white-space:nowrap; } td.acts button { font-size:10px; padding:2px 7px; margin-right:4px; }
+
+/* Fixed layouts so long URL/Route cells can never stretch their column. */
+#resTable, #netTable, #routeTable { table-layout:fixed; width:100%; }
+/* resTable (9 cols: URL,Type,Status,Size,Route,Via,Map,Indexed,Actions) */
+#resTable th:nth-child(1), #resTable td:nth-child(1) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(2), #resTable td:nth-child(2) { width:92px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(3), #resTable td:nth-child(3) { width:62px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(4), #resTable td:nth-child(4) { width:72px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(5), #resTable td:nth-child(5) { width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(6), #resTable td:nth-child(6) { width:104px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(7), #resTable td:nth-child(7) { width:52px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(8), #resTable td:nth-child(8) { width:74px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#resTable th:nth-child(9), #resTable td:nth-child(9) { width:158px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* netTable (8 cols: Method,URL,Status,MIME,Route,Body,Note,Actions) */
+#netTable th:nth-child(1), #netTable td:nth-child(1) { width:74px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(2), #netTable td:nth-child(2) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(3), #netTable td:nth-child(3) { width:62px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(4), #netTable td:nth-child(4) { width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(5), #netTable td:nth-child(5) { width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(6), #netTable td:nth-child(6) { width:92px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(7), #netTable td:nth-child(7) { width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#netTable th:nth-child(8), #netTable td:nth-child(8) { width:196px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* routeTable (4 cols: Route,Seen,Via,Actions) — Route wraps fully, never truncates. */
+#routeTable th:nth-child(1), #routeTable td:nth-child(1) { white-space:normal; word-break:break-all; }
+#routeTable th:nth-child(2), #routeTable td:nth-child(2) { width:64px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#routeTable th:nth-child(3), #routeTable td:nth-child(3) { width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#routeTable th:nth-child(4), #routeTable td:nth-child(4) { width:134px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .checks { display:grid; grid-template-columns:1fr 1fr; gap:4px; } .checks label { display:flex; gap:6px; align-items:center; }
 .graph { display:flex; flex-direction:column; gap:3px; max-height:60vh; overflow:auto; }
 .viewer { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:50; padding:20px; }

@@ -825,14 +825,13 @@ function filteredRoutes(): Array<[string, { method: DiscoveryMethod; count: numb
 }
 
 function renderRoutes(): void {
-  // Aligned table: one row per route, indent via padding (not &nbsp;), full
-  // URL in link + tooltip, ×count in its own column. Reuses tableClick('route').
+  // Flat list: one row per route, full URL text in link + tooltip.
+  // Reuses tableClick('route').
   const all = filteredRoutes();
   const rows = all.slice(0, 300);
   ($('routeBody') as HTMLElement).innerHTML = rows.map(([r, v]) => {
-    const depth = Math.min(r.split('/').filter(Boolean).length, 8);
     const full = routeFullUrl(r);
-    return `<tr><td class="rt"><span style="display:inline-block;padding-left:${depth * 14}px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;" title="${esc(full)}"><a href="#" data-act="open" data-url="${esc(full)}">${esc(r)}</a></span></td>`
+    return `<tr><td class="rt"><a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(full)}</a></td>`
       + `<td class="num" title="Times seen this session">×${v.count}</td>`
       + `<td><span class="badge kind">${esc(v.method)}</span></td>`
       + `<td class="acts"><button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
@@ -880,9 +879,9 @@ function renderResources(): void {
   const rows = all.slice(0, 300);
   ($('resTable').querySelector('tbody')!).innerHTML = rows.map((r) =>
     `<tr><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
-    + `<td>${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
-    + `<td>${esc(r.route)}</td><td>${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
-    + `<td>${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
+    + `<td title="${esc(r.kind)}">${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
+    + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
+    + `<td title="${esc(r.indexed ? String(r.indexedStrings) + (r.error ? ` — ${r.error}` : '') : '—')}">${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
     + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
     + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
     + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button></td></tr>`).join('')
@@ -929,9 +928,9 @@ function renderNetwork(): void {
   const rows = all.slice(0, 250);
   ($('netTable').querySelector('tbody')!).innerHTML = rows.map((n) =>
     `<tr><td>${esc(n.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(n.url)}" title="${esc(n.url)}">${esc(shortLabel(n.url))}</a></td>`
-    + `<td>${n.status ?? '—'}</td><td>${esc(n.mime ?? '')}</td><td>${esc(n.route)}</td>`
+    + `<td>${n.status ?? '—'}</td><td title="${esc(n.mime ?? '')}">${esc(n.mime ?? '')}</td><td title="${esc(n.route)}">${esc(n.route)}</td>`
     + `<td>${n.bodyKept ? formatBytes(n.bodyChars) : n.bodyChars ? `${formatBytes(n.bodyChars)} (indexed)` : 'meta'}</td>`
-    + `<td class="muted">${esc(n.note ?? '')}</td>`
+    + `<td class="muted" title="${esc(n.note ?? '')}">${esc(n.note ?? '')}</td>`
     + `<td class="acts"><button data-act="open" data-url="${esc(n.url)}" title="Open ${esc(shortLabel(n.url))}">Open</button>`
     + `<button data-act="copy" data-url="${esc(n.url)}" title="Copy URL">Copy</button>`
     + `<button data-act="view" data-url="${esc(n.url)}" title="Preview captured content">View</button>`
@@ -1320,7 +1319,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.4.1', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.4.2', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],
