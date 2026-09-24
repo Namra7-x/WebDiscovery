@@ -7,7 +7,9 @@ import { MemoryLedger, formatBytes } from './memory.js';
 import { displayNameFor, searchIndex } from './search.js';
 import { extractHtml, resolveUrl } from './extractors.js';
 import { scanTextForSecrets } from './rules.js';
-import { buildCurl, groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts } from './tables.js';
+import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody } from './tables.js';
+import { classifyApiKind, findExposures } from './exposure.js';
+import type { ApiKind } from './exposure.js';
 import type { SearchResult, Severity, TextRecord } from './types.js';
 import {
   DEFAULT_SETTINGS, defaultScope,
@@ -41,6 +43,8 @@ let secDropped = 0;
 let secDiagOnce = false;
 /** Last rendered Analyze slice (backs Open/Copy buttons by index). */
 const renderedSec: SecFinding[] = [];
+/** Rendered Analyze host groups (backs per-group Copy by data-grp `sev|host` key). */
+const renderedAnaGroups = new Map<string, SecFinding[]>();
 /** Units arriving at commitUnits() / the worker 'units' message. `sec` is the
  *  first secret hit attached by the worker/fallback via scanTextForSecrets. */
 interface IndexUnit { text: string; line: number; column: number; kind: string; extra?: string; sec?: { rule: string; sev: Severity; label: string } }
@@ -52,6 +56,38 @@ let renderTimer = 0;
 let netMethod = 'ALL';
 let netKind = 'ALL';
 let resType = 'ALL';
+let apiKind = 'ALL';
+// API tab state: option-sig cache (like netKind), lazily-rendered detail rows.
+let apiKindSig = '';
+const apiExpanded = new Set<string>();
+const apiDetHtml = new Map<string, string>();
+// Exposure findings (Analyze tab): dedupe keys + surfaced count.
+const expoKeys = new Set<string>();
+let expoAdded = 0;
+// Domain grouping (Resources/Network): collapsed hosts persist per session.
+const grpCollapsed = new Set<string>();
+const grpTouched = new Set<string>();
+// Per-group Show-all (Resources/Network): host keys with lifted slice cap (100 → 1000).
+const grpShowAll = new Set<string>();
+// API domain grouping: separate collapse state (first-party expanded, rest collapsed).
+const apiCollapsed = new Set<string>();
+const apiTouched = new Set<string>();
+// Analyze host subgroups: keyed `sev|host`, default expanded.
+const anaCollapsed = new Set<string>();
+/** Local fallback for snippetBody (same behavior) if tables.js export is missing at runtime. */
+function snippetBodyFallback(text: string | undefined, cap = 1500): string {
+  if (!text) return '(request/response body not captured — enable retain raw + recapture)';
+  if (text.length > cap) return text.slice(0, cap) + `\n… [truncated ${text.length - cap} chars]`;
+  return text;
+}
+/** Safe sent/body preview: uses tables.snippetBody when present, else local fallback. */
+function safeSnippetBody(text: string | undefined, cap = 1500): string {
+  try {
+    const fn = snippetBody as unknown as ((s: string | undefined, c?: number) => string) | undefined;
+    if (typeof fn === 'function') return fn(text, cap);
+  } catch { /* fall through to fallback */ }
+  return snippetBodyFallback(text, cap);
+}
 // Cached option signatures — skip DOM writes when live counts are unchanged.
 let resTypeSig = '';
 let netMethodSig = '';
@@ -460,11 +496,13 @@ function hookDevtoolsNetwork(): void {
       const mime: string = req.response.content?.mimeType ?? '';
       const status: number = req.response.status;
       const initiator = reqMetaByUrl.get(url)?.initiator;
+      const postText = settings.capture.json ? req.request.postData?.text : undefined;
       const entry: NetEntry = {
         id: `${Date.now()}-${netEntries.length}`, url, method: req.request.method, status, mime,
         route: sessionRoute, initiator, reqHeaders: headersToObj(req.request.headers),
         resHeaders: headersToObj(req.response.headers), bodyKept: false, bodyTruncated: false,
         bodyChars: req.response.content?.size ?? 0, ts: Date.now(),
+        ...(postText ? { reqBody: postText.slice(0, 2000) } : {}),
       };
       // Binary/media/fonts: metadata only
       if (/\.(png|jpe?g|gif|webp|avif|svg|ico|mp4|webm|mp3|woff2?|ttf|otf)(\?|$)/i.test(url) || /^(image|video|audio|font)\//.test(mime)) {
@@ -771,7 +809,7 @@ function scheduleRender(): void {
 }
 
 function renderAll(): void {
-  renderMem(); renderOverview(); renderRoutes(); renderResources(); renderNetwork(); renderAnalyze(); renderGraph();
+  renderMem(); renderOverview(); renderRoutes(); renderResources(); renderNetwork(); renderApis(); renderAnalyze(); renderGraph();
 }
 
 function renderMem(): void {
@@ -876,16 +914,44 @@ function syncResTypeOptions(): void {
 function renderResources(): void {
   syncResTypeOptions();
   const all = filteredResources();
-  const rows = all.slice(0, 300);
-  ($('resTable').querySelector('tbody')!).innerHTML = rows.map((r) =>
-    `<tr><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
-    + `<td title="${esc(r.kind)}">${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
-    + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
-    + `<td title="${esc(r.indexed ? String(r.indexedStrings) + (r.error ? ` — ${r.error}` : '') : '—')}">${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
-    + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
-    + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
-    + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button></td></tr>`).join('')
-    || '<tr><td colspan="9" class="muted">no resources match — browse the page, or clear the filters</td></tr>';
+  const fp = fpHost();
+  let groups: Array<{ host: string; items: ResourceMeta[] }> = [];
+  try {
+    groups = groupByHost(all, (r) => r.url);
+  } catch { groups = all.length ? [{ host: '(relative)', items: all }] : []; }
+  // First-party group first; groupByHost already returns the rest count-desc.
+  if (fp) {
+    const i = groups.findIndex((g) => g.host === fp);
+    if (i > 0) { const [g] = groups.splice(i, 1); groups.unshift(g); }
+  }
+  const tb = $('resTable').querySelector('tbody')!;
+  if (!groups.length) {
+    tb.innerHTML = '<tr><td colspan="9" class="muted">no resources match — browse the page, or clear the filters</td></tr>';
+  } else {
+    const out: string[] = [];
+    for (const g of groups) {
+      grpDefault(g.host, fp);
+      const col = grpCollapsed.has(g.host);
+      const size = g.items.reduce((a, r) => a + (r.size ?? 0), 0);
+      const gh = esc(g.host);
+      const showAll = grpShowAll.has(g.host);
+      const cap = showAll ? 1000 : 100;
+      const showBtn = g.items.length > 100 ? ` <button data-act="gshowall" data-grp="${gh}" title="Toggle full group (100 ↔ 1000)">${showAll ? 'Show less' : `Show all (${g.items.length})`}</button>` : '';
+      out.push(`<tr class="grp"><td colspan="9"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} items · ${formatBytes(size)}</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopyall" data-grp="${gh}" title="Copy group URLs + contents (bounded)">Copy URLs+contents</button>${showBtn}</td></tr>`);
+      const hide = col ? ' class="hidden"' : '';
+      for (const r of g.items.slice(0, cap)) {
+        out.push(`<tr data-g="${gh}"${hide}><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
+          + `<td title="${esc(r.kind)}">${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
+          + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
+          + `<td title="${esc(r.indexed ? String(r.indexedStrings) + (r.error ? ` — ${r.error}` : '') : '—')}">${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
+          + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
+          + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
+          + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button></td></tr>`);
+      }
+      if (g.items.length > cap) out.push(`<tr data-g="${gh}"${hide}><td colspan="9" class="muted">… +${g.items.length - cap} more in this group — refine filters, use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
+    }
+    tb.innerHTML = out.join('');
+  }
   $('resCount').textContent = `${all.length} shown${resources.size > all.length ? ` of ${resources.size}` : ''} · ${resType === 'ALL' ? 'all types' : resType}`;
 }
 
@@ -925,17 +991,45 @@ function filteredNetEntries(): NetEntry[] {
 function renderNetwork(): void {
   syncNetOptions();
   const all = filteredNetEntries();
-  const rows = all.slice(0, 250);
-  ($('netTable').querySelector('tbody')!).innerHTML = rows.map((n) =>
-    `<tr><td>${esc(n.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(n.url)}" title="${esc(n.url)}">${esc(shortLabel(n.url))}</a></td>`
-    + `<td>${n.status ?? '—'}</td><td title="${esc(n.mime ?? '')}">${esc(n.mime ?? '')}</td><td title="${esc(n.route)}">${esc(n.route)}</td>`
-    + `<td>${n.bodyKept ? formatBytes(n.bodyChars) : n.bodyChars ? `${formatBytes(n.bodyChars)} (indexed)` : 'meta'}</td>`
-    + `<td class="muted" title="${esc(n.note ?? '')}">${esc(n.note ?? '')}</td>`
-    + `<td class="acts"><button data-act="open" data-url="${esc(n.url)}" title="Open ${esc(shortLabel(n.url))}">Open</button>`
-    + `<button data-act="copy" data-url="${esc(n.url)}" title="Copy URL">Copy</button>`
-    + `<button data-act="view" data-url="${esc(n.url)}" title="Preview captured content">View</button>`
-    + `<button data-act="curl" data-url="${esc(n.url)}" title="Copy as cURL">cURL</button></td></tr>`).join('')
-    || '<tr><td colspan="8" class="muted">no requests match — browse the page, or clear the filters</td></tr>';
+  const fp = fpHost();
+  let groups: Array<{ host: string; items: NetEntry[] }> = [];
+  try {
+    groups = groupByHost(all, (n) => n.url);
+  } catch { groups = all.length ? [{ host: '(relative)', items: all }] : []; }
+  // First-party group first; groupByHost already returns the rest count-desc.
+  if (fp) {
+    const i = groups.findIndex((g) => g.host === fp);
+    if (i > 0) { const [g] = groups.splice(i, 1); groups.unshift(g); }
+  }
+  const tb = $('netTable').querySelector('tbody')!;
+  if (!groups.length) {
+    tb.innerHTML = '<tr><td colspan="8" class="muted">no requests match — browse the page, or clear the filters</td></tr>';
+  } else {
+    const out: string[] = [];
+    for (const g of groups) {
+      grpDefault(g.host, fp);
+      const col = grpCollapsed.has(g.host);
+      const size = g.items.reduce((a, n) => a + (n.bodyChars ?? 0), 0);
+      const gh = esc(g.host);
+      const showAll = grpShowAll.has(g.host);
+      const cap = showAll ? 1000 : 100;
+      const showBtn = g.items.length > 100 ? ` <button data-act="gshowall" data-grp="${gh}" title="Toggle full group (100 ↔ 1000)">${showAll ? 'Show less' : `Show all (${g.items.length})`}</button>` : '';
+      out.push(`<tr class="grp"><td colspan="8"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} items · ${formatBytes(size)}</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopyall" data-grp="${gh}" title="Copy group URLs + contents (bounded)">Copy URLs+contents</button>${showBtn}</td></tr>`);
+      const hide = col ? ' class="hidden"' : '';
+      for (const n of g.items.slice(0, cap)) {
+        out.push(`<tr data-g="${gh}"${hide}><td>${esc(n.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(n.url)}" title="${esc(n.url)}">${esc(shortLabel(n.url))}</a></td>`
+          + `<td>${n.status ?? '—'}</td><td title="${esc(n.mime ?? '')}">${esc(n.mime ?? '')}</td><td title="${esc(n.route)}">${esc(n.route)}</td>`
+          + `<td>${n.bodyKept ? formatBytes(n.bodyChars) : n.bodyChars ? `${formatBytes(n.bodyChars)} (indexed)` : 'meta'}</td>`
+          + `<td class="muted" title="${esc(n.note ?? '')}">${esc(n.note ?? '')}</td>`
+          + `<td class="acts"><button data-act="open" data-url="${esc(n.url)}" title="Open ${esc(shortLabel(n.url))}">Open</button>`
+          + `<button data-act="copy" data-url="${esc(n.url)}" title="Copy URL">Copy</button>`
+          + `<button data-act="view" data-url="${esc(n.url)}" title="Preview captured content">View</button>`
+          + `<button data-act="curl" data-url="${esc(n.url)}" title="Copy as cURL">cURL</button></td></tr>`);
+      }
+      if (g.items.length > cap) out.push(`<tr data-g="${gh}"${hide}><td colspan="8" class="muted">… +${g.items.length - cap} more in this group — refine filters, use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
+    }
+    tb.innerHTML = out.join('');
+  }
   $('netCount').textContent = `${all.length} shown${netEntries.length > all.length ? ` of ${netEntries.length}` : ''}`;
 }
 
@@ -1005,9 +1099,32 @@ function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
   const t = (e.target as HTMLElement).closest?.('[data-act]') as HTMLElement | null;
   if (!t) return;
   e.preventDefault();
+  const act = t.dataset.act;
+  // Domain-group actions (header buttons carry data-grp, no data-url).
+  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopyall' || act === 'gshowall') {
+    const grp = t.dataset.grp ?? '';
+    if (!grp || (kind !== 'res' && kind !== 'net')) return;
+    if (act === 'gtoggle') {
+      grpTouched.add(grp);
+      if (grpCollapsed.has(grp)) grpCollapsed.delete(grp);
+      else grpCollapsed.add(grp);
+      if (kind === 'res') renderResources();
+      else renderNetwork();
+      return;
+    }
+    if (act === 'gshowall') {
+      if (grpShowAll.has(grp)) grpShowAll.delete(grp);
+      else grpShowAll.add(grp);
+      if (kind === 'res') renderResources();
+      else renderNetwork();
+      return;
+    }
+    if (act === 'gcopy') { void copyGroupUrls(kind, grp); return; }
+    void copyGroupAll(kind, grp);
+    return;
+  }
   const url = t.dataset.url ?? '';
   if (!url) return;
-  const act = t.dataset.act;
   if (act === 'open') openUrl(url);
   else if (act === 'copy') void copyText(url, kind === 'res' ? 'resource URL' : kind === 'net' ? 'request URL' : 'route URL');
   else if (act === 'view') void viewUrl(url);
@@ -1016,6 +1133,76 @@ function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
     if (!n) { diag('cURL: request no longer in buffer', url); return; }
     try { void copyText(buildCurl(n.method, n.url, n.reqHeaders ?? {}), 'cURL'); }
     catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
+  }
+}
+
+/** First-party host for domain grouping ('' while the origin is unknown). */
+function fpHost(): string {
+  try { return sessionOrigin ? hostOf(sessionOrigin) : ''; } catch { return ''; }
+}
+
+/** Default collapse state for a host group: first-party expanded, the rest
+ *  collapsed — unless the user explicitly toggled that host this session. */
+function grpDefault(host: string, fp: string): void {
+  if (grpTouched.has(host)) return;
+  if (host === fp && fp) grpCollapsed.delete(host);
+  else grpCollapsed.add(host);
+}
+
+/** Default collapse for an API host group: first-party expanded, rest collapsed. */
+function apiGrpDefault(host: string, fp: string): void {
+  if (apiTouched.has(host)) return;
+  if (host === fp && fp) apiCollapsed.delete(host);
+  else apiCollapsed.add(host);
+}
+
+/** Items of one host group from a current filtered list (reuses groupByHost). */
+function groupItems<T>(items: T[], urlOf: (t: T) => string, grp: string): T[] {
+  try {
+    const g = groupByHost(items, urlOf).find((x) => x.host === grp);
+    return g ? g.items : [];
+  } catch { return []; }
+}
+
+async function copyGroupUrls(kind: 'res' | 'net', grp: string): Promise<void> {
+  if (kind === 'res') {
+    const items = groupItems(filteredResources(), (r) => r.url, grp);
+    if (!items.length) { diag('nothing to copy — group is empty'); return; }
+    await copyText(items.slice(0, 1000).map((r) => r.url).join('\n'), `${Math.min(items.length, 1000)} resource URLs (${grp})`);
+  } else {
+    const items = groupItems(filteredNetEntries(), (n) => n.url, grp);
+    if (!items.length) { diag('nothing to copy — group is empty'); return; }
+    await copyText(items.slice(0, 1000).map((n) => `${n.method} ${n.url}`).join('\n'), `${Math.min(items.length, 1000)} request URLs (${grp})`);
+  }
+}
+
+/** Bounded group contents copy: same 30 items × 10 KB, 400 KB total bounds
+ *  as the global Copy URLs+contents buttons. */
+async function copyBoundedContents(label: string, heads: string[], urls: string[]): Promise<void> {
+  const n = Math.min(heads.length, urls.length, 30);
+  const parts: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const { text } = await resolveContent(urls[i]);
+    parts.push(`${heads[i]}\n${text.slice(0, 10_000)}`);
+    if (parts.join('\n\n').length > 400_000) break;
+  }
+  if (!parts.length) { diag('nothing to copy — group is empty'); return; }
+  await copyText(parts.join('\n\n'), label);
+}
+
+async function copyGroupAll(kind: 'res' | 'net', grp: string): Promise<void> {
+  if (kind === 'res') {
+    const items = groupItems(filteredResources(), (r) => r.url, grp).slice(0, 30);
+    if (!items.length) { diag('nothing to copy — group is empty'); return; }
+    await copyBoundedContents(`${items.length} resources with contents (${grp}, bounded)`,
+      items.map((r) => `## ${r.url}\n[${r.kind}${r.status != null ? ` · ${r.status}` : ''}${r.mime ? ` · ${r.mime}` : ''} · route ${r.route} · via ${r.method}]`),
+      items.map((r) => r.url));
+  } else {
+    const items = groupItems(filteredNetEntries(), (n) => n.url, grp).slice(0, 30);
+    if (!items.length) { diag('nothing to copy — group is empty'); return; }
+    await copyBoundedContents(`${items.length} requests with contents (${grp}, bounded)`,
+      items.map((n) => `## ${n.method} ${n.url}\n[${n.status ?? '—'} · ${n.mime ?? ''} · route ${n.route}]${n.note ? ` · ${n.note}` : ''}`),
+      items.map((n) => n.url));
   }
 }
 
@@ -1056,6 +1243,217 @@ async function copyFilteredNetAll(): Promise<void> {
   await copyText(parts.join('\n\n'), `${items.length} requests with contents (bounded)`);
 }
 
+// ---------- APIs tab ----------
+interface ApiRow { method: string; url: string; kind: ApiKind; detail: string; entry?: NetEntry }
+
+/** True when a request looks API-like: JSON mime or a non-Other API kind. */
+function apiLike(url: string, mime?: string): boolean {
+  const m = mime ?? '';
+  return /json/i.test(m) || classifyApiKind(url, m) !== 'Other';
+}
+
+function buildApiRows(): ApiRow[] {
+  const rows: ApiRow[] = [];
+  // (1) CALLED: observed network entries that look API-like (cap 500).
+  const called = new Set<string>();
+  for (const n of netEntries) {
+    if (!apiLike(n.url, n.mime)) continue;
+    called.add(n.url);
+  }
+  let nCalled = 0;
+  for (const n of netEntries) {
+    if (nCalled >= 500) break;
+    if (!called.has(n.url)) continue;
+    rows.push({ method: n.method, url: n.url, kind: classifyApiKind(n.url, n.mime ?? ''), detail: `${n.status ?? '—'}${n.mime ? ` · ${n.mime}` : ''}`, entry: n });
+    nCalled++;
+  }
+  // (2) UNCALLED: API-like routes seen in code but never requested (cap 200).
+  const apiRouteRe = /\/api\/|\/graphql|\/trpc|v\d+\/|graphql/i;
+  let nUncalled = 0;
+  for (const [route, v] of routes) {
+    if (nUncalled >= 200) break;
+    if (!(apiRouteRe.test(route) || v.method === 'fetch-target')) continue;
+    const full = routeFullUrl(route);
+    if (called.has(full)) continue;
+    rows.push({ method: '—', url: full, kind: classifyApiKind(full, ''), detail: 'in code, not called' });
+    nUncalled++;
+  }
+  return rows;
+}
+
+function syncApiKindOptions(rows: ApiRow[]): void {
+  const counts = new Map<string, number>();
+  for (const r of rows) counts.set(String(r.kind), (counts.get(String(r.kind)) ?? 0) + 1);
+  const kro = [...counts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+  const { html, sig } = optionsHtml(kro, apiKind, 'all kinds');
+  if (sig === apiKindSig) return; // unchanged — skip DOM churn
+  if (apiKind !== 'ALL' && !kro.some((r) => r.value === apiKind)) apiKind = 'ALL';
+  apiKindSig = sig;
+  ($('apiKind') as HTMLSelectElement).innerHTML = optionsHtml(kro, apiKind, 'all kinds').html;
+}
+
+function apiRowHtml(r: ApiRow, grp = '', hide = ''): string {
+  const curl = r.entry ? `<button data-act="curl" data-url="${esc(r.url)}" title="Copy as cURL">cURL</button>` : '';
+  const gAttr = grp ? ` data-g="${grp}"${hide}` : '';
+  return `<tr${gAttr}><td>${esc(r.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
+    + `<td><button class="badge kind" data-act="expand" data-url="${esc(r.url)}" title="Toggle request detail">${esc(String(r.kind))}</button></td>`
+    + `<td title="${esc(r.detail)}">${esc(r.detail)}</td>`
+    + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
+    + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
+    + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button>${curl}</td></tr>`;
+}
+
+/** Lazily-built expandable detail: headers (≤12 each) + auth badges + sent + body preview. */
+function apiDetailHtml(url: string): string {
+  const n = netEntries.find((x) => x.url === url);
+  const reqH = Object.entries(n?.reqHeaders ?? {}).slice(0, 12);
+  const resH = Object.entries(n?.resHeaders ?? {}).slice(0, 12);
+  let badges = '';
+  try {
+    const hasAuth = Object.keys(n?.reqHeaders ?? {}).some((k) => k.toLowerCase() === 'authorization');
+    const hasTokenParam = /[?&#](token|api[-_]?key|access_token|auth|bearer|key)=/i.test(url);
+    badges = (hasAuth ? '<span class="badge kind">auth-header</span>' : '<span class="badge">no-auth-header</span>')
+      + ' ' + (hasTokenParam ? '<span class="badge kind">token-param</span>' : '<span class="badge">no-token-param</span>');
+  } catch { badges = '<span class="badge">auth unknown</span>'; }
+  const req = reqH.length ? reqH.map(([k, v]) => `${k}: ${v}`).join('\n') : '(no request headers captured)';
+  const res = resH.length ? resH.map(([k, v]) => `${k}: ${v}`).join('\n') : '(no response headers captured)';
+  const sentRaw = (n as unknown as { reqBody?: string } | undefined)?.reqBody;
+  const sent = safeSnippetBody(sentRaw, 1500);
+  const body = rawBodies.get(url)?.slice(0, 1500) ?? '(body not retained — enable retain raw + recapture)';
+  return `${badges}<br/><b>Sent body</b><br/>${esc(sent)}<br/><button data-act="copysent" data-url="${esc(url)}" title="Copy sent body">Copy sent</button><br/><b>request headers</b> (≤12)<br/>${esc(req)}<br/><b>response headers</b> (≤12)<br/>${esc(res)}<br/><b>body preview</b><br/>${esc(body)}<br/><button data-act="copybody" data-url="${esc(url)}" title="Copy body preview">Copy body</button>`;
+}
+
+function filteredApiRows(all: ApiRow[]): ApiRow[] {
+  return apiKind === 'ALL' ? all : all.filter((r) => String(r.kind) === apiKind);
+}
+
+function renderApis(): void {
+  const all = buildApiRows();
+  syncApiKindOptions(all);
+  const filtered = filteredApiRows(all);
+  const pill = document.getElementById('cApis');
+  if (pill) pill.textContent = String(all.length);
+  const body = document.getElementById('apisBody');
+  if (!body) return;
+  if (!filtered.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">no APIs yet — browse the page or run Deep Scan</td></tr>';
+    const cnt0 = document.getElementById('apiCount');
+    if (cnt0) cnt0.textContent = `0 shown of ${all.length}${apiKind !== 'ALL' ? ` · ${apiKind}` : ''}`;
+    return;
+  }
+  const fp = fpHost();
+  let groups: Array<{ host: string; items: ApiRow[] }> = [];
+  try {
+    groups = groupByHost(filtered, (r) => r.url);
+  } catch { groups = [{ host: '(relative)', items: filtered }]; }
+  if (fp) {
+    const i = groups.findIndex((g) => g.host === fp);
+    if (i > 0) { const [g] = groups.splice(i, 1); groups.unshift(g); }
+  }
+  const out: string[] = [];
+  let shown = 0;
+  for (const g of groups) {
+    apiGrpDefault(g.host, fp);
+    const col = apiCollapsed.has(g.host);
+    const gh = esc(g.host);
+    out.push(`<tr class="grp"><td colspan="5"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} apis</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopycurl" data-grp="${gh}" title="Copy group cURLs (called only, ≤30)">Copy cURLs</button></td></tr>`);
+    const hide = col ? ' class="hidden"' : '';
+    for (const r of g.items.slice(0, 100)) {
+      shown++;
+      out.push(apiRowHtml(r, gh, hide));
+      const det = apiExpanded.has(r.url) ? apiDetHtml.get(r.url) : undefined;
+      if (det) out.push(`<tr class="det" data-g="${gh}"${hide}><td colspan="5">${det}</td></tr>`);
+    }
+    if (g.items.length > 100) out.push(`<tr data-g="${gh}"${hide}><td colspan="5" class="muted">… +${g.items.length - 100} more in this group — refine the kind filter or use Copy URLs</td></tr>`);
+  }
+  body.innerHTML = out.join('');
+  const cnt = document.getElementById('apiCount');
+  if (cnt) cnt.textContent = `${shown} shown of ${all.length}${apiKind !== 'ALL' ? ` · ${apiKind}` : ''}`;
+}
+
+async function copyFilteredApiUrls(): Promise<void> {
+  const all = buildApiRows();
+  const urls = filteredApiRows(all).slice(0, 1000).map((r) => r.url);
+  if (!urls.length) { diag('nothing to copy — API filter matches zero rows'); return; }
+  await copyText(urls.join('\n'), `${urls.length} API URLs`);
+}
+
+async function copyApiGroupUrls(grp: string): Promise<void> {
+  const items = groupItems(filteredApiRows(buildApiRows()), (r) => r.url, grp);
+  if (!items.length) { diag('nothing to copy — group is empty'); return; }
+  await copyText(items.slice(0, 1000).map((r) => r.url).join('\n'), `${Math.min(items.length, 1000)} API URLs (${grp})`);
+}
+
+async function copyApiGroupCurls(grp: string): Promise<void> {
+  const items = groupItems(filteredApiRows(buildApiRows()), (r) => r.url, grp).filter((r) => r.entry).slice(0, 30);
+  if (!items.length) { diag('nothing to copy — group has no called API rows'); return; }
+  const parts = items.map((r) => {
+    const n = r.entry!;
+    return buildCurl(n.method, n.url, n.reqHeaders ?? {});
+  });
+  await copyText(parts.join('\n'), `${items.length} API cURLs (${grp}, called only)`);
+}
+
+/** Single delegated listener for the APIs table (open/copy/view/curl/copybody/copysent/expand/groups). */
+function apiClick(e: Event): void {
+  const t = (e.target as HTMLElement).closest?.('[data-act]') as HTMLElement | null;
+  if (!t) return;
+  e.preventDefault();
+  const act = t.dataset.act;
+  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopycurl') {
+    const grp = t.dataset.grp ?? '';
+    if (!grp) return;
+    if (act === 'gtoggle') {
+      apiTouched.add(grp);
+      if (apiCollapsed.has(grp)) apiCollapsed.delete(grp);
+      else apiCollapsed.add(grp);
+      renderApis();
+      return;
+    }
+    if (act === 'gcopy') { void copyApiGroupUrls(grp); return; }
+    void copyApiGroupCurls(grp);
+    return;
+  }
+  const url = t.dataset.url ?? '';
+  if (act === 'expand') {
+    if (!url) return;
+    if (apiExpanded.has(url)) {
+      apiExpanded.delete(url);
+    } else {
+      if (!apiDetHtml.has(url)) {
+        try { apiDetHtml.set(url, apiDetailHtml(url)); }
+        catch { apiDetHtml.set(url, '(detail unavailable)'); }
+        if (apiDetHtml.size > 200) {
+          const oldest = apiDetHtml.keys().next().value as string | undefined;
+          if (oldest !== undefined && oldest !== url) { apiDetHtml.delete(oldest); apiExpanded.delete(oldest); }
+        }
+      }
+      apiExpanded.add(url);
+    }
+    renderApis();
+    return;
+  }
+  if (!url) return;
+  if (act === 'open') openUrl(url);
+  else if (act === 'copy') void copyText(url, 'API URL');
+  else if (act === 'view') void viewUrl(url);
+  else if (act === 'curl') {
+    const n = netEntries.find((x) => x.url === url);
+    if (!n) { diag('cURL: request no longer in buffer', url); return; }
+    try { void copyText(buildCurl(n.method, n.url, n.reqHeaders ?? {}), 'cURL'); }
+    catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
+  } else if (act === 'copybody') {
+    const b = rawBodies.get(url);
+    void copyText(b != null ? b.slice(0, 20000) : '(body not retained — enable retain raw + recapture)', 'API body');
+  } else if (act === 'copysent') {
+    const n = netEntries.find((x) => x.url === url);
+    const sent = (n as unknown as { reqBody?: string } | undefined)?.reqBody ?? '';
+    void copyText(sent, 'sent body');
+  }
+}
+
 // ---------- analyze (secret findings) ----------
 const SEC_BLURB: Record<Severity, string> = {
   critical: 'critical — likely live credentials or private keys; rotate immediately if exposed',
@@ -1065,29 +1463,45 @@ const SEC_BLURB: Record<Severity, string> = {
 };
 
 function renderAnalyze(): void {
+  refreshExposures();
   const pill = document.getElementById('cAnalyze');
   if (pill) pill.textContent = String(secFindings.length);
   const box = document.getElementById('secList');
   if (!box) return;
   const total = secFindings.length;
   renderedSec.length = 0;
+  renderedAnaGroups.clear();
   let html = '';
   for (const sev of ['critical', 'high', 'medium', 'info'] as Severity[]) {
     const items = secFindings.filter((f) => f.sev === sev);
     if (!items.length) continue;
     html += `<div><span class="badge sev-${sev}">${sev}</span> <span class="muted small">${esc(SEC_BLURB[sev])} (${items.length})</span></div>`;
-    for (const f of items) {
+    let subgroups: Array<{ host: string; items: SecFinding[] }> = [];
+    try {
+      subgroups = groupByHost(items, (f) => f.prov.resourceUrl);
+    } catch { subgroups = [{ host: '(relative)', items }]; }
+    for (const g of subgroups) {
+      const key = `${sev}|${g.host}`;
+      renderedAnaGroups.set(key, g.items.slice(0, 100));
+      const col = anaCollapsed.has(key);
+      const gk = esc(key);
+      const gh = esc(g.host);
+      html += `<div class="grp"><button data-act="atoggle" data-grp="${gk}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted small">${g.items.length} findings</span> <button data-act="acopy" data-grp="${gk}" title="Copy group findings">Copy</button></div>`;
+      if (col) continue;
+      for (const f of g.items) {
+        if (renderedSec.length >= 150) break;
+        const i = renderedSec.length;
+        renderedSec.push(f);
+        const p = f.prov;
+        const loc = p.line && p.line > 0 ? ` · L${p.line}${p.column ? ':' + p.column : ''}` : '';
+        const rule = f.label && f.label !== f.rule ? `${f.rule} · ${f.label}` : f.rule;
+        html += `<div class="res"><div class="head"><span class="badge sev-${f.sev}">${esc(f.sev)}</span>`
+          + `<span class="badge" title="rule">${esc(rule)}</span>`
+          + `<span class="orig" title="${esc(f.text.slice(0, 400))}">${esc(displayNameFor(f.text, 120))}</span>`
+          + `<span class="open"><button data-act="open" data-i="${i}" title="Open source">Open</button> <button data-act="copy" data-i="${i}" title="Copy finding">Copy</button></span></div>`
+          + `<div class="prov">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div></div>`;
+      }
       if (renderedSec.length >= 150) break;
-      const i = renderedSec.length;
-      renderedSec.push(f);
-      const p = f.prov;
-      const loc = p.line && p.line > 0 ? ` · L${p.line}${p.column ? ':' + p.column : ''}` : '';
-      const rule = f.label && f.label !== f.rule ? `${f.rule} · ${f.label}` : f.rule;
-      html += `<div class="res"><div class="head"><span class="badge sev-${f.sev}">${esc(f.sev)}</span>`
-        + `<span class="badge" title="rule">${esc(rule)}</span>`
-        + `<span class="orig" title="${esc(f.text.slice(0, 400))}">${esc(displayNameFor(f.text, 120))}</span>`
-        + `<span class="open"><button data-act="open" data-i="${i}" title="Open source">Open</button> <button data-act="copy" data-i="${i}" title="Copy finding">Copy</button></span></div>`
-        + `<div class="prov">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div></div>`;
     }
     if (renderedSec.length >= 150) break;
   }
@@ -1095,18 +1509,73 @@ function renderAnalyze(): void {
   else if (total > renderedSec.length) html += `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports up to 100</div>`;
   box.innerHTML = html;
   const sc = document.getElementById('secCount');
-  if (sc) sc.textContent = `${total} findings${secDropped ? ` · ${secDropped} dropped at cap` : ''}`;
+  if (sc) sc.textContent = `${total} findings · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}`;
 }
 
-/** Delegated Open/Copy for Analyze rows (indexes into the last rendered slice). */
+/** Fold exposure-engine findings into secFindings (deduped, capped, gated on
+ *  settings.analyzeSecrets). Rows render through the existing severity groups. */
+function refreshExposures(): void {
+  if (!settings.analyzeSecrets) return;
+  try {
+    const input = {
+      routes: [...routes].slice(0, 1000).map(([route, v]) => ({ route, method: v.method, count: v.count })),
+      resources: [...resources.values()].slice(0, 1000).map((r) => ({ url: r.url, kind: r.kind, hasSourceMap: r.hasSourceMap })),
+      urls: [...resources.keys()].slice(0, 500).concat(netEntries.slice(0, 500).map((n) => n.url)),
+      params: (() => {
+        try { return index.records.filter((rec) => rec.prov.detail === 'param').slice(0, 500).map((rec) => rec.text); }
+        catch { return [] as string[]; }
+      })(),
+    };
+    const findings = findExposures(input);
+    for (const f of findings.slice(0, 500)) {
+      const key = `${f.rule}|${f.text}|${f.url}`;
+      if (expoKeys.has(key)) continue;
+      if (secFindings.length >= 2000) {
+        secDropped++;
+        if (!secDiagOnce) { secDiagOnce = true; diag('secret findings cap reached (2000 kept); further hits dropped — use Copy findings promptly'); }
+        continue;
+      }
+      expoKeys.add(key);
+      expoAdded++;
+      secFindings.push({
+        text: f.text || f.url,
+        prov: {
+          resourceUrl: f.url || sessionOrigin + f.route || '',
+          resourceKind: (f.kind as ResourceKind) || 'route',
+          route: f.route || sessionRoute, method: 'deep-scan', detail: f.rule,
+        },
+        rule: f.rule, sev: f.sev, label: f.label,
+      });
+    }
+  } catch { /* exposure engine unavailable/failing — secret path still works */ }
+}
+
+/** Delegated Open/Copy for Analyze rows + host-group toggle/copy (data-grp `sev|host`). */
 function secClick(e: Event): void {
   const t = (e.target as HTMLElement).closest?.('[data-act]') as HTMLElement | null;
   if (!t) return;
   e.preventDefault();
+  const act = t.dataset.act;
+  if (act === 'atoggle') {
+    const grp = t.dataset.grp ?? '';
+    if (!grp) return;
+    if (anaCollapsed.has(grp)) anaCollapsed.delete(grp);
+    else anaCollapsed.add(grp);
+    renderAnalyze();
+    return;
+  }
+  if (act === 'acopy') { void copyAnaGroup(t.dataset.grp ?? ''); return; }
   const f = renderedSec[Number(t.dataset.i)];
   if (!f) return;
-  if (t.dataset.act === 'open') openUrl(f.prov.resourceUrl);
-  else if (t.dataset.act === 'copy') void copyText(f.text, 'secret finding');
+  if (act === 'open') openUrl(f.prov.resourceUrl);
+  else if (act === 'copy') void copyText(f.text, 'secret finding');
+}
+
+async function copyAnaGroup(grp: string): Promise<void> {
+  const items = renderedAnaGroups.get(grp);
+  if (!items?.length) { diag('nothing to copy — group is empty'); return; }
+  const parts = items.slice(0, 100).map((f) => `[${f.sev}] ${f.rule}${f.label && f.label !== f.rule ? ` (${f.label})` : ''}\n${f.text}\n— ${f.prov.resourceUrl} · route ${f.prov.route} · via ${f.prov.method}`);
+  await copyText(parts.join('\n\n'), `${Math.min(items.length, 100)} secret findings (${grp})`);
 }
 
 async function copySecFindings(): Promise<void> {
@@ -1255,6 +1724,9 @@ function wire(): void {
   ($('netTable').querySelector('tbody')!).addEventListener('click', (e) => tableClick(e, 'net'));
   $('btnNetCopyUrls').addEventListener('click', () => void copyFilteredNetUrls());
   $('btnNetCopyAll').addEventListener('click', () => void copyFilteredNetAll());
+  on('apiKind', 'change', (e) => { apiKind = (e.target as HTMLSelectElement).value; renderApis(); });
+  on('apisBody', 'click', apiClick);
+  on('btnApisCopyAll', 'click', () => void copyFilteredApiUrls());
   $('btnDiscoverRoutes').addEventListener('click', () => void discoverRoutesNow());
   on('routeFilter', 'input', () => renderRoutes());
   on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
@@ -1292,6 +1764,11 @@ function clearSession(): void {
   lastResults = []; lastResultsById.clear();
   resType = 'ALL'; netMethod = 'ALL'; netKind = 'ALL';
   resTypeSig = ''; netMethodSig = ''; netKindSig = '';
+  apiKind = 'ALL'; apiKindSig = ''; apiExpanded.clear(); apiDetHtml.clear();
+  apiCollapsed.clear(); apiTouched.clear();
+  expoKeys.clear(); expoAdded = 0;
+  grpCollapsed.clear(); grpTouched.clear(); grpShowAll.clear();
+  anaCollapsed.clear(); renderedAnaGroups.clear();
   closeViewer();
   ledger.rawBytes = 0; ledger.indexedChars = 0; ledger.indexBytes = 0;
   ledger.records = 0; ledger.resources = 0; ledger.routes = 0; ledger.requests = 0; ledger.warned90 = false;
@@ -1319,7 +1796,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.4.2', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.5.1', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],

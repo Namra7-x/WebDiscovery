@@ -65,6 +65,7 @@ export interface NetEntry {
   bodyChars: number;
   ts: number;
   note?: string;
+  reqBody?: string; // sent request body text, sliced to 2000 chars at capture (only when capture.json on)
 }
 
 export interface GraphNode {

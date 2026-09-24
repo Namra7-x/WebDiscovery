@@ -108,3 +108,26 @@ body[data-theme="light"] .ctx mark { background:#ffe6a3; color:#5c3d00; }
 body[data-theme="light"] .warn { background:#fff2dc; color:#7a4a00; border-bottom-color:var(--warn); }
 body[data-theme="light"] .scope-row label { background:#fff; }
 body[data-theme="light"] .viewer-body { background:#f5f8fc; }
+
+/* APIs table (5 cols: Method, URL, Kind, Detail, Actions) — fixed layout like the others. */
+#apisTable { table-layout:fixed; width:100%; }
+#apisTable th:nth-child(1), #apisTable td:nth-child(1) { width:74px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#apisTable th:nth-child(2), #apisTable td:nth-child(2) { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#apisTable th:nth-child(3), #apisTable td:nth-child(3) { width:96px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#apisTable th:nth-child(4), #apisTable td:nth-child(4) { width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#apisTable th:nth-child(5), #apisTable td:nth-child(5) { width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#apisTable td.acts button { font-size:10px; padding:2px 7px; margin-right:4px; }
+
+/* Domain group header rows (Resources / Network) — simple bold row on panel bg. */
+.grp td { background:var(--panel); font-weight:bold; padding:6px 8px; }
+.grp td button { font-size:10px; padding:2px 7px; margin-right:4px; }
+.grp td .muted { font-weight:normal; }
+
+/* Analyze host subheaders — same bold group look as tr.grp, in the div-based list. */
+#secList .grp { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:6px 8px; font-weight:bold; }
+#secList .grp button { font-size:10px; padding:2px 7px; margin-right:4px; }
+#secList .grp .muted { font-weight:normal; }
+
+/* Expandable API detail rows. */
+.det td { color:var(--mut); white-space:pre-wrap; word-break:break-all; max-height:120px; overflow:auto; font-family:Consolas,Menlo,monospace; font-size:11px; }
+.det td button { font-size:10px; padding:2px 7px; }

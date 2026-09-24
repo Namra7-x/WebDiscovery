@@ -6,7 +6,7 @@ const refs = [
   m.background.service_worker, m.devtools_page, m.action.default_popup,
   ...Object.values(m.icons),
   'dist/panel.js', 'dist/content.js', 'dist/worker-indexer.js',
-  'dist/devtools.js', 'dist/popup.js', 'dist/extractors.js', 'dist/tables.js', 'dist/rules.js',
+  'dist/devtools.js', 'dist/popup.js', 'dist/extractors.js', 'dist/tables.js', 'dist/rules.js', 'dist/exposure.js',
   'panel.html', 'panel.css', 'popup.html', 'devtools.html',
 ];
 let fail = 0;

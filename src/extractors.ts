@@ -488,6 +488,123 @@ export function extractJs(src: string, starts?: number[]): Extracted[] {
     push(out, v, l, c, 'identifier');
     idCount++;
   }
+
+  // ---- JSON-RPC method facet (INDEX-ONLY, cap 100) ----
+  {
+    const JSONRPC_RE = /["']method["']\s*:\s*["']([A-Za-z_][\w.\-]{1,80})["']/g;
+    JSONRPC_RE.lastIndex = 0;
+    let jm: RegExpExecArray | null;
+    let jsonrpcCount = 0;
+    while ((jm = JSONRPC_RE.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && jsonrpcCount < 100) {
+      const method = jm[1];
+      if (!method) continue;
+      const valIdx = jm.index + jm[0].indexOf(method);
+      const [l, c] = lc(valIdx);
+      const before = out.length;
+      push(out, method.slice(0, MAX_UNIT_LEN), l, c, 'jsonrpc-method', 'jsonrpc:method');
+      if (out.length > before) jsonrpcCount++;
+    }
+  }
+
+  // ---- SOAP facet (INDEX-ONLY, cap 40 total) ----
+  {
+    let soapCount = 0;
+    const SOAP_ACTION_RE = /soapaction\s*[:=]\s*["']?([^"'`\s]{2,160})/gi;
+    SOAP_ACTION_RE.lastIndex = 0;
+    let sm: RegExpExecArray | null;
+    while ((sm = SOAP_ACTION_RE.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && soapCount < 40) {
+      let op = (sm[1] || '').trim();
+      if (!op) continue;
+      op = op.replace(/[,\;)}\]]+$/g, '');
+      if (op.length < 2 || op.length > MAX_UNIT_LEN) continue;
+      const valIdx = sm.index + sm[0].indexOf(sm[1]);
+      const [l, c] = lc(valIdx >= sm.index ? valIdx : sm.index);
+      const before = out.length;
+      push(out, op.slice(0, MAX_UNIT_LEN), l, c, 'soap-op', 'soap:action');
+      if (out.length > before) soapCount++;
+    }
+    if (soapCount < 40) {
+      const SOAP_ENV_RE = /<\s*(?:\w+:)?Envelope[\s>]/g;
+      SOAP_ENV_RE.lastIndex = 0;
+      let em: RegExpExecArray | null;
+      while ((em = SOAP_ENV_RE.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && soapCount < 40) {
+        const [l, c] = lc(em.index);
+        const before = out.length;
+        push(out, 'SOAP Envelope', l, c, 'soap-op', 'soap:envelope');
+        if (out.length > before) soapCount++;
+      }
+    }
+  }
+
+  // ---- SSE facet (INDEX-ONLY, cap 40 total; source AND string literals) ----
+  {
+    let sseCount = 0;
+    const seenSse = new Set<string>();
+    const SSE_SRC_RE = /(?:^)?\s*event\s*:\s*([A-Za-z][\w\-]{0,60})/gm;
+    SSE_SRC_RE.lastIndex = 0;
+    let em: RegExpExecArray | null;
+    while ((em = SSE_SRC_RE.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && sseCount < 40) {
+      const name = em[1];
+      if (!name) continue;
+      const valIdx = em.index + em[0].indexOf(name);
+      const [l, c] = lc(valIdx >= em.index ? valIdx : em.index);
+      const before = out.length;
+      push(out, name.slice(0, MAX_UNIT_LEN), l, c, 'sse-event', 'sse:event');
+      if (out.length > before) {
+        sseCount++;
+        seenSse.add(name);
+      }
+    }
+    if (sseCount < 40) {
+      for (const lit of lits) {
+        if (out.length >= MAX_UNITS_PER_RESOURCE || sseCount >= 40) break;
+        const SSE_LIT_RE = /(?:^)?\s*event\s*:\s*([A-Za-z][\w\-]{0,60})/gm;
+        SSE_LIT_RE.lastIndex = 0;
+        let lm: RegExpExecArray | null;
+        while ((lm = SSE_LIT_RE.exec(lit.value)) && out.length < MAX_UNITS_PER_RESOURCE && sseCount < 40) {
+          const name = lm[1];
+          if (!name || seenSse.has(name + '@lit')) continue;
+          const [l, c] = lc(lit.index);
+          const before = out.length;
+          push(out, name.slice(0, MAX_UNIT_LEN), l, c, 'sse-event', 'sse:event');
+          if (out.length > before) {
+            sseCount++;
+            seenSse.add(name + '@lit');
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Sink facet (INDEX-ONLY, dangerous sinks for Analyze tab; cap 200, dedupe) ----
+  {
+    const SINK_PATTERNS: Array<{ re: RegExp; extra: string }> = [
+      { re: /\beval\s*\(/g, extra: 'sink:eval' },
+      { re: /\bFunction\s*\(/g, extra: 'sink:Function' },
+      { re: /\.innerHTML\s*=/g, extra: 'sink:innerHTML' },
+      { re: /document\.write\s*\(/g, extra: 'sink:document.write' },
+      { re: /\.outerHTML\s*=/g, extra: 'sink:outerHTML' },
+      { re: /setTimeout\s*\(\s*["']/g, extra: 'sink:setTimeout-string' },
+    ];
+    const seenSink = new Set<string>();
+    let sinkCount = 0;
+    for (const pat of SINK_PATTERNS) {
+      if (out.length >= MAX_UNITS_PER_RESOURCE || sinkCount >= 200) break;
+      pat.re.lastIndex = 0;
+      let km: RegExpExecArray | null;
+      while ((km = pat.re.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && sinkCount < 200) {
+        const raw = src.slice(km.index, km.index + km[0].length + 100);
+        const text = raw.replace(/[\r\n]+/g, ' ').slice(0, 120);
+        if (text.length < 2) continue;
+        if (seenSink.has(text)) continue;
+        seenSink.add(text);
+        const [l, c] = lc(km.index);
+        const before = out.length;
+        push(out, text, l, c, 'sink', pat.extra);
+        if (out.length > before) sinkCount++;
+      }
+    }
+  }
   return out;
 }
 
@@ -743,6 +860,11 @@ export function extractJson(text: string): Extracted[] {
         const [k, val] = entries[i];
         const p = path === '$' ? k : `${path}.${k}`;
         push(out, k, -1, -1, 'json-key', p);
+        // JSON-RPC method facet (INDEX-ONLY): exact key `method` with a
+        // method-name string value gets an extra searchable unit.
+        if (k === 'method' && typeof val === 'string' && /^[A-Za-z_][\w.\-]{1,80}$/.test(val)) {
+          push(out, val, -1, -1, 'jsonrpc-method', p);
+        }
         stack.push({ v: val, path: p });
         count++;
         if (count >= 4000) break;

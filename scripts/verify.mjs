@@ -6,8 +6,9 @@ import { fuzzyScore, fuzzyMatch } from '../dist/fuzzy.js';
 import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
-import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank } from '../dist/tables.js';
-import { SECRET_RULES, scanTextForSecrets, isPlaceholder } from '../dist/rules.js';
+import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody } from '../dist/tables.js';
+import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon } from '../dist/rules.js';
+import { classifyApiKind, findExposures } from '../dist/exposure.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { defaultScope } from '../dist/types.js';
 
@@ -251,6 +252,100 @@ ok('namespace paths rejected', () => {
   assert.equal(classifyPath('/2000/svg'), null);
   assert.equal(classifyPath('/1998/Math/MathML'), null);
   assert.equal(classifyPath('/dashboard/settings'), 'route'); // real routes unaffected
+});
+
+// 22. classifyApiKind — ordered kind detection.
+ok('classifyApiKind', () => {
+  assert.equal(classifyApiKind('/graphql'), 'GraphQL');
+  assert.equal(classifyApiKind('/api/trpc/user.byId?batch=1&input=%7B%7D'), 'tRPC');
+  assert.equal(classifyApiKind('https://x.example/grpc', 'application/grpc'), 'gRPC-Web');
+  assert.equal(classifyApiKind('ws://x.example/socket'), 'WebSocket');
+  assert.equal(classifyApiKind('https://x.example/events', 'text/event-stream'), 'SSE');
+  assert.equal(classifyApiKind('https://x.example/api/models'), 'REST');
+  assert.equal(classifyApiKind('https://x.example/rpc', 'application/json', 'POST', '{"method":"getUser"}'), 'JSON-RPC');
+  assert.equal(classifyApiKind('https://x.example/soap', 'text/xml', 'POST', '<Envelope><Body/>'), 'SOAP');
+  assert.equal(classifyApiKind('https://x.example/img/a.png', 'image/png'), 'Other');
+});
+
+// 23. findExposures — one finding per category, right rules/sevs.
+ok('findExposures', () => {
+  const findings = findExposures({
+    routes: [{ route: '/admin/users', method: 'GET', count: 3 }],
+    resources: [{ url: 'https://x.example/app.js', kind: 'script', hasSourceMap: true }],
+    urls: ['https://x.example/api/s?token=abc123', 'https://staging.example.com/home'],
+    params: ['redirect'],
+  });
+  assert.equal(findings.length, 5, JSON.stringify(findings));
+  const byRule = new Map(findings.map((f) => [f.rule, f]));
+  assert.equal(byRule.get('expo-sourcemap').sev, 'high');
+  assert.equal(byRule.get('expo-sensitive-endpoint').sev, 'high');
+  assert.equal(byRule.get('expo-auth-in-url').sev, 'high');
+  assert.equal(byRule.get('expo-param').sev, 'medium');
+  assert.equal(byRule.get('expo-internal-domain').sev, 'medium');
+});
+
+// 24. generic assignment + entropy + jwt-none + new vendor shapes.
+ok('generic secrets: assignment, entropy, jwt-none', () => {
+  const g = scanTextForSecrets('api_key = "aB3xK9pQ2mZ7vL4qWeRt6"');
+  assert.ok(g.some((h) => h.rule === 'generic_secret_assignment' && h.sev === 'medium'), JSON.stringify(g));
+  assert.ok(shannon('aaaaaaaa') < shannon('aB3xK9pQ2mZ7vL4qWeRt6'), 'entropy sanity');
+  const b64u = (s) => Buffer.from(s, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const noneJwt = `${b64u('{"alg":"none"}')}.${b64u('{"sub":"1"}')}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c`;
+  assert.equal(decodeJwtAlg(noneJwt), 'none');
+  const j = scanTextForSecrets(noneJwt);
+  assert.ok(j.some((h) => h.rule === 'jwt' && h.sev === 'high'), JSON.stringify(j));
+  assert.ok(j.some((h) => h.rule === 'jwt_none_alg' && h.sev === 'critical'), JSON.stringify(j));
+  const proj = scanTextForSecrets('key = "sk-proj-aB3xK9pQ2mZ7vL4qWeRt7GhY8"');
+  assert.ok(proj.some((h) => h.rule === 'openai_project' && h.sev === 'critical'), JSON.stringify(proj));
+  const asia = scanTextForSecrets('token ASIAIOSFODNN7EXAMPLE12345 here');
+  assert.ok(asia.some((h) => h.rule === 'aws_session_token' && h.sev === 'critical'), JSON.stringify(asia));
+});
+
+// 25. sinks + new facets (extractors agent owns these kinds).
+ok('sinks + new facets', () => {
+  const s = extractJs('if(x){eval(y)}; el.innerHTML = z; document.write(w);');
+  const sinks = s.filter((u) => u.kind === 'sink');
+  assert.equal(sinks.length, 3, JSON.stringify(sinks.map((u) => [u.kind, u.text, u.extra])));
+  for (const e of ['sink:eval', 'sink:innerHTML', 'sink:document.write']) {
+    assert.ok(sinks.some((u) => u.extra === e), `missing ${e} in ${JSON.stringify(sinks.map((u) => u.extra))}`);
+  }
+  assert.ok(extractJs('"method":"getUser"').some((u) => u.kind === 'jsonrpc-method'), 'jsonrpc-method');
+  assert.ok(extractJs('event: priceUpdate').some((u) => u.kind === 'sse-event'), 'sse-event');
+  assert.ok(extractJs('soapaction: "urn:X"').some((u) => u.kind === 'soap-op'), 'soap-op');
+});
+
+// 26. hostOf + groupByHost.
+ok('hostOf + groupByHost', () => {
+  assert.equal(hostOf('https://API.X.example:8080/a'), 'api.x.example');
+  assert.equal(hostOf('/relative/path'), '');
+  const groups = groupByHost(
+    [{ u: 'https://b.example/x' }, { u: 'https://a.example/x' }, { u: 'https://a.example/y' }, { u: '/rel' }],
+    (t) => t.u,
+  );
+  assert.equal(groups[0].host, 'a.example');
+  assert.equal(groups[0].items.length, 2);
+  assert.equal(groups[groups.length - 1].host, '(relative)');
+});
+
+// 27. NetEntry reqBody optional + snippetBody basics.
+ok('NetEntry reqBody optional + snippetBody', () => {
+  const entry = { id: '1', url: 'https://x.test/a', method: 'POST', route: '/', bodyKept: false, bodyTruncated: false, bodyChars: 0, ts: 1 };
+  assert.equal(entry.reqBody, undefined);
+  assert.ok(snippetBody(undefined).includes('not captured'));
+  assert.ok(snippetBody('').includes('not captured'));
+  assert.equal(snippetBody('hello'), 'hello');
+  const long = 'x'.repeat(2000);
+  const out = snippetBody(long, 100);
+  assert.ok(out.includes('truncated'));
+  assert.ok(out.length <= 140, `len=${out.length}`);
+});
+
+// 28. snippetBody default cap 1500.
+ok('snippetBody default cap 1500', () => {
+  const input = 'y'.repeat(1600);
+  const out = snippetBody(input);
+  assert.ok(out.includes('truncated'));
+  assert.ok(out.includes('100 chars'));
 });
 
 console.log(`\n${pass} checks passed.`);

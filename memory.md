@@ -4,6 +4,38 @@
 
 ---
 
+## v1.5.1 — 2026-09-23 (group show-all, Analyze host sections, sent bodies)
+
+Built by 2 parallel agents, no overlap (UI: panel.ts/html/css · core: types.ts/tables.ts/verify). All assumed shapes matched on landing.
+- **Per-group Show-all** in Resources/Network: `Show all (N)` / `Show less` per domain section lifts the 100-row cap → 1000 (hard cap stays); default view unchanged and fast.
+- **Analyze host sections**: findings subgrouped per website inside each severity group (collapsible, per-group Copy ≤100); severity order, caps, pill, counts unchanged.
+- **Sent bodies**: `NetEntry.reqBody` captures POST `postData.text` (≤2000 chars, only when JSON capture on; ≈1.6MB worst case); API detail shows a "Sent body" block + Copy-sent; `snippetBody()` helper (tested) with guarded fallback.
+- Verified: tsc clean, `verify.mjs` **28/28**, manifest clean, `release/deepscope/` ≈ 241KB, zero deps.
+
+---
+
+## v1.5.0 — 2026-09-23 (API tab + domain grouping + exposure engine)
+
+Built by 3 parallel subagents, zero file overlaps (A: extractors.ts · B: rules.ts/exposure.ts/tables.ts/verify/check-manifest · C: panel.ts/panel.html/panel.css). Contracts fixed up-front; all assumed shapes matched on landing — zero integration conflicts.
+
+### API tab (new, separate)
+- `panel.ts/html/css`: **APIs** tab after Analyze — called API rows (method, URL, kind badge, status·mime) + uncalled API-like routes (`in code, not called`); expandable detail rows (req/res headers ≤12, auth/token badges, body preview ≤1500, lazy-rendered + cached); per-row Open/Copy/View/cURL; dynamic kind filter + counts + `cApis` pill.
+- API kinds (`exposure.ts` `classifyApiKind`): REST, GraphQL, tRPC, gRPC-Web, JSON-RPC, SOAP, SSE, WebSocket, Other — ordered detection over URL+mime+body-start.
+
+### API-type capture completeness
+- `extractors.ts`: JSON-RPC `method` facets (JSON bodies + JS literals), SOAP actions/envelopes, SSE `event:` names, 6-pattern **sink** facets (`sink:eval` etc., cap 200, deduped) — all index-only facets sharing existing caps.
+- Honest boundaries kept: gRPC-Web bodies stay metadata-only (protobuf binary); WebSocket *frames* still need the opt-in hook phase.
+
+### Domain-grouped Resources/Network
+- `tables.ts` `hostOf`/`groupByHost`; panel renders per-host collapsible sections (first-party first + expanded, third-party collapsed, toggles persist); header rows with counts, sizes, per-group **Copy URLs / Copy URLs+contents** (same 30×10KB/400KB bounds); 100 items/group cap; global buttons/filters/counts unchanged.
+
+### Stronger secrets + exposure findings
+- `rules.ts` 41→**50 rules**: `sk-proj-`, `ASIA`, Stripe test, Slack app tokens, password/private-token assignments, `x-api-key`, npm auth, **generic credential-assignment** (medium, FP-guarded) + **Shannon entropy** heuristic (≥4.7, medium) + **JWT `alg:none` → critical** via `decodeJwtAlg()`. Worker flow picks it all up automatically.
+- New `exposure.ts` `findExposures()` (all from existing RAM data): exposed source maps (high), debug/admin endpoints (high), auth-in-URL (high), interesting params (medium), internal/staging domains (medium) — deduplicated, capped, rendered through existing Analyze severity groups.
+- `verify.mjs` 21→**26 checks**. Release ≈ **232KB**, runtime deps still 0. `check-manifest.mjs` asserts `dist/exposure.js`.
+
+---
+
 ## v1.4.2 — 2026-09-23 (flat Routes, fixed table columns)
 
 - **Routes tab flat + full URLs**: indent removed entirely (was pushing nested routes right on route-heavy sites); first cell shows the complete URL, wrapping in place — entire URL always visible, full value also in tooltip.

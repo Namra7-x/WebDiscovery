@@ -97,3 +97,39 @@ export function severityRank(s: Severity): number {
     case 'info': return 3;
   }
 }
+
+/** Lowercased hostname of an absolute URL, or '' when unparseable/relative. */
+export function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Group items by URL host (via `urlOf`). Empty hosts bucket under
+ * '(relative)', always sorted last; the rest sort by count desc, then host.
+ */
+export function groupByHost<T>(items: T[], urlOf: (t: T) => string): Array<{ host: string; items: T[] }> {
+  const m = new Map<string, T[]>();
+  for (const it of items) {
+    const h = hostOf(urlOf(it)) || '(relative)';
+    const arr = m.get(h);
+    if (arr) arr.push(it);
+    else m.set(h, [it]);
+  }
+  return [...m.entries()]
+    .map(([host, group]) => ({ host, items: group }))
+    .sort((a, b) => {
+      if (a.host === '(relative)' && b.host !== '(relative)') return 1;
+      if (b.host === '(relative)' && a.host !== '(relative)') return -1;
+      return b.items.length - a.items.length || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0);
+    });
+}
+
+export function snippetBody(s: string | undefined, cap = 1500): string {
+  if (!s) return '(request/response body not captured — enable retain raw + recapture)';
+  if (s.length > cap) return s.slice(0, cap) + `\n… [truncated ${s.length - cap} chars]`;
+  return s;
+}

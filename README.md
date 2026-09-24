@@ -107,7 +107,6 @@ no CDN, no bundler, no framework.
   capped (300/250 rows) with `shown X of Y` counters.
 
 ## Analyze (security / exposure)
-
 - New **Analyze tab**: 41-pattern secret engine (cloud keys, tokens, JWT, private
   keys, connection strings) with placeholder/false-positive guards, severity
   grouped critical → info with plain-language blurbs, Open/Copy per finding.
@@ -116,6 +115,19 @@ no CDN, no bundler, no framework.
 - Universal discovery behind it: GraphQL operations, axios baseURL joining,
   query-param facets, import maps, framework manifests, tRPC/gRPC, meta/form
   inputs, copy-as-cURL, and a rebuilt Routes tab (full links + Open/Copy).
+
+## APIs tab + domain grouping
+
+- New **APIs tab**: every captured API call (REST, GraphQL, tRPC, gRPC-Web,
+  JSON-RPC, SOAP, SSE) plus discovered-but-uncalled endpoints. Expandable rows
+  show request/response headers, auth badges, and body preview.
+- **Resources/Network group by website**: per-host collapsible sections
+  (first-party open, third-party collapsed) each with its own Copy URLs and
+  Copy URLs + contents buttons.
+- Secrets engine now 50 rules incl. generic credential assignments, entropy
+  heuristics, and JWT `none`-algorithm detection; exposure flags cover open
+  source maps, admin/debug endpoints, auth-in-URL, risky params, and
+  internal domains.
 
 ## Project structure
 

@@ -28,6 +28,7 @@
     <button data-tab="resources">Resources <span id="cRes" class="pill">0</span></button>
     <button data-tab="network">Network <span id="cNet" class="pill">0</span></button>
     <button data-tab="analyze">Analyze <span id="cAnalyze" class="pill">0</span></button>
+    <button data-tab="apis">APIs <span id="cApis" class="pill">0</span></button>
     <button data-tab="graph">Graph</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -66,7 +67,7 @@
       <div class="table-wrap"><table id="routeTable"><thead><tr><th>Route</th><th title="How many times this route was seen this session">Seen</th><th>Via</th><th>Actions</th></tr></thead><tbody id="routeBody"></tbody></table></div>
     </section>
     <section id="tab-resources" class="tab">
-      <p class="muted small">Every captured file. Click a URL to open it, View to preview contents.</p>
+      <p class="muted small">Every captured file, grouped by domain with per-group Show-all — click a URL to open it, View to preview contents.</p>
       <div class="row">
         <input id="resFilter" placeholder="filter resources…" />
         <select id="resType" title="Filter by resource type (built live from what was captured)"><option value="ALL">all types</option></select>
@@ -79,7 +80,7 @@
       <div class="table-wrap"><table id="resTable"><thead><tr><th>URL</th><th>Type</th><th>Status</th><th>Size</th><th>Route</th><th>Via</th><th>Map</th><th>Indexed</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
     </section>
     <section id="tab-network" class="tab">
-      <p class="muted small">Every observed request. Filter by method or type, View a body or copy one as cURL.</p>
+      <p class="muted small">Every observed request, grouped by domain with per-group Show-all — filter by method or type, View a body or copy one as cURL.</p>
       <div class="row">
         <select id="netMethod" title="Filter by HTTP method (built live from observed traffic)">
           <option value="ALL" selected>all methods</option>
@@ -98,6 +99,15 @@
       <p class="muted small">Possible secrets found in captured text, grouped by severity — critical means likely live credentials, high sensitive tokens, medium review-worthy, info low-risk context. All analysis stays local in this panel's RAM.</p>
       <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><span id="secCount" class="muted small"></span></div>
       <div id="secList" class="results"></div>
+    </section>
+    <section id="tab-apis" class="tab">
+      <p class="muted small">APIs seen on the wire (called) plus API-like routes spotted in code but never requested (uncalled), grouped by domain — click a Kind badge for headers, sent body and preview.</p>
+      <div class="row">
+        <select id="apiKind" title="Filter by API kind (built live from observed traffic)"><option value="ALL">all kinds</option></select>
+        <button id="btnApisCopyAll" title="Copy filtered API URLs (up to 1000 lines)">Copy all APIs</button>
+        <span id="apiCount" class="muted small"></span>
+      </div>
+      <div class="table-wrap"><table id="apisTable"><thead><tr><th>Method</th><th>API URL</th><th>Kind</th><th>Detail</th><th>Actions</th></tr></thead><tbody id="apisBody"></tbody></table></div>
     </section>
     <section id="tab-graph" class="tab">
       <p class="muted small" style="max-width:760px">The discovery graph is the <b>provenance map</b>: every node is a route, resource, JS chunk, API endpoint or frame, and every edge records <b>how it was found</b> (dom-link, dynamic-import, sourcemap-ref, deep-scan…). Use case: pick a search hit, then trace its chain here — e.g. <span class="mono">route /models → chunk assets/x.js → endpoint /api/models</span> — to see exactly which file and discovery step exposed a string, and what else that file pulled in.</p>
