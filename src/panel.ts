@@ -57,6 +57,10 @@ let netMethod = 'ALL';
 let netKind = 'ALL';
 let resType = 'ALL';
 let apiKind = 'ALL';
+/** Analyze global Show-all: lift the 150-row render cap (up to the 2000 cap). */
+let secShowAll = false;
+/** Routes global Show-all: lift the 300-row render slice (up to the 1200 cap). */
+let routeShowAll = false;
 // API tab state: option-sig cache (like netKind), lazily-rendered detail rows.
 let apiKindSig = '';
 const apiExpanded = new Set<string>();
@@ -866,7 +870,8 @@ function renderRoutes(): void {
   // Flat list: one row per route, full URL text in link + tooltip.
   // Reuses tableClick('route').
   const all = filteredRoutes();
-  const rows = all.slice(0, 300);
+  const cap = routeShowAll ? 1200 : 300;
+  const rows = all.slice(0, cap);
   ($('routeBody') as HTMLElement).innerHTML = rows.map(([r, v]) => {
     const full = routeFullUrl(r);
     return `<tr><td class="rt"><a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(full)}</a></td>`
@@ -876,7 +881,12 @@ function renderRoutes(): void {
       + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">no routes yet — browse the page or run Deep Scan</td></tr>';
   const rc = document.getElementById('routeCount');
-  if (rc) rc.textContent = `${all.length} shown${routes.size > all.length ? ` of ${routes.size}` : ''}`;
+  if (rc) {
+    const base = `${all.length} shown${routes.size > all.length ? ` of ${routes.size}` : ''}`;
+    rc.textContent = routeShowAll ? `${base} (Show-all on: up to 1200)` : (all.length > 300 ? `${base} — showing 300 (capped)` : base);
+  }
+  const rsb = document.getElementById('btnRoutesShowAll');
+  if (rsb) rsb.textContent = routeShowAll ? 'Show less' : `Show all (${all.length})`;
 }
 
 async function copyFilteredRouteUrls(): Promise<void> {
@@ -1358,15 +1368,18 @@ function renderApis(): void {
     apiGrpDefault(g.host, fp);
     const col = apiCollapsed.has(g.host);
     const gh = esc(g.host);
-    out.push(`<tr class="grp"><td colspan="5"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} apis</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopycurl" data-grp="${gh}" title="Copy group cURLs (called only, ≤30)">Copy cURLs</button></td></tr>`);
+    const showAll = grpShowAll.has(g.host);
+    const cap = showAll ? 1000 : 100;
+    const showBtn = g.items.length > 100 ? ` <button data-act="gshowall" data-grp="${gh}" title="Toggle full group (100 ↔ 1000)">${showAll ? 'Show less' : `Show all (${g.items.length})`}</button>` : '';
+    out.push(`<tr class="grp"><td colspan="5"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} apis</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopycurl" data-grp="${gh}" title="Copy group cURLs (called only, ≤30)">Copy cURLs</button>${showBtn}</td></tr>`);
     const hide = col ? ' class="hidden"' : '';
-    for (const r of g.items.slice(0, 100)) {
+    for (const r of g.items.slice(0, cap)) {
       shown++;
       out.push(apiRowHtml(r, gh, hide));
       const det = apiExpanded.has(r.url) ? apiDetHtml.get(r.url) : undefined;
       if (det) out.push(`<tr class="det" data-g="${gh}"${hide}><td colspan="5">${det}</td></tr>`);
     }
-    if (g.items.length > 100) out.push(`<tr data-g="${gh}"${hide}><td colspan="5" class="muted">… +${g.items.length - 100} more in this group — refine the kind filter or use Copy URLs</td></tr>`);
+    if (g.items.length > cap) out.push(`<tr data-g="${gh}"${hide}><td colspan="5" class="muted">… +${g.items.length - cap} more in this group — refine the kind filter or use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
   }
   body.innerHTML = out.join('');
   const cnt = document.getElementById('apiCount');
@@ -1402,13 +1415,19 @@ function apiClick(e: Event): void {
   if (!t) return;
   e.preventDefault();
   const act = t.dataset.act;
-  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopycurl') {
+  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopycurl' || act === 'gshowall') {
     const grp = t.dataset.grp ?? '';
     if (!grp) return;
     if (act === 'gtoggle') {
       apiTouched.add(grp);
       if (apiCollapsed.has(grp)) apiCollapsed.delete(grp);
       else apiCollapsed.add(grp);
+      renderApis();
+      return;
+    }
+    if (act === 'gshowall') {
+      if (grpShowAll.has(grp)) grpShowAll.delete(grp);
+      else grpShowAll.add(grp);
       renderApis();
       return;
     }
@@ -1469,6 +1488,7 @@ function renderAnalyze(): void {
   const box = document.getElementById('secList');
   if (!box) return;
   const total = secFindings.length;
+  const cap = secShowAll ? Math.min(secFindings.length, 2000) : 150;
   renderedSec.length = 0;
   renderedAnaGroups.clear();
   let html = '';
@@ -1489,7 +1509,7 @@ function renderAnalyze(): void {
       html += `<div class="grp"><button data-act="atoggle" data-grp="${gk}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted small">${g.items.length} findings</span> <button data-act="acopy" data-grp="${gk}" title="Copy group findings">Copy</button></div>`;
       if (col) continue;
       for (const f of g.items) {
-        if (renderedSec.length >= 150) break;
+        if (renderedSec.length >= cap) break;
         const i = renderedSec.length;
         renderedSec.push(f);
         const p = f.prov;
@@ -1501,15 +1521,19 @@ function renderAnalyze(): void {
           + `<span class="open"><button data-act="open" data-i="${i}" title="Open source">Open</button> <button data-act="copy" data-i="${i}" title="Copy finding">Copy</button></span></div>`
           + `<div class="prov">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div></div>`;
       }
-      if (renderedSec.length >= 150) break;
+      if (renderedSec.length >= cap) break;
     }
-    if (renderedSec.length >= 150) break;
+    if (renderedSec.length >= cap) break;
   }
   if (!html) html = '<span class="muted">no secret findings — enable “scan for exposed secrets” in Settings, then browse or Deep Scan</span>';
-  else if (total > renderedSec.length) html += `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports up to 100</div>`;
+  else if (total > renderedSec.length) html += secShowAll
+    ? `<div class="muted small">showing ${renderedSec.length} of ${total} findings (Show-all on: full bounded list) — Copy findings exports up to 100</div>`
+    : `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports up to 100</div>`;
   box.innerHTML = html;
   const sc = document.getElementById('secCount');
-  if (sc) sc.textContent = `${total} findings · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}`;
+  if (sc) sc.textContent = `${total} findings · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
+  const ssb = document.getElementById('btnSecShowAll');
+  if (ssb) ssb.textContent = secShowAll ? 'Show less' : 'Show all';
 }
 
 /** Fold exposure-engine findings into secFindings (deduped, capped, gated on
@@ -1730,8 +1754,10 @@ function wire(): void {
   $('btnDiscoverRoutes').addEventListener('click', () => void discoverRoutesNow());
   on('routeFilter', 'input', () => renderRoutes());
   on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
+  on('btnRoutesShowAll', 'click', () => { routeShowAll = !routeShowAll; renderRoutes(); });
   on('routeBody', 'click', (e) => tableClick(e, 'route'));
   on('btnSecCopy', 'click', () => void copySecFindings());
+  on('btnSecShowAll', 'click', () => { secShowAll = !secShowAll; renderAnalyze(); });
   on('secList', 'click', secClick);
   $('btnTheme').addEventListener('click', () => {
     settings.theme = settings.theme === 'light' ? 'dark' : 'light';
@@ -1760,6 +1786,7 @@ function clearSession(): void {
   index.clear(); graph.clear(); resources.clear(); rawBodies.clear(); rawOrder.length = 0;
   contentHash.clear(); netEntries.length = 0; routes.clear(); diags.length = 0;
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
+  secShowAll = false; routeShowAll = false;
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0;
   lastResults = []; lastResultsById.clear();
   resType = 'ALL'; netMethod = 'ALL'; netKind = 'ALL';
@@ -1796,7 +1823,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.5.1', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.5.2', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],

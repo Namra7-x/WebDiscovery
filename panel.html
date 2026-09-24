@@ -63,7 +63,7 @@
     <section id="tab-routes" class="tab">
       <p class="muted small">Every route seen on this origin. <b>Seen ×N</b> = times observed this session. Filter the list, then Open a route or Copy URLs to export.</p>
       <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small"></span></div>
-      <div class="row"><input id="routeFilter" type="text" placeholder="filter routes…" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><span id="routeCount" class="muted small"></span></div>
+      <div class="row"><input id="routeFilter" type="text" placeholder="filter routes…" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><button id="btnRoutesShowAll" title="Lift the 300-row render cap">Show all</button><span id="routeCount" class="muted small"></span></div>
       <div class="table-wrap"><table id="routeTable"><thead><tr><th>Route</th><th title="How many times this route was seen this session">Seen</th><th>Via</th><th>Actions</th></tr></thead><tbody id="routeBody"></tbody></table></div>
     </section>
     <section id="tab-resources" class="tab">
@@ -97,11 +97,11 @@
     </section>
     <section id="tab-analyze" class="tab">
       <p class="muted small">Possible secrets found in captured text, grouped by severity — critical means likely live credentials, high sensitive tokens, medium review-worthy, info low-risk context. All analysis stays local in this panel's RAM.</p>
-      <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><span id="secCount" class="muted small"></span></div>
+      <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><button id="btnSecShowAll" title="Lift the 150-row render cap">Show all</button><span id="secCount" class="muted small"></span></div>
       <div id="secList" class="results"></div>
     </section>
     <section id="tab-apis" class="tab">
-      <p class="muted small">APIs seen on the wire (called) plus API-like routes spotted in code but never requested (uncalled), grouped by domain — click a Kind badge for headers, sent body and preview.</p>
+      <p class="muted small">APIs seen on the wire (called) plus API-like routes spotted in code but never requested (uncalled), grouped by domain — per-group Show-all lifts the 100-row cap — click a Kind badge for headers, sent body and preview.</p>
       <div class="row">
         <select id="apiKind" title="Filter by API kind (built live from observed traffic)"><option value="ALL">all kinds</option></select>
         <button id="btnApisCopyAll" title="Copy filtered API URLs (up to 1000 lines)">Copy all APIs</button>

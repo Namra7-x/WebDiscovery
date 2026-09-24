@@ -4,6 +4,15 @@
 
 ---
 
+## v1.5.2 — 2026-09-23 (show-all everywhere rows were capped)
+
+- **API tab**: per-group `Show all (N)` / `Show less` reusing the shared `grpShowAll` set (100 → 1000 rows); overflow rows point at it.
+- **Analyze**: toolbar `Show all` toggle lifts the 150-row render cap → full bounded list (≤2000); subheaders + per-group copy keep working on the full slice.
+- **Routes**: toolbar `Show all (N)` / `Show less` lifts the 300-row cap → 1200; count text states the cap.
+- Search's 200-result limit deliberately untouched (per-keystroke path). Verified: tsc clean, 28/28, release ≈ 243KB.
+
+---
+
 ## v1.5.1 — 2026-09-23 (group show-all, Analyze host sections, sent bodies)
 
 Built by 2 parallel agents, no overlap (UI: panel.ts/html/css · core: types.ts/tables.ts/verify). All assumed shapes matched on landing.

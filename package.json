@@ -1,6 +1,6 @@
 {
   "name": "deepscope",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "private": true,
   "description": "DeepScope — RAM-only Chromium discovery + fuzzy search (MV3, TypeScript, zero runtime deps)",
   "type": "module",
