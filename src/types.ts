@@ -48,6 +48,13 @@ export interface ResourceMeta {
   indexedStrings: number;
   error?: string;              // diagnostics when capture/analysis failed
   ts: number;
+  // Request identity / target awareness (filled when known; never required).
+  reqId?: string;              // CDP requestId or devtools request id
+  frameId?: string;            // frame the resource belongs to
+  targetId?: string;           // CDP target (page/iframe/worker) when Deep Capture is on
+  workerKind?: WorkerKind;      // where it was observed
+  fromCache?: boolean;         // served from cache (disk/memory) rather than network
+  fromServiceWorker?: boolean; // served via a service worker
 }
 
 export interface NetEntry {
@@ -66,6 +73,17 @@ export interface NetEntry {
   ts: number;
   note?: string;
   reqBody?: string; // sent request body text, sliced to 2000 chars at capture (only when capture.json on)
+  // Request identity / correlation (filled when known; URL alone never identifies a request).
+  reqId?: string;              // CDP requestId or devtools request id (unique per actual request)
+  frameId?: string;            // frame that issued the request
+  targetId?: string;           // CDP target (page/iframe/worker) when Deep Capture is on
+  workerKind?: WorkerKind;      // where it was observed
+  loaderId?: string;           // CDP loaderId (navigation/document lifecycle)
+  redirects?: string[];        // redirect chain URLs (bounded, oldest-first)
+  protocol?: string;           // e.g. h2, http/1.1, websocket
+  timingMs?: number;           // wall-time duration when known
+  fromServiceWorker?: boolean; // handled by a service worker
+  fromCache?: boolean;         // served from cache rather than network
 }
 
 export interface GraphNode {
@@ -94,6 +112,9 @@ export type SearchMode = 'exact' | 'substring' | 'normalized' | 'regex' | 'fuzzy
 /** Finding severity for the Analyze tab (rules.ts maps every rule to one). */
 export type Severity = 'critical' | 'high' | 'medium' | 'info';
 
+/** Where a request/resource was observed: page, iframe, worker, or service worker. */
+export type WorkerKind = 'page' | 'iframe' | 'worker' | 'serviceworker' | 'unknown';
+
 export interface SearchResult {
   recordId: number;
   text: string;                // original
@@ -119,6 +140,16 @@ export interface SessionSettings {
   analyzeSecrets: boolean;   // rules.ts engine over indexed units (Analyze tab)
   includeBinaryMeta: boolean;
   onBudget: 'stop-capture' | 'discard-oldest-raw' | 'stop-deep-analysis';
+  // Unified hard retention budget (RAM + temporary IndexedDB, enforced by store.ts).
+  storageMB: number;           // max retained capture data (presets 60/100/250/500/1024 or custom)
+  maxBodyBytes: number;        // max single retained body (text); larger bodies stay metadata-only
+  retainBinary: boolean;       // retain image/video/audio bodies (default false: metadata only)
+  // Deep Capture behavior (all default-cheap; expensive modes are opt-in).
+  deep: {
+    concurrency: number;       // max simultaneous deep fetches / parser jobs
+    captureWsFrames: boolean;  // retain WebSocket frame payloads when Deep Capture is on
+    runtimeHook: boolean;      // instrument fetch/XHR/WS/EventSource/history in page (opt-in)
+  };
   deepScan: {
     maxDepth: number;
     maxPages: number;
@@ -144,12 +175,16 @@ export const DEFAULT_SETTINGS: SessionSettings = {
   maxResponseBytes: 2_000_000,
   maxIndexedChars: 400_000,
   maxResources: 3000,
-  retainRaw: false,
+  retainRaw: true,
   analyzeSourceMaps: true,
-  advancedJsAnalysis: false,
+  advancedJsAnalysis: true,
   analyzeSecrets: true,
   includeBinaryMeta: true,
   onBudget: 'discard-oldest-raw',
+  storageMB: 60,
+  maxBodyBytes: 524288,
+  retainBinary: false,
+  deep: { concurrency: 3, captureWsFrames: true, runtimeHook: true },
   deepScan: {
     maxDepth: 2,
     maxPages: 25,
@@ -177,8 +212,7 @@ export function defaultScope(): SearchScope {
 }
 
 // Map a resource kind to the scope flags that gate it.
-export function scopeAllows(kind: ResourceKind, s: SearchScope): boolean {
-  switch (kind) {
+export function scopeAllows(kind: ResourceKind, s: SearchScope): boolean {  switch (kind) {
     case 'dom': case 'document': return s.dom;
     case 'script': return s.js;
     case 'chunk': return s.chunks;
@@ -190,4 +224,17 @@ export function scopeAllows(kind: ResourceKind, s: SearchScope): boolean {
     case 'manifest': case 'header': case 'other-text': case 'media-meta': case 'font-meta': return s.meta;
     default: return true;
   }
+}
+
+/**
+ * Strict subdomain check: host is the base host itself or ends with '.' + base.
+ * Prevents evil-example.com matching example.com. Lowercases + strips one
+ * trailing dot before comparing. Pure — safe to use in panel, worker, content.
+ */
+export function isSubdomainOf(host: string, base: string): boolean {
+  const h = host.toLowerCase().replace(/\.$/, '');
+  const b = base.toLowerCase().replace(/\.$/, '').replace(/^www\./, '');
+  if (!h || !b) return false;
+  const hh = h.replace(/^www\./, '');
+  return hh === b || hh.endsWith(`.${b}`);
 }

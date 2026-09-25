@@ -1,5 +1,10 @@
 # DeepScope — RAM-only Web App Discovery & Universal Fuzzy Search
 
+> v1.6.0 engine: real CDP Deep Capture (opt-in), request-identity correlation,
+> endpoint evidence (static/runtime/network), unified storage budget (RAM +
+> temporary session IndexedDB, hard limit), worker/iframe/service-worker
+> awareness, WebSocket observation, backpressure + session generations.
+
 Production-quality Chromium (MV3) extension, no backend, no database, no persistent
 capture storage, zero runtime dependencies. TypeScript + native extension APIs +
 plain HTML/CSS UI + a Web Worker for heavy parsing/indexing.
@@ -59,7 +64,7 @@ default; a deeper scanner runs only with **Advanced JS analysis** on.
 | `webNavigation` | navigation/frame/SPA-route tracking (metadata) |
 | `webRequest` | broader request metadata (no bodies in SW); needs host grant to see traffic |
 | `storage` | **settings only** (`deepscope-settings`); captures never touch storage |
-| `debugger` (optional) | reserved for CDP Deep Capture, explicit opt-in, shows Chrome banner |
+| `debugger` (required) | Deep Capture attach, strictly toggled by you (shows a tab banner while ON). Chrome rejects `debugger` as a runtime-requested optional permission, so it is install-granted; the button only toggles capture, never auto-attaches |
 | `<all_urls>` (optional host) | requested per-origin via **Grant site access**; base capture works without it |
 
 Privacy: 100% local processing, no network exfiltration, no telemetry.

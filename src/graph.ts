@@ -15,7 +15,12 @@ export class DiscoveryGraph {
     if (this.edgeKeys.has(k)) return;
     this.edgeKeys.add(k);
     this.edges.push({ from, to, via, label });
-    if (this.edges.length > 8000) this.edges.splice(0, 1000);
+    if (this.edges.length > 8000) {
+      this.edges.splice(0, 1000);
+      // Rebuild edgeKeys from retained edges so dropped keys don't leak
+      // forever (long-session growth) and re-adding a dropped triple works.
+      this.edgeKeys = new Set(this.edges.map((e) => `${e.from}→${e.to}→${e.via}`));
+    }
   }
 
   routeNode(route: string): string { return `route:${route}`; }

@@ -9,6 +9,12 @@ import { extractHtml, resolveUrl } from './extractors.js';
 import { scanTextForSecrets } from './rules.js';
 import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody } from './tables.js';
 import { classifyApiKind, findExposures } from './exposure.js';
+import { CaptureStore } from './store.js';
+import type { StoreCategory } from './store.js';
+import { newSessionId, idbPutBody, idbGetBody, idbDeleteBody, idbOldestUrls, idbDeleteSession, idbListSessions, idbSessionBytes } from './idb.js';
+import type { CdpNetEvent, CdpTargetInfo } from './cdp.js';
+import { isSubdomainOf } from './types.js';
+import type { WorkerKind } from './types.js';
 import type { ApiKind } from './exposure.js';
 import type { SearchResult, Severity, TextRecord } from './types.js';
 import {
@@ -50,7 +56,7 @@ const renderedAnaGroups = new Map<string, SecFinding[]>();
 interface IndexUnit { text: string; line: number; column: number; kind: string; extra?: string; sec?: { rule: string; sev: Severity; label: string } }
 let worker: Worker | null = null;
 let workerSeq = 0;
-const workerPending = new Map<number, { url: string; route: string; kind: ResourceKind; mime: string; prov: Omit<import('./types.js').Provenance, 'resourceUrl' | 'resourceKind' | 'route'> & { method: DiscoveryMethod; initiator?: string; parentUrl?: string; detail?: string } }>();
+const workerPending = new Map<number, { url: string; route: string; kind: ResourceKind; mime: string; prov: Omit<import('./types.js').Provenance, 'resourceUrl' | 'resourceKind' | 'route'> & { method: DiscoveryMethod; initiator?: string; parentUrl?: string; detail?: string }; gen: number }>();
 let searchTimer = 0;
 let renderTimer = 0;
 let netMethod = 'ALL';
@@ -97,6 +103,85 @@ let resTypeSig = '';
 let netMethodSig = '';
 let netKindSig = '';
 let viewerUrl = '';
+let lastApiCount = 0;
+
+// ---------- deep-capture / unified-budget / evidence (additive v1.6) ----------
+type StoreSnapshotShape = ReturnType<CaptureStore['snapshot']>;
+let store: CaptureStore = new CaptureStore(DEFAULT_SETTINGS.storageMB * 1024 * 1024);
+let sessionId = '';
+let idbReady = false;
+let idbBytes = 0;
+const idbBytesByUrl = new Map<string, number>();
+// Generations: boot=1, ++ on Clear/tab-switch. Worker/fetch/sourcemap jobs
+// carry it; stale results are dropped at the use site.
+let sessionGen = 1;
+// Deep Capture (CDP) state — never auto-attached; only via btnDebugger opt-in.
+let panelPort: chrome.runtime.Port | null = null;
+let cdpAttached = false;
+let cdpNote = '';
+const cdpTargets = new Map<string, CdpTargetInfo>();
+// Request identity: CDP reqId -> netEntries index (indices shift on unshift, so
+// every lookup re-validates entry.reqId; pruned on trim).
+const reqIdMap = new Map<string, number>();
+const cdpMatched = new Set<NetEntry>();
+const wsFramesByUrl = new Map<string, number>();
+const wsBytesByUrl = new Map<string, number>();
+// Evidence model (Called/Uncalled v2): keyed `${METHOD} ${pathTemplate}`.
+interface EndpointEvidence {
+  url: string; kind: string; calls: number; methods: Set<string>; lastStatus?: number;
+  static?: { via: string; file: string; line: number }; runtime?: { source: string };
+  sm: boolean; workers: Set<string>; routes: Set<string>;
+}
+const endpointEvidence = new Map<string, EndpointEvidence>();
+// Cross-cutting helpers.
+const diagOnceKeys = new Set<string>();
+function diagOnce(key: string, note: string, url?: string): void {
+  if (diagOnceKeys.has(key)) return;
+  diagOnceKeys.add(key);
+  diag(note, url);
+}
+function isStale(e: unknown): boolean { return String(e).includes('stale-gen'); }
+function storeAdd(cat: StoreCategory, bytes: number): void { try { store.add(cat, bytes); } catch { /* never breaks capture */ } }
+function storeRelease(cat: StoreCategory, bytes: number): void { try { store.release(cat, bytes); } catch { /* ignore */ } }
+function storeCanRetain(bytes: number, cat: StoreCategory): boolean {
+  try { return store.canRetain(bytes, cat); } catch { return true; }
+}
+function storeSnapshot(): StoreSnapshotShape {
+  syncStoreDerived();
+  try { return store.snapshot(); }
+  catch {
+    return {
+      limit: settings.storageMB * 1024 * 1024, total: 0,
+      byCategory: { 'raw-bodies': 0, metadata: 0, index: 0, graph: 0, network: 0, pending: 0, buffers: 0 },
+      pressure: 'ok', metadataOnly: false,
+    };
+  }
+}
+
+/**
+ * Absolute-sync the derived categories (index/graph/network/metadata) from live
+ * structures. Bodies/pending/buffers stay incremental (add/release at retain
+ * sites) — never set them here. Keeps the meter truthful even when raw-body
+ * retention is off.
+ */
+function syncStoreDerived(): void {
+  try {
+    store.setCategory('index', index.indexBytes);
+    store.setCategory('graph', graph.nodes.size * 128 + graph.edges.length * 64);
+    store.setCategory('network', netEntries.length * 512);
+    store.setCategory('metadata', resources.size * 256 + routes.size * 64);
+  } catch { /* never breaks capture */ }
+}
+/** Metadata-only latch: set when the unified store reports pressure full. */
+let metaOnlyBody = false;
+type IndexProv = { method: DiscoveryMethod; initiator?: string; parentUrl?: string; detail?: string; jsonPath?: string };
+interface QueuedIndex { url: string; route: string; kind: ResourceKind; mime: string; prov: IndexProv; text: string; gen: number }
+const workerQueue: QueuedIndex[] = [];
+let smInflight = 0;
+let deepActive = 0;
+const deepControllers = new Set<AbortController>();
+type RenderSection = 'network' | 'resources' | 'routes' | 'graph' | 'analyze' | 'apis' | 'overview';
+const sectionTimers = new Map<RenderSection, number>();
 
 // ---------- dom ----------
 const $ = (id: string): HTMLElement => document.getElementById(id)!;
@@ -117,10 +202,11 @@ function diag(note: string, url?: string): void {
   renderDiags();
 }
 
-function evalInPage<T>(expr: string): Promise<T> {
+function evalInPage<T>(expr: string, gen?: number): Promise<T> {
   return new Promise((resolve, reject) => {
     try {
       chrome.devtools.inspectedWindow.eval(expr, (res: unknown, err: unknown) => {
+        if (gen !== undefined && gen !== sessionGen) { reject(new Error('stale-gen')); return; }
         if (err) reject(new Error(String((err as { value?: string }).value ?? err)));
         else resolve(res as T);
       });
@@ -132,16 +218,19 @@ function evalInPage<T>(expr: string): Promise<T> {
 function initWorker(): void {
   try {
     worker = new Worker(chrome.runtime.getURL('dist/worker-indexer.js'), { type: 'module' });
-    worker.onmessage = (ev: MessageEvent<{ type: string; id: number; units: IndexUnit[]; error?: string }>) => {
+    worker.onmessage = (ev: MessageEvent<{ type: string; id: number; units: IndexUnit[]; error?: string; gen?: number }>) => {
       const m = ev.data;
       if (!m || m.type !== 'units') return;
       const p = workerPending.get(m.id);
       workerPending.delete(m.id);
+      try { drainWorkerQueue(); } catch { /* ignore */ }
       if (!p) return;
+      const mg = m.gen ?? 0; // worker-indexer echoes gen; missing -> 0 (tolerated)
+      if (mg !== 0 && mg !== p.gen) return; // stale generation — drop
       if (m.error) { diag(`indexer worker: ${m.error}`, p.url); return; }
       commitUnits(p.url, p.route, p.kind, p.mime, p.prov, m.units);
     };
-    worker.onerror = () => { diag('indexer worker failed; using main-thread fallback'); worker = null; };
+    worker.onerror = () => { diag('indexer worker failed; using main-thread fallback'); worker = null; try { drainWorkerQueue(); } catch { /* ignore */ } };
   } catch { worker = null; }
 }
 
@@ -159,8 +248,10 @@ function enforceBudget(context: string): void {
         const b = rawBodies.get(u);
         if (b) { freed += b.length; rawBodies.delete(u); }
         ledger.rawBytes = Math.max(0, ledger.rawBytes - freed);
+        storeRelease('raw-bodies', freed);
         freed = 0;
       }
+      void evictIdbOldest();
       diag(`memory budget exceeded — discarded oldest raw bodies, kept index (${context})`);
     } else if (settings.onBudget === 'stop-deep-analysis') {
       stopDeepScan('memory budget');
@@ -174,6 +265,15 @@ function enforceBudget(context: string): void {
   } else if (ledger.pct < 85) {
     warn.classList.add('hidden');
   }
+  // Unified store pressure: full -> metadata-only body retention (diag once).
+  // Existing onBudget behaviors above are unchanged.
+  try {
+    const snap = store.snapshot();
+    if ((snap.pressure === 'full' || snap.metadataOnly) && !metaOnlyBody) {
+      metaOnlyBody = true;
+      diagOnce('store-full', 'body-retention budget full — metadata-only capture continues');
+    }
+  } catch { /* store never breaks budgeting */ }
   renderMem();
 }
 
@@ -206,6 +306,15 @@ async function ingestText(
   if (isBinaryKind(kind) && !settings.includeBinaryMeta) return;
   if (isBinaryKind(kind)) {
     upsertResource(url, { url, kind, route, method: opts.method ?? 'devtools-network', status: opts.status, mime, size: text.length, indexed: false, hasSourceMap: false, indexedStrings: 0, ts: Date.now() });
+    // Binary bodies stay metadata-only by default; retainBinary (+retainRaw)
+    // keeps a bounded copy for View/copy without ever indexing binary bytes.
+    if (settings.retainBinary && settings.retainRaw && !metaOnlyBody && !rawBodies.has(url)
+      && text.length <= settings.maxBodyBytes && storeCanRetain(text.length, 'raw-bodies')) {
+      rawBodies.set(url, text);
+      rawOrder.push(url);
+      ledger.rawBytes += text.length;
+      storeAdd('raw-bodies', text.length);
+    }
     return; // metadata only — never index binary bytes
   }
   const capKey = opts.method ?? 'devtools-network';
@@ -240,10 +349,22 @@ async function ingestText(
   graph.addNode(url, shortLabel(url), kind === 'chunk' ? 'chunk' : url.includes('/api/') ? 'endpoint' : 'resource', url);
   graph.link(graph.routeNode(route), url, capKey);
 
-  if (settings.retainRaw) {
-    rawBodies.set(url, capped);
-    rawOrder.push(url);
-    ledger.rawBytes += capped.length;
+  if (settings.retainRaw && !metaOnlyBody) {
+    const len = capped.length;
+    if (len > settings.maxBodyBytes) {
+      diagOnce('body-maxsize', `body exceeds maxBodyBytes (${formatBytes(settings.maxBodyBytes)}) — kept metadata only`, url);
+      meta.error = `body exceeded maxBodyBytes (${formatBytes(settings.maxBodyBytes)})`;
+    } else if (!storeCanRetain(len, 'raw-bodies')) {
+      diagOnce('body-budget', 'body-retention budget full — kept metadata only', url);
+      meta.error = 'body skipped: retention budget full';
+    } else if (len > 64 * 1024) {
+      void retainOverflow(url, capped); // temp-disk overflow, RAM stays flat
+    } else {
+      rawBodies.set(url, capped);
+      rawOrder.push(url);
+      ledger.rawBytes += len;
+      storeAdd('raw-bodies', len);
+    }
   }
   enforceBudget(`ingest ${kind}`);
 
@@ -255,36 +376,20 @@ async function ingestText(
       meta.hasSourceMap = true; meta.sourceMapUrl = smUrl;
       graph.addNode(smUrl, shortLabel(smUrl), 'resource', smUrl);
       graph.link(url, smUrl, 'sourcemap-ref');
-      void fetchSourceMap(url, smUrl, route);
+      queueSourceMap(url, smUrl, route);
     }
   }
 
-  // Extract units in worker (or inline fallback)
+  // Extract units in worker (in-flight cap 4, FIFO queue) or inline fallback
   const prov = { method: capKey, initiator: opts.initiator, parentUrl: opts.parentUrl, detail: opts.detail, jsonPath: opts.jsonPath };
   if (worker) {
-    const id = ++workerSeq;
-    workerPending.set(id, { url, route, kind, mime, prov });
-    worker.postMessage({ type: 'index-text', id, text: indexedSlice, url, route, mime, kind, advancedJs: settings.advancedJsAnalysis, scanSecrets: settings.analyzeSecrets });
+    postWorkerJob(url, route, kind, mime, prov, indexedSlice);
   } else {
-    const { extractCss, extractJs, extractJsAdvanced, extractJson } = await import('./extractors.js');
-    const rawUnits = kind === 'api-json' ? extractJson(indexedSlice)
-      : (kind === 'script' || kind === 'chunk') ? extractJs(indexedSlice).concat(settings.advancedJsAnalysis ? extractJsAdvanced(indexedSlice) : [])
-      : kind === 'stylesheet' ? extractCss(indexedSlice)
-      : kind === 'document' || kind === 'dom' ? extractHtml(indexedSlice, url).units
-      : extractJson(indexedSlice);
-    // No-worker fallback: attach the same first-hit `sec` the worker would add.
-    const units: IndexUnit[] = rawUnits.map((u) => ({ text: u.text, line: u.line, column: u.column, kind: u.kind, extra: u.extra }));
-    if (settings.analyzeSecrets) {
-      for (const u of units) {
-        const hits = scanTextForSecrets(u.text, 1);
-        if (hits.length) u.sec = { rule: hits[0].rule, sev: hits[0].sev, label: hits[0].label };
-      }
-    }
-    commitUnits(url, route, kind, mime, prov, units);
+    void indexFallback(url, route, kind, mime, prov, indexedSlice, sessionGen);
   }
 
   // Follow-up discovery: imports / fetch targets / links (bounded, same-origin default)
-  scheduleRender();
+  scheduleRender('resources'); scheduleRender('graph'); scheduleRender('overview'); scheduleRender('routes');
 }
 
 function commitUnits(
@@ -305,6 +410,10 @@ function commitUnits(
     // two-pass route/endpoint/asset facets so NOTHING hides in bundles.
     if ((u.kind === 'url' || u.kind === 'endpoint' || u.kind === 'route' || u.kind === 'asset-ref' || u.kind === 'fetch-target' || u.kind.endsWith('-import') || u.kind === 'importmap' || u.kind === 'dom-data-url' || u.kind === 'dom-link' || u.kind === 'css-reference' || u.kind === 'css-import') && u.text) {
       considerDiscoveredUrl(url, u.text, route, u.kind);
+    }
+    // Endpoint/route/graphql/trpc facets feed Called/Uncalled v2 evidence.
+    if ((u.kind === 'endpoint' || u.kind === 'route' || u.kind === 'fetch-target' || u.kind === 'graphql-op' || u.kind === 'trpc-proc') && u.text) {
+      feedStaticEvidence(url, route, u, provBase.method);
     }
     if (index.add(u.text, prov) !== null) {
       added++;
@@ -328,7 +437,7 @@ function commitUnits(
     // raw was never stored in non-retain mode; account only transiently
   }
   enforceBudget('index-commit');
-  scheduleRender();
+  scheduleRender('resources'); scheduleRender('graph'); scheduleRender('overview'); scheduleRender('routes');
 }
 
 function upsertResource(url: string, m: ResourceMeta): void {
@@ -375,9 +484,11 @@ function considerDiscoveredUrl(from: string, raw: string, route: string, kind: s
   graph.link(from, abs, via, kind);
 }
 
-async function fetchSourceMap(minUrl: string, smUrl: string, route: string): Promise<void> {
+async function fetchSourceMap(minUrl: string, smUrl: string, route: string, gen?: number): Promise<void> {
+  const g = gen ?? sessionGen;
   try {
-    const text = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(smUrl)},{credentials:'same-origin'});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,3000000);}catch(e){return '__ERR__:'+String(e)}})()`);
+    const text = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(smUrl)},{credentials:'same-origin'});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,3000000);}catch(e){return '__ERR__:'+String(e)}})()`, g);
+    if (g !== sessionGen) return;
     if (!text || text.startsWith('__ERR__')) { diag(`source map unavailable (${text?.slice(0, 80) ?? 'fetch failed'}). Cross-origin maps need site access grant.`, smUrl); return; }
     let map: { sources?: string[]; sourcesContent?: Array<string | null> };
     try { map = JSON.parse(text); } catch { diag('source map malformed JSON', smUrl); return; }
@@ -398,13 +509,522 @@ async function fetchSourceMap(minUrl: string, smUrl: string, route: string): Pro
       }
     }
     diag(`source map: ${n} original sources indexed from ${shortLabel(smUrl)}`);
-  } catch (e) { diag(`source map fetch failed: ${String(e).slice(0, 120)}`, smUrl); }
+  } catch (e) { if (!isStale(e)) diag(`source map fetch failed: ${String(e).slice(0, 120)}`, smUrl); }
+}
+
+// ---------- deep capture / unified budget / evidence (implementation) ----------
+/** Boot: construct the unified store, mint a session id, and GC orphaned
+ *  sessions left by crashed tabs. idb.js degrades to RAM-only by itself when
+ *  IndexedDB is unavailable; idbReady just selects the retention path. */
+async function initStore(): Promise<void> {
+  try { store = new CaptureStore(settings.storageMB * 1024 * 1024); } catch { /* keep previous */ }
+  try { sessionId = newSessionId(); } catch { sessionId = `sess-${Date.now().toString(36)}`; }
+  try {
+    const g = globalThis as unknown as { indexedDB?: unknown };
+    idbReady = !!g.indexedDB;
+  } catch { idbReady = false; }
+  if (!idbReady) return;
+  try {
+    const sessions = await idbListSessions();
+    const olds = (sessions ?? []).filter((s) => s !== sessionId).slice(0, 50);
+    for (const s of olds) { try { await idbDeleteSession(s); } catch { /* ignore */ } }
+    if (olds.length) diag(`storage GC: removed ${olds.length} orphaned session(s) from crashed tabs`);
+  } catch { /* ignore */ }
+}
+
+/** Bodies >64KB overflow to temp-disk IDB (never-throw); without IndexedDB
+ *  the RAM map absorbs them under the same budget gates. */
+async function retainOverflow(url: string, text: string): Promise<void> {
+  if (idbReady) {
+    try {
+      await idbPutBody(sessionId, url, text);
+      idbBytesByUrl.set(url, text.length);
+      if (idbBytesByUrl.size > 2000) {
+        const k = idbBytesByUrl.keys().next().value;
+        if (k !== undefined) idbBytesByUrl.delete(k);
+      }
+      idbBytes += text.length;
+      storeAdd('raw-bodies', text.length);
+      return;
+    } catch { /* fall through to RAM */ }
+  }
+  rawBodies.set(url, text);
+  rawOrder.push(url);
+  ledger.rawBytes += text.length;
+  storeAdd('raw-bodies', text.length);
+}
+
+/** Discard-oldest also evicts temp-disk overflow (oldest urls first). */
+async function evictIdbOldest(): Promise<void> {
+  if (!idbReady) return;
+  try {
+    const urls = await idbOldestUrls(sessionId, 10);
+    let freed = 0;
+    for (const u of (urls ?? []).slice(0, 10)) {
+      try { await idbDeleteBody(sessionId, u); } catch { /* ignore */ }
+      const n = idbBytesByUrl.get(u) ?? 0;
+      if (n) { idbBytesByUrl.delete(u); freed += n; }
+    }
+    if (freed) { idbBytes = Math.max(0, idbBytes - freed); storeRelease('raw-bodies', freed); }
+    try { idbBytes = await idbSessionBytes(sessionId); } catch { /* keep local */ }
+  } catch { /* never-throw */ }
+}
+
+// ----- Deep Capture (CDP) wiring: opt-in only, never auto-attached -----
+function sendCdpStart(): void {
+  try {
+    if (!panelPort) { diag('Deep Capture: panel relay unavailable — reopen DevTools and retry'); return; }
+    panelPort.postMessage({ type: 'cdp-start', tabId, opts: { captureWs: settings.deep.captureWsFrames } });
+    diag('Deep Capture requested — waiting for debugger attach…');
+  } catch (e) { diag(`Deep Capture start failed: ${String(e).slice(0, 120)}`); }
+}
+
+function sendCdpStop(_reason: string): void {
+  void _reason;
+  try { panelPort?.postMessage({ type: 'cdp-stop', tabId }); } catch { /* best effort */ }
+}
+
+function syncDeepCapBtn(): void {
+  try { ($('btnDebugger') as HTMLButtonElement).textContent = cdpAttached ? 'Deep Capture: ON' : 'Deep Capture: OFF'; } catch { /* ignore */ }
+  const t = document.getElementById('cdpTargets');
+  if (t && !cdpTargets.size) t.textContent = cdpAttached ? 'targets: waiting…' : '';
+}
+
+/** Arm/disarm the page runtime hook via the DOM flag content.ts polls. */
+async function syncHookFlag(): Promise<void> {
+  try {
+    await evalInPage<unknown>(`window.__deepscope_hook=${cdpAttached && settings.deep.runtimeHook ? 'true' : 'false'};void 0;`);
+  } catch { /* page not ready; flag stays off */ }
+}
+
+function workerKindFor(targetId?: string): WorkerKind {
+  if (!targetId) return 'unknown';
+  const t = cdpTargets.get(targetId);
+  if (!t) return 'unknown';
+  // cdp.ts already classifies the kind; parentId only splits page subframes.
+  if (t.kind === 'page') return t.parentId ? 'iframe' : 'page';
+  if (t.kind === 'iframe' || t.kind === 'worker' || t.kind === 'serviceworker') return t.kind;
+  return t.parentId ? 'iframe' : 'unknown';
+}
+
+/** Insert with index fix-up (netEntries is newest-first) + trim + map prune. */
+function unshiftNet(e: NetEntry): void {
+  netEntries.unshift(e);
+  for (const [k, v] of reqIdMap) reqIdMap.set(k, v + 1);
+  if (e.reqId) reqIdMap.set(e.reqId, 0);
+  while (netEntries.length > 800) netEntries.pop();
+  if (reqIdMap.size > 1600) reqIdMap.clear();
+  else {
+    for (const [k, v] of reqIdMap) {
+      if (v < 0 || v >= netEntries.length || netEntries[v]?.reqId !== k) reqIdMap.delete(k);
+    }
+  }
+}
+
+/** CDP correlation: exact reqId hit, else first unmatched same url+method
+ *  entry within 30s (devtools/HAR entries match; CDP-linked ones don't). */
+function findCdpEntry(reqId: string, url: string, method?: string): NetEntry | undefined {
+  const i = reqIdMap.get(reqId);
+  const cand = i !== undefined ? netEntries[i] : undefined;
+  if (cand && cand.reqId === reqId) { cdpMatched.add(cand); return cand; }
+  const m = (method ?? '').toUpperCase();
+  const now = Date.now();
+  for (const e of netEntries) {
+    if (cdpMatched.has(e)) continue;
+    if (e.reqId && !e.reqId.startsWith('dt-') && !e.reqId.startsWith('har-')) continue;
+    if (m && e.method.toUpperCase() !== m) continue;
+    if (e.url !== url) continue;
+    if (now - e.ts > 30000) continue;
+    cdpMatched.add(e);
+    return e;
+  }
+  return undefined;
+}
+
+function handleCdp(ev: CdpNetEvent): void {
+  if (paused || !ev || !ev.reqId || !ev.url) return;
+  if (!sessionOrigin) {
+    try { sessionOrigin = new URL(ev.url).origin; $('scopeLabel').textContent = `scope: ${sessionOrigin}`; } catch { /* ignore */ }
+  }
+  const wk = workerKindFor(ev.targetId);
+  if (ev.ev === 'req') {
+    const method = (ev.method ?? 'GET').toUpperCase();
+    const isWs = /^wss?:/i.test(ev.url) && method === 'GET';
+    const i = reqIdMap.get(ev.reqId);
+    const cand = i !== undefined ? netEntries[i] : undefined;
+    if (cand && cand.reqId === ev.reqId) {
+      cand.url = ev.url; cand.method = method;
+      cand.frameId = ev.frameId ?? cand.frameId; cand.targetId = ev.targetId ?? cand.targetId;
+      cand.workerKind = wk; cand.loaderId = ev.loaderId ?? cand.loaderId; cand.protocol = ev.protocol ?? cand.protocol;
+    } else {
+      const e: NetEntry = {
+        id: `cdp-${ev.reqId}`, url: ev.url, method, route: sessionRoute, ts: Date.now(),
+        reqId: ev.reqId, frameId: ev.frameId, targetId: ev.targetId, workerKind: wk,
+        loaderId: ev.loaderId, protocol: ev.protocol,
+        bodyKept: false, bodyTruncated: false, bodyChars: 0,
+        note: isWs ? 'ws handshake' : undefined,
+      };
+      unshiftNet(e);
+      ledger.requests++;
+      recordNetworkEvidence(method, ev.url, { workerKind: wk, route: e.route });
+    }
+    scheduleRender('network'); scheduleRender('overview');
+    return;
+  }
+  if (ev.ev === 'ws-frame') {
+    const e = findCdpEntry(ev.reqId, ev.url, 'GET');
+    if (!e) return;
+    if (wsFramesByUrl.size > 1000) { wsFramesByUrl.clear(); wsBytesByUrl.clear(); }
+    const n = wsFramesByUrl.get(ev.url) ?? 0;
+    wsFramesByUrl.set(ev.url, n + 1);
+    e.note = `ws ${n + 1} frames`;
+    const payload = ev.wsPayload ?? '';
+    if (payload && settings.deep.captureWsFrames && !metaOnlyBody) {
+      const used = wsBytesByUrl.get(ev.url) ?? 0;
+      const room = 32768 - used;
+      if (room > 0 && storeCanRetain(Math.min(room, payload.length), 'raw-bodies')) {
+        const chunk = payload.slice(0, room);
+        const cur = rawBodies.get(ev.url) ?? '';
+        rawBodies.set(ev.url, cur + chunk);
+        if (!rawOrder.includes(ev.url)) rawOrder.push(ev.url);
+        wsBytesByUrl.set(ev.url, used + chunk.length);
+        e.bodyChars += chunk.length;
+        e.bodyKept = true;
+        ledger.rawBytes += chunk.length;
+        storeAdd('raw-bodies', chunk.length);
+      } else {
+        diagOnce('ws-cap', 'WebSocket frame cap reached (32 KB/url or budget) — further frames metadata-only', ev.url);
+      }
+    }
+    scheduleRender('network'); scheduleRender('overview');
+    return;
+  }
+  const e = findCdpEntry(ev.reqId, ev.url, ev.method);
+  if (!e) {
+    const method = (ev.method ?? 'GET').toUpperCase();
+    const ne: NetEntry = {
+      id: `cdp-${ev.reqId}`, url: ev.url, method, status: ev.status, mime: ev.mime,
+      route: sessionRoute, ts: Date.now(), reqId: ev.reqId, frameId: ev.frameId,
+      targetId: ev.targetId, workerKind: wk, loaderId: ev.loaderId, protocol: ev.protocol,
+      timingMs: ev.timingMs, fromServiceWorker: ev.fromServiceWorker, fromCache: ev.fromCache,
+      bodyKept: false, bodyTruncated: false, bodyChars: 0,
+      note: ev.ev === 'fail' ? 'request failed' : undefined,
+    };
+    unshiftNet(ne);
+    ledger.requests++;
+    recordNetworkEvidence(method, ev.url, { status: ev.status, mime: ev.mime, workerKind: wk, route: ne.route });
+    scheduleRender('network'); scheduleRender('overview');
+    return;
+  }
+  if (ev.ev === 'redirect' && ev.redirectUrl) {
+    e.redirects = [...(e.redirects ?? []), ev.redirectUrl].slice(-5);
+    e.url = ev.redirectUrl;
+  } else {
+    if (ev.status !== undefined) e.status = ev.status;
+    if (ev.mime !== undefined) e.mime = ev.mime;
+    if (ev.timingMs !== undefined) e.timingMs = ev.timingMs;
+    if (ev.fromServiceWorker !== undefined) e.fromServiceWorker = ev.fromServiceWorker;
+    if (ev.fromCache !== undefined) e.fromCache = ev.fromCache;
+    if (ev.protocol !== undefined) e.protocol = ev.protocol;
+    if (ev.ev === 'fail' && !e.note) e.note = 'request failed';
+    recordNetworkStatus(e.method, e.url, ev.status);
+  }
+  scheduleRender('network'); scheduleRender('overview');
+}
+
+function handleCdpTargets(targets: CdpTargetInfo[]): void {
+  cdpTargets.clear();
+  const list = (targets ?? []).slice(0, 200);
+  if ((targets ?? []).length > 200) diagOnce('target-cap', `Deep Capture: target list capped (200 of ${targets.length})`);
+  for (const t of list) {
+    if (!t || !t.targetId) continue;
+    cdpTargets.set(t.targetId, t);
+  }
+  const counts = new Map<string, number>();
+  for (const id of cdpTargets.keys()) {
+    const k = workerKindFor(id);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const el = document.getElementById('cdpTargets');
+  if (el) {
+    const parts = [...counts.entries()].map(([k, n]) => `${k} ${n}`);
+    el.textContent = `targets: ${cdpTargets.size}${parts.length ? ` (${parts.join(' · ')})` : ''}`;
+  }
+  scheduleRender('overview');
+}
+
+function handleCdpState(attached: boolean, note?: string): void {
+  cdpAttached = !!attached;
+  cdpNote = String(note ?? '');
+  syncDeepCapBtn();
+  permStatus(cdpAttached ? 'Deep Capture is ON — rich frame/worker/socket detail.' : (cdpNote ? `Deep Capture off (${cdpNote.slice(0, 120)}).` : 'Deep Capture is OFF.'));
+  void syncHookFlag();
+  if (!cdpAttached && cdpNote && /fail|error|denied|refus|could not|unable/i.test(cdpNote)) {
+    diag(`Deep Capture: ${cdpNote.slice(0, 160)}`);
+  }
+  scheduleRender('overview');
+}
+
+/** Tab switch/close while a session is active: fresh session + new id + gen++. */
+function handleTabSwitch(_reason: string): void {
+  void _reason;
+  clearSession();
+}
+
+// ----- Evidence model (Called/Uncalled v2) -----
+/** Template dynamic path segments (long numbers, UUIDs, 0x-hex) to {id}. */
+function templatePath(path: string): string {
+  const p = path.split('?')[0].split('#')[0];
+  const out = p.split('/').map((seg) => {
+    if (!seg) return seg;
+    if (/(\d{2,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|0x[0-9a-fA-F]+)/.test(seg)) return '{id}';
+    return seg;
+  }).join('/');
+  return out || '/';
+}
+
+function pathOf(url: string): string {
+  try { return new URL(url, sessionOrigin || 'http://localhost/').pathname || '/'; }
+  catch { return url.split('?')[0].split('#')[0] || '/'; }
+}
+
+function evidenceKey(method: string, url: string): string {
+  return `${(method ?? 'GET').toUpperCase()} ${templatePath(pathOf(url))}`;
+}
+
+function evidenceForUrl(url: string, method?: string): EndpointEvidence | undefined {
+  try {
+    const tpl = templatePath(pathOf(url));
+    if (method && method !== '—') {
+      const exact = endpointEvidence.get(`${method.toUpperCase()} ${tpl}`);
+      if (exact) return exact;
+    }
+    for (const [k, v] of endpointEvidence) {
+      if (k.slice(k.indexOf(' ') + 1) === tpl) return v;
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
+
+function putEvidence(key: string, make: () => EndpointEvidence): EndpointEvidence {
+  let ev = endpointEvidence.get(key);
+  if (!ev) {
+    if (endpointEvidence.size >= 2000) {
+      const oldest = endpointEvidence.keys().next().value;
+      if (oldest !== undefined) endpointEvidence.delete(oldest);
+    }
+    ev = make();
+    endpointEvidence.set(key, ev);
+  }
+  return ev;
+}
+
+/** Static units (endpoint/route/fetch-target + graphql/trpc facets). */
+function feedStaticEvidence(fromUrl: string, route: string, u: IndexUnit, via: string): void {
+  try {
+    const k = u.kind;
+    if (k === 'endpoint' || k === 'fetch-target' || k === 'route') {
+      let abs = '';
+      try { abs = new URL(u.text, fromUrl).toString(); } catch { return; }
+      if (!/^https?:/.test(abs) || abs.length > 500) return;
+      const key = evidenceKey('GET', abs);
+      const ev = putEvidence(key, () => ({
+        url: abs, kind: classifyApiKind(abs, ''), calls: 0, methods: new Set<string>(),
+        sm: via === 'sourcemap-ref', workers: new Set<string>(), routes: new Set<string>(),
+      }));
+      if (!ev.static) ev.static = { via, file: fromUrl, line: u.line };
+      if (via === 'sourcemap-ref') ev.sm = true;
+      ev.routes.add(route);
+    } else if (k === 'graphql-op' || k === 'trpc-proc') {
+      const key = `${k === 'graphql-op' ? 'GRAPHQL' : 'tRPC'} ${(u.text ?? '').slice(0, 120)}`;
+      const ev = putEvidence(key, () => ({
+        url: fromUrl, kind: k === 'graphql-op' ? 'GraphQL' : 'tRPC', calls: 0, methods: new Set<string>(),
+        sm: via === 'sourcemap-ref', workers: new Set<string>(), routes: new Set<string>(),
+      }));
+      if (!ev.static) ev.static = { via, file: fromUrl, line: u.line };
+      ev.routes.add(route);
+    }
+  } catch { /* evidence never breaks capture */ }
+}
+
+/** Network ingest: calls++, methods, lastStatus. Called = calls > 0. */
+function recordNetworkEvidence(method: string, url: string, opts: { status?: number; mime?: string; workerKind?: WorkerKind; route?: string } = {}): void {
+  try {
+    const m = (method ?? 'GET').toUpperCase();
+    const key = evidenceKey(m, url);
+    let ev = endpointEvidence.get(key);
+    if (!ev) {
+      const tpl = key.slice(key.indexOf(' ') + 1);
+      for (const [k, v] of endpointEvidence) {
+        if (k.slice(k.indexOf(' ') + 1) === tpl) { ev = v; break; }
+      }
+    }
+    if (!ev) {
+      ev = putEvidence(key, () => ({
+        url, kind: classifyApiKind(url, opts.mime ?? ''), calls: 0, methods: new Set<string>(),
+        sm: false, workers: new Set<string>(), routes: new Set<string>(),
+      }));
+    }
+    ev.calls++;
+    ev.methods.add(m);
+    if (opts.status !== undefined) ev.lastStatus = opts.status;
+    ev.workers.add(opts.workerKind ?? 'unknown');
+    if (opts.route) {
+      ev.routes.add(opts.route);
+      if (ev.routes.size > 20) {
+        const f = ev.routes.values().next().value;
+        if (f !== undefined) ev.routes.delete(f);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+/** CDP res/fail for an already-counted request: refresh lastStatus only. */
+function recordNetworkStatus(method: string, url: string, status?: number): void {
+  if (status === undefined) return;
+  try {
+    const ev = evidenceForUrl(url, method);
+    if (ev) ev.lastStatus = status;
+  } catch { /* ignore */ }
+}
+
+/** Runtime-hook hits piggybacked in content batches. */
+function recordRuntimeEvidence(hit: { t: string; method: string; url: string }): void {
+  try {
+    let abs = '';
+    if (/^https?:/i.test(hit.url)) abs = hit.url;
+    else {
+      if (!sessionOrigin) return;
+      try { abs = new URL(hit.url, sessionOrigin).toString(); } catch { return; }
+    }
+    if (abs.length > 600) return;
+    const key = evidenceKey(hit.method || 'GET', abs);
+    const ev = putEvidence(key, () => ({
+      url: abs, kind: classifyApiKind(abs, ''), calls: 0, methods: new Set<string>(),
+      sm: false, workers: new Set<string>(), routes: new Set<string>(),
+    }));
+    if (!ev.runtime) ev.runtime = { source: String(hit.t ?? 'hook') };
+    ev.routes.add(sessionRoute);
+  } catch { /* ignore */ }
+}
+
+/** Evidence badges appended into the API Detail cell (S/R/N×calls/U). */
+function evidenceBadges(url: string, method: string): string {
+  try {
+    const ev = evidenceForUrl(url, method);
+    if (!ev) return '';
+    const b: string[] = [];
+    if (ev.static) b.push('<span class="badge" title="seen in static code">S</span>');
+    if (ev.runtime) b.push('<span class="badge" title="seen at runtime">R</span>');
+    if (ev.calls > 0) b.push(`<span class="badge kind" title="observed on the network">N×${ev.calls}</span>`);
+    else b.push('<span class="badge" title="in code, never requested">U</span>');
+    return ' ' + b.join(' ');
+  } catch { return ''; }
+}
+
+// ----- Worker pool / backpressure -----
+function postWorkerJob(url: string, route: string, kind: ResourceKind, mime: string, prov: IndexProv, text: string): void {
+  if (!worker) { void indexFallback(url, route, kind, mime, prov, text, sessionGen); return; }
+  if (workerPending.size >= 4) {
+    if (workerQueue.length >= 40) {
+      diagOnce('worker-queue', 'indexer queue full (40) — dropped oldest queued job');
+      workerQueue.shift();
+    }
+    workerQueue.push({ url, route, kind, mime, prov, text, gen: sessionGen });
+    return;
+  }
+  const id = ++workerSeq;
+  workerPending.set(id, { url, route, kind, mime, prov, gen: sessionGen });
+  try {
+    worker.postMessage({ type: 'index-text', id, text, url, route, mime, kind, advancedJs: settings.advancedJsAnalysis, scanSecrets: settings.analyzeSecrets, gen: sessionGen });
+  } catch {
+    workerPending.delete(id);
+    void indexFallback(url, route, kind, mime, prov, text, sessionGen);
+  }
+}
+
+function drainWorkerQueue(): void {
+  if (!worker) {
+    const jobs = workerQueue.splice(0, 40);
+    for (const j of jobs) {
+      if (j.gen !== sessionGen) continue;
+      void indexFallback(j.url, j.route, j.kind, j.mime, j.prov, j.text, j.gen);
+    }
+    return;
+  }
+  while (workerQueue.length && workerPending.size < 4) {
+    const j = workerQueue.shift()!;
+    if (j.gen !== sessionGen) continue;
+    const id = ++workerSeq;
+    workerPending.set(id, { url: j.url, route: j.route, kind: j.kind, mime: j.mime, prov: j.prov, gen: j.gen });
+    try {
+      worker.postMessage({ type: 'index-text', id, text: j.text, url: j.url, route: j.route, mime: j.mime, kind: j.kind, advancedJs: settings.advancedJsAnalysis, scanSecrets: settings.analyzeSecrets, gen: j.gen });
+    } catch {
+      workerPending.delete(id);
+      void indexFallback(j.url, j.route, j.kind, j.mime, j.prov, j.text, j.gen);
+      break;
+    }
+  }
+}
+
+/** Main-thread extraction fallback (same first-hit `sec` the worker adds). */
+async function indexFallback(url: string, route: string, kind: ResourceKind, mime: string, prov: IndexProv, indexedSlice: string, gen: number): Promise<void> {
+  try {
+    const { extractCss, extractJs, extractJsAdvanced, extractJson } = await import('./extractors.js');
+    if (gen !== sessionGen) return;
+    const rawUnits = kind === 'api-json' ? extractJson(indexedSlice)
+      : (kind === 'script' || kind === 'chunk') ? extractJs(indexedSlice).concat(settings.advancedJsAnalysis ? extractJsAdvanced(indexedSlice) : [])
+      : kind === 'stylesheet' ? extractCss(indexedSlice)
+      : kind === 'document' || kind === 'dom' ? extractHtml(indexedSlice, url).units
+      : extractJson(indexedSlice);
+    const units: IndexUnit[] = rawUnits.map((u) => ({ text: u.text, line: u.line, column: u.column, kind: u.kind, extra: u.extra }));
+    if (settings.analyzeSecrets) {
+      for (const u of units) {
+        const hits = scanTextForSecrets(u.text, 1);
+        if (hits.length) u.sec = { rule: hits[0].rule, sev: hits[0].sev, label: hits[0].label };
+      }
+    }
+    if (gen !== sessionGen) return;
+    commitUnits(url, route, kind, mime, prov, units);
+  } catch (e) { if (!isStale(e)) diag(`index fallback failed: ${String(e).slice(0, 120)}`, url); }
+}
+
+/** Source-map fetch gate: cap 8 in flight, drop extras with diag-once. */
+function queueSourceMap(minUrl: string, smUrl: string, route: string): void {
+  if (smInflight >= 8) { diagOnce('sm-queue', 'source-map queue full (8 in flight) — dropped extras'); return; }
+  smInflight++;
+  void fetchSourceMap(minUrl, smUrl, route, sessionGen).finally(() => { smInflight = Math.max(0, smInflight - 1); });
+}
+
+/** Deep-fetch pool: settings.deep.concurrency simultaneous jobs, per-job
+ *  AbortController; Stop/Clear aborts all via abortDeepJobs. */
+async function deepFetch(url: string, route: string, gen: number): Promise<void> {
+  const conc = Math.min(8, Math.max(1, settings.deep.concurrency || 3));
+  while (deepActive >= conc) {
+    if (!scanning || gen !== sessionGen) return;
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  if (!scanning || gen !== sessionGen) return;
+  const c = new AbortController();
+  deepControllers.add(c);
+  deepActive++;
+  try {
+    await fetchViaPage(url, route, 'deep-scan', { gen, signal: c.signal });
+  } catch { /* fetchViaPage already diags non-stale failures */ }
+  finally { deepActive--; deepControllers.delete(c); }
+}
+
+function abortDeepJobs(): void {
+  for (const c of deepControllers) { try { c.abort(); } catch { /* ignore */ } }
+  deepControllers.clear();
+  deepActive = 0;
 }
 
 // ---------- capture wiring ----------
 function connectBackground(): void {
   try {
     const port = chrome.runtime.connect({ name: 'deepscope-panel' });
+    panelPort = port;
     port.postMessage({ type: 'hello', tabId });
     port.onMessage.addListener((msg: { type: string; url?: string; kind?: string; route?: string; [k: string]: unknown }) => {
       if (msg.type === 'nav' && msg.url) {
@@ -413,17 +1033,30 @@ function connectBackground(): void {
           if (!sessionOrigin) { sessionOrigin = u.origin; $('scopeLabel').textContent = `scope: ${sessionOrigin}`; }
           sessionRoute = u.pathname + u.search;
           touchRoute(sessionRoute, msg.kind === 'spa' ? 'history-api' : 'unknown');
-          scheduleRender();
+          scheduleRender('routes'); scheduleRender('overview');
         } catch { /* ignore */ }
       } else if (msg.type === 'req-meta' && msg.url) {
         reqMetaByUrl.set(String(msg.url), { method: String(msg.method ?? 'GET'), initiator: (msg.initiator as string) ?? undefined });
         if (reqMetaByUrl.size > 2000) reqMetaByUrl.clear();
       } else if (msg.type === 'content-batch') {
         void handleContentBatch(msg as unknown as ContentBatch);
+      } else if (msg.type === 'cdp') {
+        try { handleCdp((msg as unknown as { ev: CdpNetEvent }).ev); } catch { /* ignore */ }
+      } else if (msg.type === 'cdp-targets') {
+        try { handleCdpTargets((msg as unknown as { targets: CdpTargetInfo[] }).targets ?? []); } catch { /* ignore */ }
+      } else if (msg.type === 'cdp-state') {
+        const m = msg as unknown as { attached?: boolean; note?: string };
+        handleCdpState(!!m.attached, m.note);
+      } else if (msg.type === 'tab-closed' && (msg as unknown as { tabId?: number }).tabId === tabId) {
+        handleTabSwitch('tab-closed');
+      } else if (msg.type === 'hello' && typeof (msg as unknown as { tabId?: number }).tabId === 'number'
+        && (msg as unknown as { tabId?: number }).tabId !== tabId) {
+        handleTabSwitch('tab-switch');
       } else if (msg.type === 'diag') {
         diag(String(msg.note ?? 'background notice'), msg.url);
       }
     });
+    port.onDisconnect.addListener(() => { if (panelPort === port) panelPort = null; });
   } catch { diag('background relay unavailable; devtools.network capture still works'); }
 }
 
@@ -431,6 +1064,9 @@ interface ContentBatch {
   type: string; url: string; route: string; htmlLen: number;
   links: string[]; scripts: string[]; forms: string[]; iframes: Array<{ src: string }>;
   routes: string[]; manifest?: string | null; manifests?: string[]; chunks: string[]; apis: string[]; textSample: string;
+  /** Runtime-hook piggyback (content.ts drains its buffer here; background
+   *  forwards content-batch untouched, so zero background changes needed). */
+  runtime?: Array<{ t: string; method: string; url: string; ts: number }>;
 }
 
 async function handleContentBatch(b: ContentBatch): Promise<void> {
@@ -468,17 +1104,28 @@ async function handleContentBatch(b: ContentBatch): Promise<void> {
     graph.link(b.url, mUrl, 'manifest-ref');
     if (settings.capture.dom) void fetchViaPage(mUrl, sessionRoute, 'manifest-ref');
   }
+  // Runtime-hook findings piggybacked in the batch (no new plumbing): feed
+  // runtime evidence + discovered URLs. Batches carry no gen — accepted when
+  // not paused (limitation noted; hook only arms inside this session's page).
+  for (const r of (b.runtime ?? []).slice(0, 200)) {
+    if (!r || !r.url) continue;
+    recordRuntimeEvidence(r);
+    try { considerDiscoveredUrl(b.url || sessionOrigin || '', String(r.url), sessionRoute, 'fetch-target'); } catch { /* ignore */ }
+  }
   ledger.records = index.size; ledger.indexedChars = index.indexedChars; ledger.indexBytes = Math.round(index.indexBytes);
-  scheduleRender();
+  scheduleRender('routes'); scheduleRender('overview'); scheduleRender('graph');
 }
 
-async function fetchViaPage(url: string, route: string, method: DiscoveryMethod): Promise<void> {
+async function fetchViaPage(url: string, route: string, method: DiscoveryMethod, opts: { gen?: number; signal?: AbortSignal } = {}): Promise<void> {
+  if (opts.signal?.aborted) return;
   if (!sameOriginOk(url)) { diag('cross-origin fetch skipped (grant site access to include)', url); return; }
+  const g = opts.gen ?? sessionGen;
   try {
-    const text = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(url)},{credentials:'same-origin'});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,2500000);}catch(e){return '__ERR__:'+String(e).slice(0,160)}})()`);
+    const text = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(url)},{credentials:'same-origin'});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,2500000);}catch(e){return '__ERR__:'+String(e).slice(0,160)}})()`, g);
+    if (opts.signal?.aborted || g !== sessionGen) return;
     if (!text || text.startsWith('__ERR__')) { diag(`fetch failed: ${text?.slice(0, 100) ?? 'unknown'}`, url); return; }
     await ingestText(url, text, { route, method });
-  } catch (e) { diag(`fetch failed: ${String(e).slice(0, 120)}`, url); }
+  } catch (e) { if (!isStale(e)) diag(`fetch failed: ${String(e).slice(0, 120)}`, url); }
 }
 
 function sameOriginOk(url: string): boolean {
@@ -486,7 +1133,7 @@ function sameOriginOk(url: string): boolean {
     if (!sessionOrigin) return true;
     const u = new URL(url, sessionOrigin);
     if (u.origin === sessionOrigin) return true;
-    if (settings.deepScan.includeSubdomains && u.hostname.endsWith(new URL(sessionOrigin).hostname.replace(/^www\./, ''))) return true;
+    if (settings.deepScan.includeSubdomains && isSubdomainOf(u.hostname, new URL(sessionOrigin).hostname)) return true;
     return settings.deepScan.includeThirdParty;
   } catch { return false; }
 }
@@ -506,32 +1153,40 @@ function hookDevtoolsNetwork(): void {
         route: sessionRoute, initiator, reqHeaders: headersToObj(req.request.headers),
         resHeaders: headersToObj(req.response.headers), bodyKept: false, bodyTruncated: false,
         bodyChars: req.response.content?.size ?? 0, ts: Date.now(),
+        reqId: `dt-${netEntries.length}-${Date.now()}`,
         ...(postText ? { reqBody: postText.slice(0, 2000) } : {}),
       };
-      // Binary/media/fonts: metadata only
+      // Binary/media/fonts: metadata only (unless retainBinary keeps a bounded copy)
       if (/\.(png|jpe?g|gif|webp|avif|svg|ico|mp4|webm|mp3|woff2?|ttf|otf)(\?|$)/i.test(url) || /^(image|video|audio|font)\//.test(mime)) {
-        if (settings.includeBinaryMeta) {
-          upsertResource(url, { url, kind: kindFor(url, mime), route: sessionRoute, method: 'devtools-network', initiator, status, mime, size: req.response.content?.size, indexed: false, hasSourceMap: false, indexedStrings: 0, ts: Date.now() });
-          netEntries.unshift(entry);
-          ledger.requests++;
-          scheduleRender();
+        if (!settings.retainBinary) {
+          if (settings.includeBinaryMeta) {
+            upsertResource(url, { url, kind: kindFor(url, mime), route: sessionRoute, method: 'devtools-network', initiator, status, mime, size: req.response.content?.size, indexed: false, hasSourceMap: false, indexedStrings: 0, ts: Date.now() });
+            unshiftNet(entry);
+            ledger.requests++;
+            recordNetworkEvidence(entry.method, url, { status, mime, workerKind: 'unknown', route: entry.route });
+            scheduleRender('network'); scheduleRender('overview');
+          }
+          return;
         }
-        return;
       }
       req.getContent((content, encoding) => {
         if (paused) return;
-        if (content == null) { diag('empty body (browser did not expose content)', url); netEntries.unshift(entry); scheduleRender(); return; }
+        if (content == null) { diag('empty body (browser did not expose content)', url); unshiftNet(entry); scheduleRender('network'); scheduleRender('overview'); return; }
         let text = content;
         if (encoding === 'base64') {
-          try { text = atob(content).slice(0, settings.maxResponseBytes); } catch { diag('base64 body undecodable; kept metadata only', url); netEntries.unshift(entry); scheduleRender(); return; }
+          try { text = atob(content).slice(0, settings.maxResponseBytes); } catch { diag('base64 body undecodable; kept metadata only', url); unshiftNet(entry); scheduleRender('network'); scheduleRender('overview'); return; }
         }
+        const binKind = isBinaryKind(kindFor(url, mime));
         entry.bodyKept = settings.retainRaw;
         entry.bodyChars = text.length;
-        netEntries.unshift(entry);
-        if (netEntries.length > 800) netEntries.pop();
+        if (binKind) entry.note = 'binary body retained — not indexed';
+        unshiftNet(entry);
         ledger.requests++;
-        // Index the URL itself + headers so URL/header scopes actually match.
-        indexUrlAndHeaders(url, entry);
+        recordNetworkEvidence(entry.method, url, { status, mime, workerKind: 'unknown', route: entry.route });
+        if (!binKind) {
+          // Index the URL itself + headers so URL/header scopes actually match.
+          indexUrlAndHeaders(url, entry);
+        }
         void ingestText(url, text, { mime, route: sessionRoute, method: 'devtools-network', initiator, status });
       });
     });
@@ -540,9 +1195,11 @@ function hookDevtoolsNetwork(): void {
         for (const e of (har.entries ?? []).slice(-120)) {
           const url = e.request.url;
           if (/^(chrome-extension|devtools|data):/.test(url)) continue;
-          netEntries.unshift({ id: `har-${netEntries.length}`, url, method: e.request.method, status: e.response.status, mime: e.response.content?.mimeType, route: sessionRoute, bodyKept: false, bodyTruncated: false, bodyChars: e.response.content?.size ?? 0, ts: Date.now(), note: 'from HAR snapshot' });
+          const he: NetEntry = { id: `har-${netEntries.length}`, url, method: e.request.method, status: e.response.status, mime: e.response.content?.mimeType, route: sessionRoute, bodyKept: false, bodyTruncated: false, bodyChars: e.response.content?.size ?? 0, ts: Date.now(), reqId: `har-${netEntries.length}-${Date.now()}`, note: 'from HAR snapshot' };
+          unshiftNet(he);
+          recordNetworkEvidence(he.method, url, { status: he.status, mime: he.mime ?? undefined, workerKind: 'unknown', route: he.route });
         }
-        scheduleRender();
+        scheduleRender('network'); scheduleRender('overview');
       } catch { /* ignore */ }
     });
   } catch { diag('devtools.network unavailable in this context'); }
@@ -592,7 +1249,7 @@ async function startDeepScan(): Promise<void> {
       const href = await evalInPage<string>('location.href');
       sessionOrigin = new URL(href).origin;
       $('scopeLabel').textContent = `scope: ${sessionOrigin}`;
-    } catch { diag('deep scan: cannot determine page origin'); return; }
+    } catch (e) { if (!isStale(e)) diag('deep scan: cannot determine page origin'); return; }
   }
   scanning = true;
   scanVisited = new Set();
@@ -605,7 +1262,7 @@ async function startDeepScan(): Promise<void> {
   } catch { /* content helper absent; link parsing still works */ }
   for (const r of seeds) scanQueue.push({ route: r, depth: 0 });
   for (const r of seeds) touchRoute(r, 'router'); // Routes tab fills immediately
-  scheduleRender();
+  scheduleRender('routes'); scheduleRender('overview');
   $('btnDeep').textContent = 'Stop Scan';
   ($('btnDeep2') as HTMLButtonElement).disabled = true;
   diag(`deep scan started: origin ${sessionOrigin}, depth≤${settings.deepScan.maxDepth}, pages≤${settings.deepScan.maxPages}`);
@@ -614,23 +1271,28 @@ async function startDeepScan(): Promise<void> {
 }
 
 function stopDeepScan(reason = 'user'): void {
+  const inflight = deepActive + workerQueue.length;
+  abortDeepJobs();
   scanning = false;
   scanQueue = [];
   $('btnDeep').textContent = 'Deep Scan';
   ($('btnDeep2') as HTMLButtonElement).disabled = false;
+  if (inflight > 0) diag(`deep scan aborted (${reason}) — ${inflight} in-flight job(s) cancelled`);
   updateDeepStatus(`stopped (${reason})`);
 }
 
 async function pumpScan(): Promise<void> {
   const ds = settings.deepScan;
-  while (scanning && scanQueue.length && scanVisited.size < ds.maxPages) {
+  const gen = sessionGen;
+  while (scanning && gen === sessionGen && scanQueue.length && scanVisited.size < ds.maxPages) {
     const job = scanQueue.shift()!;
     if (scanVisited.has(job.route) || job.depth > ds.maxDepth) continue;
     scanVisited.add(job.route);
     updateDeepStatus();
     try {
       // eslint-disable-next-line no-await-in-loop
-      const html = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(job.route)},{credentials:'same-origin',headers:{'x-deepscope':'1'}});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,1500000);}catch(e){return '__ERR__:'+String(e).slice(0,160)}})()`);
+      const html = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(job.route)},{credentials:'same-origin',headers:{'x-deepscope':'1'}});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,1500000);}catch(e){return '__ERR__:'+String(e).slice(0,160)}})()`, gen);
+      if (gen !== sessionGen) return;
       if (!html || html.startsWith('__ERR__')) { diag(`deep scan page failed: ${html?.slice(0, 100)}`, sessionOrigin + job.route); continue; }
       scanFetched++;
       // eslint-disable-next-line no-await-in-loop
@@ -649,10 +1311,10 @@ async function pumpScan(): Promise<void> {
             if (!scanVisited.has(rt)) { scanQueue.push({ route: rt, depth: job.depth + 1 }); perPage++; }
           } else if (ds.followImports && /\.(m?js|css)($|\?)/.test(abs.pathname)) {
             perPage++;
-            void fetchViaPage(abs.toString(), job.route, 'deep-scan');
+            void deepFetch(abs.toString(), job.route, gen);
           } else if (ds.captureApis && abs.pathname.includes('/api/')) {
             perPage++;
-            void fetchViaPage(abs.toString(), job.route, 'deep-scan');
+            void deepFetch(abs.toString(), job.route, gen);
           }
         } catch { /* ignore */ }
       };
@@ -679,16 +1341,16 @@ async function pumpScan(): Promise<void> {
               if (!scanVisited.has(rt) && rt !== job.route) { scanQueue.push({ route: rt, depth: job.depth + 1 }); perPage++; }
             } else if (isJsCss && ds.followImports) {
               perPage++;
-              void fetchViaPage(d.url, job.route, 'deep-scan');
+              void deepFetch(d.url, job.route, gen);
             } else if (isApi && ds.captureApis) {
               perPage++;
-              void fetchViaPage(d.url, job.route, 'deep-scan');
+              void deepFetch(d.url, job.route, gen);
             }
           } catch { /* ignore */ }
         }
       }
     } catch (e) {
-      diag(`deep scan error: ${String(e).slice(0, 120)}`, sessionOrigin + job.route);
+      if (!isStale(e)) diag(`deep scan error: ${String(e).slice(0, 120)}`, sessionOrigin + job.route);
     }
     // yield to UI
     // eslint-disable-next-line no-await-in-loop
@@ -807,9 +1469,37 @@ async function openSource(recordId: number): Promise<void> {
 }
 
 // ---------- renders ----------
-function scheduleRender(): void {
-  if (renderTimer) return;
-  renderTimer = window.setTimeout(() => { renderTimer = 0; renderAll(); }, 400);
+// Dirty rendering: per-section 400ms throttle flags. Network events mark
+// network+overview only; ingest commits mark resources+graph+overview(+routes,
+// which ingest also touches); search inputs never trigger renders (runSearch
+// only). scheduleRender() with no arg keeps the legacy full render.
+function scheduleRender(section?: RenderSection): void {
+  if (!section) {
+    if (renderTimer) return;
+    renderTimer = window.setTimeout(() => {
+      renderTimer = 0;
+      try { renderAll(); } catch (e) { try { console.error('[deepscope] render failed:', e); } catch { /* ignore */ } }
+    }, 400);
+    return;
+  }
+  if (sectionTimers.has(section)) return;
+  sectionTimers.set(section, window.setTimeout(() => {
+    sectionTimers.delete(section);
+    try { renderSection(section); } catch (e) { try { console.error('[deepscope] render failed:', e); } catch { /* ignore */ } }
+  }, 400));
+}
+
+function renderSection(s: RenderSection): void {
+  try {
+    if (s === 'network') renderNetwork();
+    else if (s === 'resources') renderResources();
+    else if (s === 'routes') renderRoutes();
+    else if (s === 'graph') renderGraph();
+    else if (s === 'analyze') renderAnalyze();
+    else if (s === 'apis') renderApis();
+    else renderOverview();
+  } catch { /* a section render must never break capture */ }
+  try { renderMem(); } catch { /* ignore */ }
 }
 
 function renderAll(): void {
@@ -817,7 +1507,10 @@ function renderAll(): void {
 }
 
 function renderMem(): void {
-  $('memText').textContent = `${formatBytes(ledger.usedBytes)} / ${settings.budgetMB} MB`;
+  let storeTotal = 0;
+  let storeLimit = settings.storageMB * 1024 * 1024;
+  try { const s = storeSnapshot(); storeTotal = s.total; storeLimit = s.limit; } catch { /* ignore */ }
+  $('memText').textContent = `Live ${paused ? '○' : '●'} | Retained ${formatBytes(storeTotal)} / ${settings.storageMB} MB · ${netEntries.length} req · ${lastApiCount} apis`;
   $('memDetail').textContent = `idx ${formatBytes(ledger.indexBytes)} · raw ${formatBytes(ledger.rawBytes)} · ${ledger.resources} res · ${ledger.routes} routes · ${ledger.requests} req`;
   const f = $('memFill');
   f.style.width = `${Math.min(100, ledger.pct)}%`;
@@ -825,6 +1518,17 @@ function renderMem(): void {
   $('cRoutes').textContent = String(routes.size);
   $('cRes').textContent = String(resources.size);
   $('cNet').textContent = String(netEntries.length);
+  const sb = document.getElementById('storageBody');
+  if (sb) {
+    try {
+      const s = storeSnapshot();
+      const ram = ledger.rawBytes;
+      const disk = idbBytes;
+      const remaining = Math.max(0, storeLimit - s.total);
+      const cats = Object.entries(s.byCategory).map(([k, v]) => `${esc(k)} ${formatBytes(v)}`).join(' · ') || 'no retained bodies yet';
+      sb.innerHTML = `RAM ${formatBytes(ram)} · Temp disk ${formatBytes(disk)} · Total ${formatBytes(ram + disk)} · Limit ${formatBytes(storeLimit)} · Remaining ${formatBytes(remaining)}<br/>${cats}<br/><span class="muted">Temp disk = temporary session overflow, deleted when the tab/session ends (never a permanent database)</span>`;
+    } catch { /* storage line is best-effort */ }
+  }
 }
 
 function renderOverview(): void {
@@ -838,6 +1542,36 @@ function renderOverview(): void {
   ];
   $('statGrid').innerHTML = stats.map(([b, l]) => `<div class="stat"><b>${esc(b)}</b><span>${l}</span></div>`).join('');
   $('sessionInfo').innerHTML = `origin <b>${esc(sessionOrigin || '—')}</b><br/>route ${esc(sessionRoute)}<br/>mode ${scanning ? '<b>DEEP SCAN</b>' : 'passive'}${paused ? ' · <b>PAUSED</b>' : ''}<br/>raw bodies ${settings.retainRaw ? `kept (${rawBodies.size})` : 'dropped after indexing'}`;
+  renderHomeBudget();
+}
+
+/** Home storage-budget card: preset dropdown + custom input + live remaining. */
+function renderHomeBudget(): void {
+  try {
+    const presets = [60, 100, 250, 500, 1024];
+    const sel = document.getElementById('homeStorageSel') as HTMLSelectElement | null;
+    if (sel && document.activeElement !== sel) {
+      sel.value = presets.includes(settings.storageMB) ? String(settings.storageMB) : 'custom';
+    }
+    const custom = document.getElementById('homeStorageCustom') as HTMLInputElement | null;
+    if (custom && document.activeElement !== custom) custom.value = String(settings.storageMB);
+    const live = document.getElementById('homeStorageLive');
+    if (live) {
+      const s = storeSnapshot();
+      const remaining = Math.max(0, s.limit - s.total);
+      live.textContent = `Retained ${formatBytes(s.total)} / ${settings.storageMB} MB · Remaining ${formatBytes(remaining)}`
+        + (s.pressure === 'full' ? ' · FULL — metadata-only' : s.pressure === 'tight' ? ' · filling up' : '');
+    }
+  } catch { /* best effort */ }
+}
+
+/** Apply a storage budget from home (preset or custom), live + announced. */
+function applyStorageMB(v: number, source: string): void {
+  const mb = Math.min(2048, Math.max(10, Math.round(v) || 60));
+  settings.storageMB = mb;
+  try { store.setLimit(mb * 1024 * 1024); } catch { /* ignore */ }
+  buildSettings(); renderMem(); renderOverview();
+  diag(`storage budget set to ${mb} MB (${source})`);
 }
 
 function renderDiags(): void {
@@ -1079,6 +1813,20 @@ async function resolveContent(url: string): Promise<{ text: string; meta: string
       truncated: kept.length > cap,
     };
   }
+  // Temp-disk overflow (same session only).
+  try {
+    if (idbReady) {
+      const disk = await idbGetBody(sessionId, url);
+      if (typeof disk === 'string' && disk.length) {
+        const cap = 20_000;
+        return {
+          text: disk.length > cap ? disk.slice(0, cap) : disk,
+          meta: `temp-disk body · ${formatBytes(disk.length)}${disk.length > cap ? ` · showing first ${formatBytes(cap)}` : ''}`,
+          truncated: disk.length > cap,
+        };
+      }
+    }
+  } catch { /* fall through to on-demand fetch */ }
   const meta0 = resources.get(url);
   if (meta0 && (meta0.kind === 'media-meta' || meta0.kind === 'font-meta')) {
     return { text: '(binary/media/font — metadata only, never copied into the index)', meta: `${meta0.kind} · ${meta0.mime ?? ''}`, truncated: false };
@@ -1309,7 +2057,7 @@ function apiRowHtml(r: ApiRow, grp = '', hide = ''): string {
   const gAttr = grp ? ` data-g="${grp}"${hide}` : '';
   return `<tr${gAttr}><td>${esc(r.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
     + `<td><button class="badge kind" data-act="expand" data-url="${esc(r.url)}" title="Toggle request detail">${esc(String(r.kind))}</button></td>`
-    + `<td title="${esc(r.detail)}">${esc(r.detail)}</td>`
+    + `<td title="${esc(r.detail)}">${esc(r.detail)}${evidenceBadges(r.url, r.method)}</td>`
     + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
     + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
     + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button>${curl}</td></tr>`;
@@ -1341,6 +2089,7 @@ function filteredApiRows(all: ApiRow[]): ApiRow[] {
 
 function renderApis(): void {
   const all = buildApiRows();
+  lastApiCount = all.length;
   syncApiKindOptions(all);
   const filtered = filteredApiRows(all);
   const pill = document.getElementById('cApis');
@@ -1626,37 +2375,58 @@ function shortLabel(u: string): string {
 // ---------- settings UI ----------
 function buildSettings(): void {
   const budgets: Array<SessionSettings['budgetMB']> = [64, 128, 256, 512, 1024];
-  $('budgetRow').innerHTML = budgets.map((b) => `<button data-b="${b}" class="${settings.budgetMB === b ? 'primary' : ''}">${b} MB</button>`).join('');
-  $('budgetRow').querySelectorAll('button').forEach((el) => el.addEventListener('click', () => {
-    settings.budgetMB = Number((el as HTMLElement).dataset.b) as SessionSettings['budgetMB'];
-    buildSettings(); enforceBudget('budget-change');
-  }));
-  ($('setMaxResp') as HTMLInputElement).value = String(settings.maxResponseBytes);
-  ($('setMaxIdx') as HTMLInputElement).value = String(settings.maxIndexedChars);
-  ($('setMaxRes') as HTMLInputElement).value = String(settings.maxResources);
-  ($('setRetainRaw') as HTMLInputElement).checked = settings.retainRaw;
-  ($('setSrcMap') as HTMLInputElement).checked = settings.analyzeSourceMaps;
-  ($('setAdvJs') as HTMLInputElement).checked = settings.advancedJsAnalysis;
-  ($('setSecrets') as HTMLInputElement).checked = settings.analyzeSecrets;
-  ($('setBinMeta') as HTMLInputElement).checked = settings.includeBinaryMeta;
-  ($('setOnBudget') as HTMLSelectElement).value = settings.onBudget;
-  ($('setDepth') as HTMLInputElement).value = String(settings.deepScan.maxDepth);
-  ($('setPages') as HTMLInputElement).value = String(settings.deepScan.maxPages);
-  ($('setPerPage') as HTMLInputElement).value = String(settings.deepScan.maxRequestsPerPage);
+  try {
+    const budgetRow = document.getElementById('budgetRow');
+    if (budgetRow) {
+      budgetRow.innerHTML = budgets.map((b) => `<button data-b="${b}" class="${settings.budgetMB === b ? 'primary' : ''}">${b} MB</button>`).join('');
+      budgetRow.querySelectorAll('button').forEach((el) => el.addEventListener('click', () => {
+        settings.budgetMB = Number((el as HTMLElement).dataset.b) as SessionSettings['budgetMB'];
+        buildSettings(); enforceBudget('budget-change');
+      }));
+    }
+  } catch { /* settings card unavailable — skip */ }
+  const setVal = (id: string, v: string): void => {
+    try { (document.getElementById(id) as HTMLInputElement | null)!.value = v; } catch { /* missing control — skip */ }
+  };
+  const setChk = (id: string, v: boolean): void => {
+    try { (document.getElementById(id) as HTMLInputElement | null)!.checked = v; } catch { /* missing control — skip */ }
+  };
+  setVal('setMaxResp', String(settings.maxResponseBytes));
+  setVal('setMaxIdx', String(settings.maxIndexedChars));
+  setVal('setMaxRes', String(settings.maxResources));
+  setChk('setRetainRaw', settings.retainRaw);
+  setChk('setSrcMap', settings.analyzeSourceMaps);
+  setChk('setAdvJs', settings.advancedJsAnalysis);
+  setChk('setSecrets', settings.analyzeSecrets);
+  setChk('setBinMeta', settings.includeBinaryMeta);
+  setVal('setOnBudget', settings.onBudget);
+  setVal('setDepth', String(settings.deepScan.maxDepth));
+  setVal('setPages', String(settings.deepScan.maxPages));
+  setVal('setPerPage', String(settings.deepScan.maxRequestsPerPage));
   const caps: Array<[keyof SessionSettings['capture'], string]> = [['dom', 'DOM/HTML'], ['js', 'JavaScript'], ['css', 'CSS'], ['json', 'JSON/API'], ['headers', 'headers'], ['frames', 'frames']];
-  $('capRow').innerHTML = caps.map(([k, l]) => `<label><input type="checkbox" data-cap="${k}" ${settings.capture[k] ? 'checked' : ''}/> ${l}</label>`).join('');
-  $('capRow').querySelectorAll('input').forEach((el) => el.addEventListener('change', () => {
-    settings.capture[(el as HTMLInputElement).dataset.cap as keyof SessionSettings['capture']] = (el as HTMLInputElement).checked;
-  }));
+  try {
+    const capRow = document.getElementById('capRow');
+    if (capRow) {
+      capRow.innerHTML = caps.map(([k, l]) => `<label><input type="checkbox" data-cap="${k}" ${settings.capture[k] ? 'checked' : ''}/> ${l}</label>`).join('');
+      capRow.querySelectorAll('input').forEach((el) => el.addEventListener('change', () => {
+        settings.capture[(el as HTMLInputElement).dataset.cap as keyof SessionSettings['capture']] = (el as HTMLInputElement).checked;
+      }));
+    }
+  } catch { /* ignore */ }
   const ds: Array<[string, string]> = [
     ['sameOriginOnly', 'same-origin only'], ['includeSubdomains', 'include subdomains'], ['includeThirdParty', 'third-party'],
     ['followRoutes', 'follow routes'], ['followImports', 'follow imports'], ['followSourceMaps', 'follow source maps'],
     ['scanIframes', 'scan iframes'], ['captureApis', 'capture APIs'], ['watchSpaTransitions', 'watch SPA'],
   ];
-  $('deepRow').innerHTML = ds.map(([k, l]) => `<label><input type="checkbox" data-deep="${k}" ${(settings.deepScan as unknown as Record<string, boolean>)[k] ? 'checked' : ''}/> ${l}</label>`).join('');
-  $('deepRow').querySelectorAll('input').forEach((el) => el.addEventListener('change', () => {
-    (settings.deepScan as unknown as Record<string, boolean>)[(el as HTMLInputElement).dataset.deep ?? ''] = (el as HTMLInputElement).checked;
-  }));
+  try {
+    const deepRow = document.getElementById('deepRow');
+    if (deepRow) {
+      deepRow.innerHTML = ds.map(([k, l]) => `<label><input type="checkbox" data-deep="${k}" ${(settings.deepScan as unknown as Record<string, boolean>)[k] ? 'checked' : ''}/> ${l}</label>`).join('');
+      deepRow.querySelectorAll('input').forEach((el) => el.addEventListener('change', () => {
+        (settings.deepScan as unknown as Record<string, boolean>)[(el as HTMLInputElement).dataset.deep ?? ''] = (el as HTMLInputElement).checked;
+      }));
+    }
+  } catch { /* ignore */ }
   for (const [id, fn] of [
     ['setMaxResp', (v: string) => settings.maxResponseBytes = Math.max(1024, Number(v) || 2000000)],
     ['setMaxIdx', (v: string) => settings.maxIndexedChars = Math.max(1024, Number(v) || 400000)],
@@ -1665,15 +2435,73 @@ function buildSettings(): void {
     ['setPages', (v: string) => settings.deepScan.maxPages = Math.min(200, Math.max(1, Number(v) || 25))],
     ['setPerPage', (v: string) => settings.deepScan.maxRequestsPerPage = Math.min(200, Math.max(1, Number(v) || 60))],
   ] as Array<[string, (v: string) => void]>) {
-    ($(id) as HTMLInputElement).addEventListener('change', (e) => fn((e.target as HTMLInputElement).value));
+    on(id, 'change', (e) => fn((e.target as HTMLInputElement).value));
   }
-  ($('setRetainRaw') as HTMLInputElement).addEventListener('change', (e) => settings.retainRaw = (e.target as HTMLInputElement).checked);
-  ($('setSrcMap') as HTMLInputElement).addEventListener('change', (e) => settings.analyzeSourceMaps = (e.target as HTMLInputElement).checked);
-  ($('setAdvJs') as HTMLInputElement).addEventListener('change', (e) => settings.advancedJsAnalysis = (e.target as HTMLInputElement).checked);
-  ($('setSecrets') as HTMLInputElement).addEventListener('change', (e) => settings.analyzeSecrets = (e.target as HTMLInputElement).checked);
-  ($('setBinMeta') as HTMLInputElement).addEventListener('change', (e) => settings.includeBinaryMeta = (e.target as HTMLInputElement).checked);
-  ($('setOnBudget') as HTMLSelectElement).addEventListener('change', (e) => settings.onBudget = (e.target as HTMLSelectElement).value as SessionSettings['onBudget']);
-  $('permInfo').innerHTML = `base: activeTab · scripting · webNavigation · webRequest · storage<br/>optional: <b>&lt;all_urls&gt;</b> (site access, on demand) · <b>debugger</b> (Deep Capture, on demand)<br/>processing: <b>100% local</b> · storage: <b>RAM only</b> (settings use chrome.storage.local; captures never touch disk)`;
+  on('setRetainRaw', 'change', (e) => settings.retainRaw = (e.target as HTMLInputElement).checked);
+  on('setSrcMap', 'change', (e) => settings.analyzeSourceMaps = (e.target as HTMLInputElement).checked);
+  on('setAdvJs', 'change', (e) => settings.advancedJsAnalysis = (e.target as HTMLInputElement).checked);
+  on('setSecrets', 'change', (e) => settings.analyzeSecrets = (e.target as HTMLInputElement).checked);
+  on('setBinMeta', 'change', (e) => settings.includeBinaryMeta = (e.target as HTMLInputElement).checked);
+  on('setOnBudget', 'change', (e) => settings.onBudget = (e.target as HTMLSelectElement).value as SessionSettings['onBudget']);
+  // Unified storage budget (RAM + temp-disk overflow). Presets + custom input
+  // (clamp 10..2048); setLimit applies live. Source-map/capture toggles above
+  // keep their exact semantics.
+  const storages: number[] = [60, 100, 250, 500, 1024];
+  const srow = document.getElementById('storageRow');
+  if (srow) {
+    srow.innerHTML = storages.map((b) => `<button data-s="${b}" class="${settings.storageMB === b ? 'primary' : ''}">${b} MB</button>`).join('');
+    srow.querySelectorAll('button').forEach((el) => el.addEventListener('click', () => {
+      settings.storageMB = Number((el as HTMLElement).dataset.s);
+      try { store.setLimit(settings.storageMB * 1024 * 1024); } catch { /* ignore */ }
+      buildSettings(); renderMem();
+    }));
+  }
+  const setSMB = document.getElementById('setStorageMB') as HTMLInputElement | null;
+  if (setSMB) {
+    setSMB.value = String(settings.storageMB);
+    setSMB.addEventListener('change', (e) => {
+      const v = Math.min(2048, Math.max(10, Number((e.target as HTMLInputElement).value) || 250));
+      settings.storageMB = v;
+      try { store.setLimit(v * 1024 * 1024); } catch { /* ignore */ }
+      buildSettings(); renderMem();
+    });
+  }
+  const setMB = document.getElementById('setMaxBodyKB') as HTMLInputElement | null;
+  if (setMB) {
+    setMB.value = String(Math.round(settings.maxBodyBytes / 1024));
+    setMB.addEventListener('change', (e) => {
+      const kb = Math.min(10240, Math.max(16, Number((e.target as HTMLInputElement).value) || 512));
+      settings.maxBodyBytes = kb * 1024;
+      buildSettings();
+    });
+  }
+  const setRB = document.getElementById('setRetainBin') as HTMLInputElement | null;
+  if (setRB) {
+    setRB.checked = settings.retainBinary;
+    setRB.addEventListener('change', (e) => { settings.retainBinary = (e.target as HTMLInputElement).checked; });
+  }
+  const setDC = document.getElementById('setDeepConc') as HTMLInputElement | null;
+  if (setDC) {
+    setDC.value = String(settings.deep.concurrency);
+    setDC.addEventListener('change', (e) => {
+      settings.deep.concurrency = Math.min(8, Math.max(1, Number((e.target as HTMLInputElement).value) || 3));
+      buildSettings();
+    });
+  }
+  const setDW = document.getElementById('setDeepWs') as HTMLInputElement | null;
+  if (setDW) {
+    setDW.checked = settings.deep.captureWsFrames;
+    setDW.addEventListener('change', (e) => { settings.deep.captureWsFrames = (e.target as HTMLInputElement).checked; });
+  }
+  const setDH = document.getElementById('setDeepHook') as HTMLInputElement | null;
+  if (setDH) {
+    setDH.checked = settings.deep.runtimeHook;
+    setDH.addEventListener('change', (e) => {
+      settings.deep.runtimeHook = (e.target as HTMLInputElement).checked;
+      void syncHookFlag();
+    });
+  }
+  $('permInfo').innerHTML = `base: activeTab · scripting · webNavigation · webRequest · storage · debugger (Deep Capture, attach toggled below)<br/>optional: <b>&lt;all_urls&gt;</b> (site access, on demand)<br/>processing: <b>100% local</b> · storage: <b>RAM only</b> (settings use chrome.storage.local; captures never touch disk)<br/><br/><b>For maximum discovery, 1 manual step remains (everything else is already ON):</b><br/>1. <b>Grant site access</b> (button below) — required for the runtime hook + cross-origin bodies.<br/>2. Toggle <b>Deep Capture</b> below whenever you want frame/worker/socket detail (debugger shows a tab banner while ON).`;
 }
 
 // ---------- actions ----------
@@ -1694,7 +2522,7 @@ async function discoverRoutesNow(): Promise<void> {
   } catch {
     status.textContent = 'route discovery failed — reload the inspected page and retry';
   }
-  scheduleRender();
+  scheduleRender('routes'); scheduleRender('overview');
 }
 
 function applyTheme(): void {
@@ -1722,13 +2550,13 @@ function wire(): void {
     document.querySelectorAll('#tabs button').forEach((x) => x.classList.remove('active'));
     document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
     b.classList.add('active');
-    $(`tab-${(b as HTMLElement).dataset.tab}`).classList.add('active');
+    try { document.getElementById(`tab-${(b as HTMLElement).dataset.tab}`)?.classList.add('active'); } catch { /* ignore */ }
   }));
-  ($('q') as HTMLInputElement).addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = window.setTimeout(runSearch, 160); });
-  $('btnSearch').addEventListener('click', runSearch);
-  ($('mode') as HTMLSelectElement).addEventListener('change', runSearch);
+  on('q', 'input', () => { clearTimeout(searchTimer); searchTimer = window.setTimeout(runSearch, 160); });
+  on('btnSearch', 'click', runSearch);
+  on('mode', 'change', runSearch);
   // Click-to-open: event delegation for result "Open ↗" buttons + row click.
-  $('results').addEventListener('click', (e) => {
+  on('results', 'click', (e) => {
     const t = (e.target as HTMLElement).closest?.('[data-open]') as HTMLElement | null;
     if (t?.dataset.open) { void openSource(Number(t.dataset.open)); return; }
     const row = (e.target as HTMLElement).closest?.('.res') as HTMLElement | null;
@@ -1737,21 +2565,21 @@ function wire(): void {
       if (!sel) void openSource(Number(row.dataset.rid)); // don't hijack text selection
     }
   });
-  ($('resFilter') as HTMLInputElement).addEventListener('input', renderResources);
-  ($('resType') as HTMLSelectElement).addEventListener('change', (e) => { resType = (e.target as HTMLSelectElement).value; renderResources(); });
-  ($('resTable').querySelector('tbody')!).addEventListener('click', (e) => tableClick(e, 'res'));
-  $('btnResCopyUrls').addEventListener('click', () => void copyFilteredResUrls());
-  $('btnResCopyAll').addEventListener('click', () => void copyFilteredResAll());
-  ($('netMethod') as HTMLSelectElement).addEventListener('change', (e) => { netMethod = (e.target as HTMLSelectElement).value; renderNetwork(); });
-  ($('netKind') as HTMLSelectElement).addEventListener('change', (e) => { netKind = (e.target as HTMLSelectElement).value; renderNetwork(); });
-  ($('netFilter') as HTMLInputElement).addEventListener('input', renderNetwork);
-  ($('netTable').querySelector('tbody')!).addEventListener('click', (e) => tableClick(e, 'net'));
-  $('btnNetCopyUrls').addEventListener('click', () => void copyFilteredNetUrls());
-  $('btnNetCopyAll').addEventListener('click', () => void copyFilteredNetAll());
+  on('resFilter', 'input', renderResources);
+  on('resType', 'change', (e) => { resType = (e.target as HTMLSelectElement).value; renderResources(); });
+  try { document.getElementById('resTable')?.querySelector('tbody')?.addEventListener('click', (e) => tableClick(e, 'res')); } catch { /* ignore */ }
+  on('btnResCopyUrls', 'click', () => void copyFilteredResUrls());
+  on('btnResCopyAll', 'click', () => void copyFilteredResAll());
+  on('netMethod', 'change', (e) => { netMethod = (e.target as HTMLSelectElement).value; renderNetwork(); });
+  on('netKind', 'change', (e) => { netKind = (e.target as HTMLSelectElement).value; renderNetwork(); });
+  on('netFilter', 'input', renderNetwork);
+  try { document.getElementById('netTable')?.querySelector('tbody')?.addEventListener('click', (e) => tableClick(e, 'net')); } catch { /* ignore */ }
+  on('btnNetCopyUrls', 'click', () => void copyFilteredNetUrls());
+  on('btnNetCopyAll', 'click', () => void copyFilteredNetAll());
   on('apiKind', 'change', (e) => { apiKind = (e.target as HTMLSelectElement).value; renderApis(); });
   on('apisBody', 'click', apiClick);
   on('btnApisCopyAll', 'click', () => void copyFilteredApiUrls());
-  $('btnDiscoverRoutes').addEventListener('click', () => void discoverRoutesNow());
+  on('btnDiscoverRoutes', 'click', () => void discoverRoutesNow());
   on('routeFilter', 'input', () => renderRoutes());
   on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
   on('btnRoutesShowAll', 'click', () => { routeShowAll = !routeShowAll; renderRoutes(); });
@@ -1759,30 +2587,61 @@ function wire(): void {
   on('btnSecCopy', 'click', () => void copySecFindings());
   on('btnSecShowAll', 'click', () => { secShowAll = !secShowAll; renderAnalyze(); });
   on('secList', 'click', secClick);
-  $('btnTheme').addEventListener('click', () => {
+  on('homeStorageSel', 'change', (e) => {
+    const v = (e.target as HTMLSelectElement).value;
+    if (v === 'custom') { document.getElementById('homeStorageCustom')?.focus(); return; }
+    applyStorageMB(Number(v), 'preset');
+  });
+  on('homeStorageCustom', 'change', (e) => applyStorageMB(Number((e.target as HTMLInputElement).value), 'custom'));
+  on('btnTheme', 'click', () => {
     settings.theme = settings.theme === 'light' ? 'dark' : 'light';
     applyTheme();
   });
-  $('btnPause').addEventListener('click', () => { paused = !paused; syncPause(); });
-  $('btnClear').addEventListener('click', clearSession);
-  $('btnRecapture').addEventListener('click', () => { try { chrome.devtools.inspectedWindow.reload(); } catch { diag('reload failed'); } });
-  $('btnReindex').addEventListener('click', reindex);
-  $('btnMemClean').addEventListener('click', () => {
+  on('btnPause', 'click', () => { paused = !paused; syncPause(); });
+  on('btnClear', 'click', clearSession);
+  on('btnRecapture', 'click', () => { try { chrome.devtools.inspectedWindow.reload(); } catch { diag('reload failed'); } });
+  on('btnReindex', 'click', reindex);
+  on('btnMemClean', 'click', () => {
+    let drop = 0;
+    for (const b of rawBodies.values()) drop += b.length;
+    storeRelease('raw-bodies', drop);
     rawBodies.clear(); rawOrder.length = 0; ledger.rawBytes = 0;
     diag('memory cleanup: raw bodies dropped, index preserved');
     enforceBudget('manual-cleanup'); scheduleRender();
   });
-  $('btnExport').addEventListener('click', exportSession);
+  on('btnExport', 'click', exportSession);
   const deep = (): void => { if (scanning) stopDeepScan(); else void startDeepScan(); };
-  $('btnDeep').addEventListener('click', deep);
-  $('btnDeep2').addEventListener('click', () => void startDeepScan());
-  $('btnDeepStop').addEventListener('click', () => stopDeepScan());
-  $('btnGraphClear').addEventListener('click', () => { graph.clear(); renderGraph(); });
-  $('btnGrant').addEventListener('click', grantSite);
-  $('btnDebugger').addEventListener('click', enableDebugger);
+  on('btnDeep', 'click', deep);
+  on('btnDeep2', 'click', () => void startDeepScan());
+  on('btnDeepStop', 'click', () => stopDeepScan());
+  on('btnGraphClear', 'click', () => { graph.clear(); renderGraph(); });
+  on('btnGrant', 'click', grantSite);
+  on('btnDebugger', 'click', enableDebugger);
 }
 
 function clearSession(): void {
+  sendCdpStop('clear');
+  stopDeepScan('clear');
+  // Session rotation: drop the old temp-disk session, mint a new id, bump gen
+  // so in-flight worker/fetch/sourcemap results are ignored at their use site.
+  const oldSession = sessionId;
+  if (idbReady && oldSession) { try { void idbDeleteSession(oldSession); } catch { /* ignore */ } }
+  try { sessionId = newSessionId(); } catch { sessionId = `sess-${Date.now().toString(36)}`; }
+  sessionGen++;
+  idbBytes = 0; idbBytesByUrl.clear();
+  reqIdMap.clear(); cdpMatched.clear();
+  wsFramesByUrl.clear(); wsBytesByUrl.clear();
+  endpointEvidence.clear();
+  workerQueue.length = 0; workerPending.clear();
+  diagOnceKeys.clear();
+  metaOnlyBody = false;
+  cdpTargets.clear();
+  for (const t of sectionTimers.values()) clearTimeout(t);
+  sectionTimers.clear();
+  try {
+    store = new CaptureStore(settings.storageMB * 1024 * 1024);
+  } catch { /* keep current store */ }
+  void syncHookFlag();
   index.clear(); graph.clear(); resources.clear(); rawBodies.clear(); rawOrder.length = 0;
   contentHash.clear(); netEntries.length = 0; routes.clear(); diags.length = 0;
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
@@ -1823,7 +2682,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.5.2', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.6.3', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],
@@ -1842,33 +2701,79 @@ function exportSession(): void {
   diag('session exported (explicit user request)');
 }
 
-async function grantSite(): Promise<void> {
+/** Inline status line in the Permissions card — feedback where the user is looking. */
+function permStatus(msg: string): void {
   try {
-    if (!sessionOrigin) { diag('open a page first, then grant access'); return; }
+    const el = document.getElementById('permStatus');
+    if (el) el.textContent = msg;
+  } catch { /* ignore */ }
+}
+
+/** Reflect the real site-access grant on the button (checked live, not assumed). */
+async function syncGrantBtn(): Promise<void> {
+  try {
+    const held = sessionOrigin
+      ? await chrome.permissions.contains({ origins: [`${sessionOrigin}/*`] })
+      : false;
+    const btn = document.getElementById('btnGrant') as HTMLButtonElement | null;
+    if (btn && !btn.disabled) btn.textContent = held ? 'Site access: ON' : 'Grant site access';
+  } catch { /* permissions API unavailable — leave label as-is */ }
+}
+
+async function grantSite(): Promise<void> {
+  const btn = document.getElementById('btnGrant') as HTMLButtonElement | null;
+  if (btn) { btn.disabled = true; btn.textContent = 'Requesting…'; }
+  try {
+    if (!sessionOrigin) {
+      permStatus('Open a page first, then grant access.');
+      diag('open a page first, then grant access');
+      return;
+    }
+    permStatus(`Asking the browser for access to ${sessionOrigin}…`);
     const ok = await chrome.permissions.request({ origins: [`${sessionOrigin}/*`] });
     diag(ok ? `site access granted for ${sessionOrigin}: registering content observer` : 'site access declined — eval-based capture continues');
+    permStatus(ok ? `Site access granted for ${sessionOrigin}.` : 'Site access declined — eval-based capture continues.');
     if (ok) {
       try {
         await chrome.scripting.registerContentScripts([{
           id: 'deepscope-observer', matches: [`${sessionOrigin}/*`], js: ['dist/content.js'],
           runAt: 'document_idle', allFrames: true, persistAcrossSessions: false,
         }]);
+        permStatus(`Site access granted for ${sessionOrigin} — observer registered.`);
       } catch (e) { diag(`content-script registration: ${String(e).slice(0, 140)}`); }
     }
-  } catch (e) { diag(`grant failed: ${String(e).slice(0, 140)}`); }
+  } catch (e) {
+    const m = String(e).slice(0, 140);
+    diag(`grant failed: ${m}`);
+    permStatus(`Grant failed: ${m}`);
+  } finally {
+    if (btn) btn.disabled = false;
+    await syncGrantBtn();
+  }
 }
 
 async function enableDebugger(): Promise<void> {
+  const btn = document.getElementById('btnDebugger') as HTMLButtonElement | null;
+  if (btn) { btn.disabled = true; btn.textContent = 'Requesting…'; }
   try {
-    const ok = await chrome.permissions.request({ permissions: ['debugger'] });
-    if (!ok) { diag('Deep Capture declined — base capture continues'); return; }
-    diag('Deep Capture (CDP) permission granted. Full debugger attach is intentionally NOT auto-enabled: it shows a banner and can interfere with the page. Current build uses devtools.network + webRequest + page-context fetch, which covers the browser-visible surface without CDP. CDP attach will be added per-target in a follow-up behind this same opt-in.');
-  } catch (e) { diag(`debugger opt-in failed: ${String(e).slice(0, 140)}`); }
+    // Opt-in toggle only — never auto-attached in passive mode.
+    // NOTE: `debugger` is a required manifest permission (Chrome rejects it in
+    // permissions.request with "Only permissions specified in the manifest may
+    // be requested"), so there is no runtime permission step here — the grant
+    // happened at install. This button only toggles the attach itself.
+    if (cdpAttached) { sendCdpStop('toggle'); diag('Deep Capture detach requested'); return; }
+    sendCdpStart();
+    permStatus('Attaching Deep Capture… watch for the tab banner.');
+  } finally {
+    if (btn) btn.disabled = false;
+    syncDeepCapBtn();
+  }
 }
 
 // ---------- boot ----------
 async function boot(): Promise<void> {
   buildScopeRow(); buildSettings(); wire(); initWorker();
+  await initStore();
   connectBackground(); hookDevtoolsNetwork();
   ledger.setBudget(settings.budgetMB);
   try {
@@ -1891,12 +2796,25 @@ async function boot(): Promise<void> {
   try {
     const stored = await chrome.storage.local.get('deepscope-settings') as Record<string, unknown>;
     const saved = stored['deepscope-settings'] as Partial<SessionSettings> | undefined;
-    if (saved) { settings = { ...settings, ...saved }; buildSettings(); ledger.setBudget(settings.budgetMB); }
+    if (saved) {
+      settings = {
+        ...settings, ...saved,
+        deep: { ...DEFAULT_SETTINGS.deep, ...(saved.deep ?? {}) },
+        deepScan: { ...settings.deepScan, ...(saved.deepScan ?? {}) },
+        capture: { ...settings.capture, ...(saved.capture ?? {}) },
+      };
+      buildSettings(); ledger.setBudget(settings.budgetMB);
+      try { store.setLimit(settings.storageMB * 1024 * 1024); } catch { /* ignore */ }
+    }
   } catch { /* storage unavailable; session-only settings */ }
   // Persist only SETTINGS (never captures) — best effort.
   window.addEventListener('beforeunload', () => {
     try { void chrome.storage.local.set({ 'deepscope-settings': settings }); } catch { /* ignore */ }
+    sendCdpStop('unload');
+    try { if (idbReady && sessionId) void idbDeleteSession(sessionId); } catch { /* best effort */ }
   });
+  syncDeepCapBtn();
+  void syncGrantBtn();
   renderAll(); runSearch();
   applyTheme();
   updateDeepStatus();

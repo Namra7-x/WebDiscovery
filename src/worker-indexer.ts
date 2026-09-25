@@ -20,6 +20,7 @@ interface IndexRequest {
   kind: string;
   advancedJs: boolean;
   scanSecrets: boolean;
+  gen?: number;
 }
 
 interface Unit { text: string; line: number; column: number; kind: string; extra?: string; sec?: { rule: string; sev: Severity; label: string } }
@@ -28,17 +29,18 @@ const ctx = globalThis as unknown as {
   onmessage: ((ev: MessageEvent<IndexRequest>) => void) | null;
   postMessage(msg: unknown): void;
 };
-type PostBack = { type: string; id: number; units: Unit[]; error?: string };
+type PostBack = { type: string; id: number; units: Unit[]; gen: number; error?: string };
 
 ctx.onmessage = (ev: MessageEvent<IndexRequest>) => {
   const msg = ev.data;
   if (!msg || msg.type !== 'index-text') return;
+  const gen = (msg as IndexRequest).gen ?? 0;
   try {
     const units = computeUnits(msg);
-    const back: PostBack = { type: 'units', id: msg.id, units };
+    const back: PostBack = { type: 'units', id: msg.id, units, gen };
     ctx.postMessage(back);
   } catch (e) {
-    const back: PostBack = { type: 'units', id: (msg as IndexRequest).id, units: [], error: String(e) };
+    const back: PostBack = { type: 'units', id: (msg as IndexRequest).id, units: [], gen, error: String(e) };
     ctx.postMessage(back);
   }
 };

@@ -3,13 +3,15 @@
 import assert from 'node:assert/strict';
 import { normalize, hashStr, normalizeWithMap, snippetWithSpans } from '../dist/normalize.js';
 import { fuzzyScore, fuzzyMatch } from '../dist/fuzzy.js';
-import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals } from '../dist/extractors.js';
+import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals, extractJsAdvanced } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
 import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody } from '../dist/tables.js';
 import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon } from '../dist/rules.js';
 import { classifyApiKind, findExposures } from '../dist/exposure.js';
 import { MemoryLedger } from '../dist/memory.js';
+import { CaptureStore } from '../dist/store.js';
+import { DiscoveryGraph } from '../dist/graph.js';
 import { defaultScope } from '../dist/types.js';
 
 let pass = 0;
@@ -346,6 +348,60 @@ ok('snippetBody default cap 1500', () => {
   const out = snippetBody(input);
   assert.ok(out.includes('truncated'));
   assert.ok(out.includes('100 chars'));
+});
+
+// 29. priority-aware extraction caps — endpoints survive identifier floods.
+ok('priority caps: endpoints survive 4500+ identifiers', () => {
+  let blob = 'fetch("/api/keep1"); fetch("/api/keep2");\n';
+  for (let i = 0; i < 4600; i++) blob += `var ident${i}=${i};\n`;
+  const units = extractJs(blob);
+  assert.ok(units.length <= 6000, `out.length=${units.length}`);
+  assert.ok(units.some((u) => u.text.includes('/api/keep1')), 'keep1 present');
+  assert.ok(units.some((u) => u.text.includes('/api/keep2')), 'keep2 present');
+  assert.ok(units.filter((u) => u.kind === 'identifier').length <= 1200, 'identifiers bounded');
+});
+
+// 30. OpenAPI/Swagger declared endpoints.
+ok('openapi declared endpoints', () => {
+  const units = extractJson(JSON.stringify({ openapi: '3.0.0', paths: { '/pets': { get: {}, post: {} } } }));
+  const eps = units.filter((u) => u.kind === 'endpoint' && u.text === '/pets');
+  assert.ok(eps.some((u) => u.extra === 'openapi:GET /pets declared'), JSON.stringify(eps));
+  assert.ok(eps.some((u) => u.extra === 'openapi:POST /pets declared'), JSON.stringify(eps));
+});
+
+// 31. graph edge-key rebuild on overflow (no leak, no wrong dedupe).
+ok('graph edgeKeys rebuild on overflow', () => {
+  const g = new DiscoveryGraph();
+  for (let i = 0; i < 8200; i++) g.link(`a${i}`, `b${i}`, 'js-string');
+  assert.ok(g.edges.length <= 8000, `edges=${g.edges.length}`);
+  const before = g.edges.length;
+  g.link('a0', 'b0', 'js-string'); // dropped by overflow splice -> must NOT be wrongly deduped
+  assert.equal(g.edges.length, before + 1, 'dropped triple re-added');
+});
+
+// NOTE: worker gen echo (msg.gen ?? 0 -> PostBack.gen in both success + error
+// branches) is NOT tested here — Workers can't run in node; verified by
+// inspection of src/worker-indexer.ts.
+
+// 32. advanced socket/router/URL patterns (advancedJsAnalysis gate).
+ok('extractJsAdvanced socket/router patterns', () => {
+  const units = extractJsAdvanced('new WebSocket("wss://x/s"); el path:"/dash"');
+  assert.ok(units.some((u) => u.kind === 'fetch-target' && u.text === 'wss://x/s'), JSON.stringify(units));
+  assert.ok(units.some((u) => u.kind === 'route' && u.text === '/dash'), JSON.stringify(units));
+});
+
+// 33. v1.6.3: absolute setCategory for derived meter categories.
+ok('store setCategory', () => {
+  const s = new CaptureStore(1000);
+  s.setCategory('index', 400);
+  s.setCategory('graph', 100);
+  assert.equal(s.snapshot().total, 500);
+  s.setCategory('index', 100); // absolute replace, not accumulate
+  assert.equal(s.snapshot().total, 200);
+  s.add('raw-bodies', 300);
+  assert.equal(s.snapshot().total, 500);
+  s.setCategory('bogus', 999); // unknown category ignored
+  assert.equal(s.snapshot().total, 500);
 });
 
 console.log(`\n${pass} checks passed.`);

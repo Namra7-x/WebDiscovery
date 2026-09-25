@@ -4,6 +4,53 @@
 
 ---
 
+## v1.6.3 — 2026-09-24 (Deep Capture attach fix + truthful meter)
+
+- **Deep Capture ON fixed**: the error `Only permissions specified in the manifest may be requested` is a Chrome platform rule — `debugger` cannot be requested at runtime via `permissions.request`. Moved `debugger` to required manifest `permissions` (install-granted); the button now toggles the attach directly with busy label + inline status. NOTE: Edge will flag the permission change on reload — re-enable if prompted.
+- **Meter fixed (was stuck at 0)**: two causes — (1) index/graph/network/metadata categories were never fed to the store (only raw bodies were), so with raw retention off the total was always 0; added `store.setCategory()` + `syncStoreDerived()` (index actual bytes, graph/nodes-edges and network/records estimates) so the meter is alive in every mode. (2) Stored old settings (`retainRaw:false`) override new defaults — bodies need the Settings toggle ON to be retained.
+- Verified: tsc clean, `verify.mjs` 33/33 (new setCategory check), manifest clean, release ≈ 343KB.
+
+---
+
+## v1.6.2 — 2026-09-24 (home budget + unbreakable buttons)
+
+- **Storage budget moved to Overview (home)**: preset dropdown (60/100/250/500/1024) + always-visible custom MB box + live `Retained X / Y MB · Remaining Z` line. Removed from Settings (hint left behind). Applies live, announced in diagnostics.
+- **Grant + Deep Capture buttons fixed properly**: (1) all `wire()`/`buildSettings()` listener attachments converted to null-safe wiring — one stale/missing control can no longer kill every button after it; (2) busy labels (`Requesting…`, disabled) during async permission prompts; (3) results now appear INLINE in the Permissions card (`#permStatus`: granted/declined/failed + live ON state) instead of only as Overview diagnostics on another tab; (4) grant button reflects the real held permission on boot (`Site access: ON`); (5) render loop guarded so a render hiccup can never freeze the panel.
+- Verified: tsc clean, 32/32, release ≈ 342KB, zero deps.
+
+---
+
+## v1.6.1 — 2026-09-24 (maximum sensible defaults)
+
+- Defaults flipped to full power where Chrome allows: storageMB 250→**60**, retainRaw →**on**, advancedJsAnalysis →**on**, runtimeHook →**on** (arms automatically once site access is granted). Storage presets now 60/100/250/500/1024.
+- Kept OFF (browser-forced): Deep Capture debugger attach + site-access grant — both need your click. Settings → Permissions card now carries a plain "For maximum discovery, 2 manual steps" notice naming exactly those two.
+- retainBinary stays OFF (bytes, no discovery value). Verified: tsc clean, 32/32, release ≈ 336KB.
+
+---
+
+## v1.6.0 — 2026-09-24 (Deep Capture engine: CDP, budgets, correlation, evidence)
+
+Built by 4 parallel subagents, zero file overlaps (S: store+idb · C: background+cdp · E: extractors/exposure/graph/worker/verify · P: panel+html+css+content), contracts fixed up-front in types.ts. All assumed shapes matched; full tsc clean, 32/32 verify, manifest clean, release ≈ 336KB, zero deps.
+
+### Real Deep Capture (was permission-only, now works)
+- `background.ts` + new `cdp.ts`: opt-in `chrome.debugger` attach (protocol 1.3) with ONLY Network domain + Target auto-attach (flatten); ≤25 tracked targets (page/iframe/worker/service-worker); compact event relay (req/res/fail/redirect/ws-frame) to the panel port; WS payloads sliced 4KB, 500/session cap; detach on stop/disconnect/tab-close with state events. Passive path never attaches. `btnDebugger` now toggles a real ON/OFF session with target counts in UI.
+
+### Identity + correlation (URL never identifies a request)
+- NetEntry/ResourceMeta carry reqId, frameId, targetId, workerKind, loaderId, redirects (≤5), protocol, timing, fromServiceWorker/fromCache. CDP events upsert by reqId (30s url+method fallback); devtools entries keep stable ids; WS handshakes + frame counts (32KB/url cap).
+- Endpoint evidence map keyed `METHOD + path-template` ({id} for digits/UUIDs): static (file/line/via) + runtime (hook) + network (calls/methods/status) + source-map + worker sets. API rows show S/R/N×n/U badges; Called = calls>0 (known quirk: with Deep Capture on, devtools+CDP can double-count calls — Called status unaffected).
+
+### Unified budget + temp IndexedDB (hard limit, no permanent DB)
+- New `store.ts` CaptureStore: hard retention budget (settings.storageMB default 250; presets 50/100/250/500/1024 + custom 10–2048), categories raw-bodies/metadata/index/graph/network/pending/buffers; bodies gated, metadata always allowed; tight≥80%, full→metadata-only + one clear notice.
+- New `idb.ts`: `deepscope-tmp` session overflow (bodies >64KB), never-throw, 5MB/put cap, recorded-length accounting; sessionId per boot; boot crash-GC of abandoned sessions; beforeunload + tab-close deletion. No chrome.storage/localStorage/cloud for captures.
+- Storage UI: membar `Live ●/○ | Retained X / L MB · N req · M apis` + native expandable details (RAM/temp-disk/total/limit/remaining + per-category + temp-disk explainer), updated in existing render throttle. Settings: storage presets + max body KB + retainBinary + Advanced (concurrency 1–8, WS frames, runtime hook). Capture/render limits separated: budgets bound retention, Show All/Load More only render.
+
+### Workers, backpressure, generations, rendering
+- Deep Scan pool (settings.deep.concurrency, default 3) with per-job AbortController; worker in-flight cap 4 FIFO; source-map cap 8; sessionGen on worker posts/fetches/sourcemaps with stale-result drops; per-section dirty rendering (400ms) instead of render-all.
+- Runtime hook (content.ts, opt-in via page flag): fetch/XHR/WS/EventSource/sendBeacon/history wrapped, batched findings piggyback existing content-batch (zero background changes).
+- Extraction: priority tiers (endpoints/routes/imports first, identifiers last), OpenAPI/Swagger declared-endpoint parsing (`openapi:METHOD path declared`), AST-lite socket/router patterns, graph edgeKeys rebuilt on overflow, `isSubdomainOf` strict dot-boundary fix (evil-example.com no longer matches).
+
+---
+
 ## v1.5.2 — 2026-09-23 (show-all everywhere rows were capped)
 
 - **API tab**: per-group `Show all (N)` / `Show less` reusing the shared `grpShowAll` set (100 → 1000 rows); overflow rows point at it.

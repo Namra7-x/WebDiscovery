@@ -19,7 +19,13 @@ interface DomBatch {
   apis: string[];
   textSample: string;
   ts: number;
+  /** Opt-in runtime-hook findings drained into this batch (cap 200). The
+   *  background already forwards content-batch untouched, so piggybacking
+   *  here needs zero new plumbing. */
+  runtime?: RuntimeHit[];
 }
+
+interface RuntimeHit { t: string; method: string; url: string; ts: number }
 
 let sentInitial = false;
 let batchTimer = 0;
@@ -153,6 +159,8 @@ function snapshot(reason: string): void {
       manifest, manifests, chunks: [...new Set(chunks)], apis: [...new Set(apis)],
       textSample, ts: Date.now(),
     };
+    const rt = drainRuntime(200);
+    if (rt.length) batch.runtime = rt;
     try {
       void Promise.resolve(chrome.runtime.sendMessage(batch)).catch(() => undefined);
     } catch { /* extension context unavailable; panel eval fallback still works */ }
@@ -174,9 +182,9 @@ if (!sentInitial) {
   // SPA transition monitoring: history API + hash + performance lazy chunks
   try {
     const push = history.pushState.bind(history);
-    history.pushState = (...a: Parameters<typeof push>) => { const r = push(...a); schedule(); return r; };
+    history.pushState = (...a: Parameters<typeof push>) => { const r = push(...a); try { rtPush('history', 'GET', location.href); } catch { /* ignore */ } schedule(); return r; };
     const repl = history.replaceState.bind(history);
-    history.replaceState = (...a: Parameters<typeof repl>) => { const r = repl(...a); schedule(); return r; };
+    history.replaceState = (...a: Parameters<typeof repl>) => { const r = repl(...a); try { rtPush('history', 'GET', location.href); } catch { /* ignore */ } schedule(); return r; };
     window.addEventListener('popstate', schedule);
     window.addEventListener('hashchange', schedule);
   } catch { /* ignore */ }
@@ -209,3 +217,140 @@ if (!sentInitial) {
   } catch { /* ignore */ }
   return [...found].slice(0, 200);
 };
+
+// ----- Opt-in runtime hook (armed by the panel, never automatic) -----
+// The panel sets `window.__deepscope_hook = true` via inspectedWindow.eval
+// only when Deep Capture is attached AND settings.deep.runtimeHook is on.
+// This script polls that DOM flag every 2s (cheap) to arm/disarm; wrappers
+// stay installed once created but no-op while disarmed. Findings batch
+// {t,method,url,ts} (cap 200/batch, 1s throttle) piggybacked on the existing
+// content-batch channel, so no new messaging or permissions are needed.
+//
+// NOTE: content.ts is standalone (no imports by design). The helper below
+// mirrors types.ts isSubdomainOf() with identical semantics (strict
+// dot-boundary; www-folded). The existing === origin checks above were kept
+// as-is: swapping them for subdomain matching would broaden route collection
+// (behavior change), so only the new runtime path uses subdomain awareness.
+function isSubdomainOf(host: string, base: string): boolean {
+  const h = host.toLowerCase().replace(/\.$/, '');
+  const b = base.toLowerCase().replace(/\.$/, '').replace(/^www\./, '');
+  if (!h || !b) return false;
+  const hh = h.replace(/^www\./, '');
+  return hh === b || hh.endsWith(`.${b}`);
+}
+
+const rtBuf: RuntimeHit[] = [];
+let hookArmed = false;
+let hooksInstalled = false;
+
+function rtPush(t: string, method: string, url: string): void {
+  if (!hookArmed) return;
+  try {
+    const u = String(url ?? '').slice(0, 600);
+    if (!u || /^(data|blob|javascript):/i.test(u)) return;
+    rtBuf.push({ t, method: String(method ?? 'GET').toUpperCase().slice(0, 12) || 'GET', url: u, ts: Date.now() });
+    if (rtBuf.length > 1000) rtBuf.splice(0, rtBuf.length - 1000);
+  } catch { /* ignore */ }
+}
+
+function drainRuntime(n: number): RuntimeHit[] {
+  if (!rtBuf.length) return [];
+  return rtBuf.splice(0, Math.min(n, rtBuf.length));
+}
+
+function flushRuntime(): void {
+  const runtime = drainRuntime(200);
+  if (!runtime.length) return;
+  try {
+    const batch: DomBatch = {
+      type: 'content-batch', url: location.href, route: routeOf(), htmlLen: 0,
+      links: [], scripts: [], forms: [], iframes: [], routes: [],
+      manifest: null, manifests: [], chunks: [], apis: [], textSample: '',
+      ts: Date.now(), runtime,
+    };
+    void Promise.resolve(chrome.runtime.sendMessage(batch)).catch(() => undefined);
+  } catch { /* ignore */ }
+}
+
+/** Ultra-light wrappers: fetch/XHR/WebSocket/EventSource/sendBeacon/history.
+ *  Passive unless hookArmed; each install guarded so page breakage is impossible. */
+function installRuntimeHooks(): void {
+  if (hooksInstalled) return;
+  hooksInstalled = true;
+  try {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      try {
+        let u = '';
+        let m = init?.method ?? 'GET';
+        if (typeof input === 'string') u = input;
+        else if (input instanceof URL) u = input.toString();
+        else { u = (input as Request).url; if (!init?.method) m = (input as Request).method ?? 'GET'; }
+        rtPush('fetch', m, u);
+      } catch { /* ignore */ }
+      return origFetch(input, init);
+    }) as typeof window.fetch;
+  } catch { /* ignore */ }
+  try {
+    const XP = XMLHttpRequest.prototype;
+    const origOpen = XP.open;
+    const origSend = XP.send;
+    (XP as unknown as { open: (...a: unknown[]) => unknown }).open = function (...a: unknown[]): unknown {
+      try {
+        const o = this as unknown as { __dsc?: { m: string; u: string } };
+        if (typeof a[0] === 'string' && (typeof a[1] === 'string' || a[1] instanceof URL)) o.__dsc = { m: a[0], u: String(a[1]) };
+      } catch { /* ignore */ }
+      return (origOpen as (...a: unknown[]) => unknown).apply(this, a);
+    };
+    (XP as unknown as { send: (...a: unknown[]) => unknown }).send = function (...a: unknown[]): unknown {
+      try {
+        const d = (this as unknown as { __dsc?: { m: string; u: string } }).__dsc;
+        if (d) rtPush('xhr', d.m, new URL(d.u, location.href).toString());
+      } catch { /* ignore */ }
+      return (origSend as (...a: unknown[]) => unknown).apply(this, a);
+    };
+  } catch { /* ignore */ }
+  try {
+    const WS = window.WebSocket;
+    function WrappedWS(url: string | URL, protocols?: string | string[]): WebSocket {
+      try { rtPush('ws', 'GET', url.toString()); } catch { /* ignore */ }
+      return new WS(url, protocols);
+    }
+    WrappedWS.prototype = WS.prototype;
+    Object.setPrototypeOf(WrappedWS, WS);
+    window.WebSocket = WrappedWS as unknown as typeof WebSocket;
+  } catch { /* ignore */ }
+  try {
+    const ES = window.EventSource;
+    if (typeof ES === 'function') {
+      function WrappedES(url: string | URL, init?: EventSourceInit): EventSource {
+        try { rtPush('sse', 'GET', url.toString()); } catch { /* ignore */ }
+        return new ES(url, init);
+      }
+      WrappedES.prototype = ES.prototype;
+      Object.setPrototypeOf(WrappedES, ES);
+      (window as unknown as { EventSource: unknown }).EventSource = WrappedES;
+    }
+  } catch { /* ignore */ }
+  try {
+    const origBeacon = navigator.sendBeacon.bind(navigator) as (url: string | URL, data?: BodyInit | null) => boolean;
+    navigator.sendBeacon = ((url: string | URL, data?: BodyInit | null): boolean => {
+      try { rtPush('beacon', 'POST', url.toString()); } catch { /* ignore */ }
+      return origBeacon(url, data);
+    }) as typeof navigator.sendBeacon;
+  } catch { /* ignore */ }
+}
+
+try {
+  window.setInterval(() => {
+    try {
+      hookArmed = (window as unknown as { __deepscope_hook?: unknown }).__deepscope_hook === true;
+      if (hookArmed) installRuntimeHooks();
+    } catch { /* ignore */ }
+  }, 2000);
+} catch { /* ignore */ }
+try {
+  window.setInterval(() => {
+    try { if (hookArmed && rtBuf.length) flushRuntime(); } catch { /* ignore */ }
+  }, 1000);
+} catch { /* ignore */ }

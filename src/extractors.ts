@@ -8,6 +8,8 @@
 //   pass 2 — every literal is classified as route / endpoint / asset / url and
 //            emitted with the right kind, so the graph + Deep Scan queue sees it.
 
+import { classifyApiKind } from './exposure.js';
+
 export interface Extracted {
   text: string;
   line: number;
@@ -95,6 +97,16 @@ export function classifyPath(s: string): 'endpoint' | 'route' | 'asset' | null {
   if (ASSET_EXT_RE.test(t) && !isApiEndpoint(t)) return 'asset';
   if (isApiEndpoint(t)) return 'endpoint';
   return 'route';
+}
+
+/**
+ * Canonical endpoint classifier for NEW decisions — thin wrapper over
+ * exposure.ts classifyApiKind (THE canonical API classifier). Frozen
+ * helpers isApiEndpoint/looksLikeRoutePath/classifyPath above are NOT
+ * rewired (test stability); new code below should call classifyEndpoint().
+ */
+export function classifyEndpoint(text: string, mime?: string): string {
+  return classifyApiKind(text, mime);
 }
 
 interface Lit { value: string; index: number; quote: string }
@@ -467,12 +479,21 @@ export function extractJs(src: string, starts?: number[]): Extracted[] {
   }
 
   // String literals + identifiers: cap aggressively to bound RAM.
+  // Priority-aware extraction caps: tier1 (endpoint/route/graphql-op/
+  // fetch-target/imports/sourcemap-ref/trpc/jsonrpc/soap/sse/importmap) is
+  // emitted first and never skipped for volume; tier2 (url/string-literal/
+  // identifier/asset-ref) is volume-capped. Implemented as: once out.length
+  // exceeds 4000 SKIP 'identifier' units, once exceeds 5000 SKIP plain
+  // 'string-literal' units (but keep path-like literals containing '/' so
+  // route-ish strings still surface). Small inputs never hit these
+  // thresholds, so existing tests stay green.
   STRING_RE.lastIndex = 0;
   let strCount = 0;
   while ((m = STRING_RE.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && strCount < 2500) {
     const v = m[2];
     if (v.length < 3 || v.length > MAX_UNIT_LEN || looksLikeNoise(v)) continue;
     if (v.includes('/') && (looksLikeRoutePath(v.trim()) || isApiEndpoint(v.trim()))) continue; // already emitted
+    if (out.length > 5000 && !v.includes('/')) continue; // priority cap: drop plain literals, keep path-like
     const [l, c] = lc(m.index);
     push(out, v, l, c, 'string-literal');
     strCount++;
@@ -481,6 +502,7 @@ export function extractJs(src: string, starts?: number[]): Extracted[] {
   let idCount = 0;
   const seenIds = new Set<string>();
   while ((m = IDENT_RE.exec(src)) && out.length < MAX_UNITS_PER_RESOURCE && idCount < 1200) {
+    if (out.length > 4000) break; // priority cap: identifiers are lowest priority
     const v = m[0];
     if (seenIds.has(v) || isJsKeyword(v)) continue;
     seenIds.add(v);
@@ -836,6 +858,43 @@ export function extractJson(text: string): Extracted[] {
   const out: Extracted[] = [];
   let obj: unknown;
   try { obj = JSON.parse(text); } catch { return out; }
+  // OpenAPI/Swagger declared endpoints (INDEX-ONLY).
+  // NOTE: YAML specs are intentionally skipped — extractJson only parses
+  // JSON (JSON.parse); a YAML-only spec never reaches here.
+  // If parsed object has string `openapi` (3.x) or `swagger` ('2.0') AND
+  // object `paths`: for each path (cap 300) and each method in
+  // [get,put,post,delete,options,head,patch,trace] present: push kind
+  // 'endpoint', text = path (sliced), extra `openapi:<METHOD> <path> declared`.
+  {
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      const rec = obj as Record<string, unknown>;
+      const hasOpenapi = typeof rec['openapi'] === 'string';
+      const hasSwagger = typeof rec['swagger'] === 'string';
+      const paths = rec['paths'];
+      if ((hasOpenapi || hasSwagger) && paths && typeof paths === 'object' && !Array.isArray(paths)) {
+        const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'];
+        const entries = Object.entries(paths as Record<string, unknown>).slice(0, 300);
+        for (const [p, ops] of entries) {
+          if (typeof p !== 'string' || p.length < 1 || p.length > 220) continue;
+          const path = p.slice(0, MAX_UNIT_LEN);
+          if (!ops || typeof ops !== 'object' || Array.isArray(ops)) continue;
+          const opRec = ops as Record<string, unknown>;
+          for (const mm of METHODS) {
+            if (!(mm in opRec)) continue;
+            // Consult canonical classifier (exposure.ts) for consistency;
+            // OpenAPI-declared paths are always indexed as 'endpoint' units.
+            classifyEndpoint(path, 'application/json');
+            const methodUp = mm.toUpperCase();
+            const extra = `openapi:${methodUp} ${path} declared`;
+            if (extra.length > MAX_UNIT_LEN + 40) continue;
+            push(out, path, -1, -1, 'endpoint', extra);
+            if (out.length >= MAX_UNITS_PER_RESOURCE) break;
+          }
+          if (out.length >= MAX_UNITS_PER_RESOURCE) break;
+        }
+      }
+    }
+  }
   const stack: Array<{ v: unknown; path: string }> = [{ v: obj, path: '$' }];
   let count = 0;
   while (stack.length && count < 4000) {
@@ -910,6 +969,95 @@ export function extractJsAdvanced(src: string): Extracted[] {
         }
       }
       idx += t.length;
+    }
+  }
+  // ---- Advanced socket/URL/router patterns (bounded state machines) ----
+  // Runs only when advancedJsAnalysis is on (caller gates). Covers:
+  //   new WebSocket( / new EventSource( / navigator.sendBeacon( /
+  //   XHR .open(method, url) — method+url args, cap 200 total across all four;
+  //   router shapes path:"/..." → kind 'route' (cap 100);
+  //   new URL("...") → kind 'url' (cap 100).
+  {
+    let sockCount = 0;
+    const sockTargets: Array<{ needle: string; label: string }> = [
+      { needle: 'new WebSocket(', label: 'advanced:WebSocket' },
+      { needle: 'new EventSource(', label: 'advanced:EventSource' },
+      { needle: 'navigator.sendBeacon(', label: 'advanced:sendBeacon' },
+    ];
+    for (const t of sockTargets) {
+      if (sockCount >= 200 || out.length >= 800) break;
+      let idx = 0;
+      while (sockCount < 200 && out.length < 800 && (idx = src.indexOf(t.needle, idx)) >= 0) {
+        const base = idx + t.needle.length;
+        const q = src.indexOf('"', base);
+        const q2 = src.indexOf("'", base);
+        const q3 = src.indexOf('`', base);
+        let qs = -1;
+        for (const c of [q, q2, q3]) if (c >= base && c < base + 80 && (qs < 0 || c < qs)) qs = c;
+        if (qs >= 0) {
+          const quote = src[qs];
+          const end = src.indexOf(quote, qs + 1);
+          if (end > qs && end - qs > 1 && end - qs < 240) {
+            const v = src.slice(qs + 1, end);
+            if (v.length >= 2 && v.length <= MAX_UNIT_LEN) {
+              const [l, c] = lineColFallback(src, idx);
+              const before = out.length;
+              push(out, v.slice(0, MAX_UNIT_LEN), l, c, 'fetch-target', t.label);
+              if (out.length > before) sockCount++;
+            }
+          }
+        }
+        idx += t.needle.length;
+      }
+    }
+    // XHR-style .open(method, url): emit the URL as fetch-target with method in extra.
+    if (sockCount < 200 && out.length < 800) {
+      const OPEN2_RE = /\.open\s*\(\s*["']([^"']{1,20})["']\s*,\s*["']([^"']{1,220})["']/g;
+      OPEN2_RE.lastIndex = 0;
+      let om: RegExpExecArray | null;
+      while ((om = OPEN2_RE.exec(src)) && sockCount < 200 && out.length < 800) {
+        const method = (om[1] || '').trim().toUpperCase().slice(0, 20);
+        const url = (om[2] || '').trim();
+        if (!url || url.length < 2 || url.length > MAX_UNIT_LEN) continue;
+        const [l, c] = lineColFallback(src, om.index);
+        const before = out.length;
+        push(out, url.slice(0, MAX_UNIT_LEN), l, c, 'fetch-target', `open:${method || 'UNKNOWN'}`);
+        if (out.length > before) sockCount++;
+      }
+    }
+    // Router shapes: path:"/dash" / path:'/users/:id' → kind 'route' (cap 100).
+    if (out.length < 800) {
+      const ROUTER_RE = /path\s*:\s*["'](\/[^"']{1,120})["']/g;
+      ROUTER_RE.lastIndex = 0;
+      let rm: RegExpExecArray | null;
+      let routeCount = 0;
+      while ((rm = ROUTER_RE.exec(src)) && routeCount < 100 && out.length < 800) {
+        const p = (rm[1] || '').trim();
+        if (!p || p.length < 2 || p.length > MAX_UNIT_LEN) continue;
+        const valIdx = rm.index + rm[0].indexOf(p);
+        const [l, c] = lineColFallback(src, valIdx >= rm.index ? valIdx : rm.index);
+        const before = out.length;
+        push(out, p.slice(0, MAX_UNIT_LEN), l, c, 'route', 'router:path');
+        if (out.length > before) routeCount++;
+      }
+    }
+    // new URL("...") → kind 'url' (cap 100). Canonical ApiKind consulted
+    // via classifyEndpoint() for the extra (units stay kind 'url' per contract).
+    if (out.length < 800) {
+      const NEWURL_RE = /new URL\(\s*["']([^"']{1,160})["']/g;
+      NEWURL_RE.lastIndex = 0;
+      let um: RegExpExecArray | null;
+      let urlCount = 0;
+      while ((um = NEWURL_RE.exec(src)) && urlCount < 100 && out.length < 800) {
+        const u = (um[1] || '').trim();
+        if (!u || u.length < 2 || u.length > MAX_UNIT_LEN) continue;
+        const valIdx = um.index + um[0].indexOf(u);
+        const [l, c] = lineColFallback(src, valIdx >= um.index ? valIdx : um.index);
+        const apiKind = classifyEndpoint(u);
+        const before = out.length;
+        push(out, u.slice(0, MAX_UNIT_LEN), l, c, 'url', `advanced:new-URL:${apiKind}`);
+        if (out.length > before) urlCount++;
+      }
     }
   }
   return out;

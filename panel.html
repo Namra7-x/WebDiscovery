@@ -36,7 +36,16 @@
     <section id="tab-overview" class="tab active">
       <div id="statGrid" class="stat-grid"></div>
       <div class="cols">
+        <div class="card"><h3>Storage budget</h3>
+          <div class="row"><select id="homeStorageSel" title="Retained capture budget — RAM + temporary session storage">
+            <option value="60">60 MB</option><option value="100">100 MB</option><option value="250">250 MB</option><option value="500">500 MB</option><option value="1024">1024 MB</option><option value="custom">custom…</option>
+          </select>
+          <input id="homeStorageCustom" type="number" min="10" max="2048" step="10" title="Custom limit in MB" /></div>
+          <div id="homeStorageLive" class="mono small"></div>
+          <p class="muted small">Hard cap for everything retained. When full: metadata continues, bodies drop first.</p>
+        </div>
         <div class="card"><h3>Session</h3><div id="sessionInfo" class="mono small"></div>
+          <details id="storageDetails"><summary>Storage details</summary><div id="storageBody" class="mono small"></div></details>
           <div class="row"><button id="btnRecapture">Recapture / reload</button><button id="btnReindex">Reindex</button><button id="btnMemClean">Memory cleanup</button><button id="btnExport">Export JSON</button></div>
           <p class="muted small">RAM-only: everything below lives in this panel's memory and is destroyed when DevTools closes. Export only happens when you click it.</p>
         </div>
@@ -117,6 +126,14 @@
     <section id="tab-settings" class="tab">
       <div class="cols">
         <div class="card"><h3>Memory budget</h3><div id="budgetRow" class="row"></div>
+          <p class="muted small">Storage budget lives on the Overview tab.</p>
+          <label>Max body KB <input id="setMaxBodyKB" type="number" min="16" step="16" /></label>
+          <label><input id="setRetainBin" type="checkbox" /> retain binary bodies</label>
+          <details><summary>Advanced</summary>
+            <label>Deep concurrency (1–8) <input id="setDeepConc" type="number" min="1" max="8" /></label>
+            <label><input id="setDeepWs" type="checkbox" /> capture WebSocket frames — retain WS payloads when Deep Capture is on</label>
+            <label><input id="setDeepHook" type="checkbox" /> runtime hook — observe fetch/XHR/WS in the page via an opt-in page flag</label>
+          </details>
           <label>Max response bytes <input id="setMaxResp" type="number" min="1024" step="1024" /></label>
           <label>Max indexed chars / resource <input id="setMaxIdx" type="number" min="1024" step="1000" /></label>
           <label>Max resources <input id="setMaxRes" type="number" min="10" step="10" /></label>
@@ -138,6 +155,8 @@
         <div class="card"><h3>Permissions &amp; privacy</h3>
           <div id="permInfo" class="small"></div>
           <div class="row"><button id="btnGrant">Grant site access</button><button id="btnDebugger">Enable Deep Capture (CDP)</button></div>
+          <div id="permStatus" class="mono small"></div>
+          <div id="cdpTargets" class="mono small"></div>
           <p class="muted small">Deep Capture via chrome.debugger is strictly opt-in and announces a debugging banner in the tab. Base capture uses devtools.network + page-context eval and needs no extra grants.</p>
         </div>
       </div>
