@@ -8,6 +8,7 @@ const refs = [
   'dist/panel.js', 'dist/content.js', 'dist/worker-indexer.js',
   'dist/devtools.js', 'dist/popup.js', 'dist/extractors.js', 'dist/tables.js', 'dist/rules.js', 'dist/exposure.js',
   'dist/store.js', 'dist/idb.js', 'dist/cdp.js',
+  'dist/replay.js', 'dist/intercept-main.js', 'dist/session-file.js', 'dist/openapi.js', 'dist/har.js', 'dist/filter-dsl.js',
   'panel.html', 'panel.css', 'popup.html', 'devtools.html',
 ];
 let fail = 0;

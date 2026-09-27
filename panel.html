@@ -7,56 +7,69 @@
   <link rel="stylesheet" href="./panel.css" />
 </head>
 <body>
+  <a href="#main" class="skip-link">Skip to content</a>
   <header id="topbar">
-    <div class="brand"><span class="dot"></span><strong>DeepScope</strong><span id="scopeLabel" class="scope">scope: —</span></div>
+    <div class="brand"><span class="dot" aria-hidden="true"></span><span id="clearLamp" class="lamp" data-state="base" role="img" aria-label="Clearance: base capture — grant site access in Settings for full capture"></span><h1>DeepScope</h1><span id="scopeLabel" class="scope">scope: —</span></div>
     <div id="membar" class="membar" title="Live RAM accounting (session only, never persisted)">
-      <div class="mem-numbers"><span id="memText">0 MB / 256 MB</span><span id="memDetail" class="muted"></span></div>
-      <div class="mem-track"><div id="memFill" class="mem-fill"></div></div>
+      <div class="mem-numbers" role="status" aria-live="polite" aria-label="Retention summary"><span id="memText">0 MB / 256 MB</span><span id="memDetail" class="muted"></span></div>
+      <div class="mem-track" aria-hidden="true"><div id="memFill" class="mem-fill"></div></div>
     </div>
     <div class="top-actions">
-      <button id="btnTheme" title="Toggle light / dark theme">◐ Light</button>
-      <button id="btnPause" title="Pause/resume capture">Pause</button>
-      <button id="btnDeep" class="primary" title="Start bounded same-origin Deep Scan">Deep Scan</button>
+      <button id="topStatus" class="topstatus" title="Session status — open Settings">starting…</button>
+      <input id="urlFind" type="text" placeholder="Find URL in all tabs…" title="Fuzzy URL search across Routes, Resources, Network and APIs — substring or typo-tolerant (Esc clears)" autocomplete="off" spellcheck="false" aria-label="Find URL across all tabs" />
+      <button id="btnTheme" title="Toggle light / dark theme" aria-pressed="false">◐ Light</button>
+      <button id="btnPause" title="Pause/resume capture" aria-pressed="false">Pause</button>
+      <button id="btnDeep" class="primary" title="Start bounded same-origin Deep Scan" aria-pressed="false">Deep Scan</button>
       <button id="btnClear" title="Clear current session (RAM only)">Clear</button>
     </div>
   </header>
-  <div id="budgetWarn" class="warn hidden"></div>
-  <nav id="tabs" role="tablist">
-    <button data-tab="overview" class="active">Overview</button>
-    <button data-tab="search" class="">Search</button>
-    <button data-tab="routes">Routes <span id="cRoutes" class="pill">0</span></button>
-    <button data-tab="resources">Resources <span id="cRes" class="pill">0</span></button>
-    <button data-tab="network">Network <span id="cNet" class="pill">0</span></button>
-    <button data-tab="analyze">Analyze <span id="cAnalyze" class="pill">0</span></button>
-    <button data-tab="apis">APIs <span id="cApis" class="pill">0</span></button>
-    <button data-tab="graph">Graph</button>
-    <button data-tab="settings">Settings</button>
+  <div id="budgetWarn" class="warn hidden" role="status" aria-live="polite"></div>
+  <nav id="tabs" role="tablist" aria-label="Capture views">
+    <button data-tab="overview" data-grp="capture" class="active" role="tab" id="tabbtn-overview" aria-selected="true" aria-controls="tab-overview">Overview</button>
+    <button data-tab="search" data-grp="capture" class="" role="tab" id="tabbtn-search" aria-selected="false" aria-controls="tab-search">Search</button>
+    <button data-tab="routes" data-grp="capture" role="tab" id="tabbtn-routes" aria-selected="false" aria-controls="tab-routes">Routes <span id="cRoutes" class="pill">0</span></button>
+    <button data-tab="resources" data-grp="evidence" role="tab" id="tabbtn-resources" aria-selected="false" aria-controls="tab-resources">Resources <span id="cRes" class="pill">0</span></button>
+    <button data-tab="network" data-grp="evidence" role="tab" id="tabbtn-network" aria-selected="false" aria-controls="tab-network">Network <span id="cNet" class="pill">0</span></button>
+    <button data-tab="analyze" data-grp="evidence" role="tab" id="tabbtn-analyze" aria-selected="false" aria-controls="tab-analyze">Analyze <span id="cAnalyze" class="pill">0</span></button>
+    <button data-tab="apis" data-grp="evidence" role="tab" id="tabbtn-apis" aria-selected="false" aria-controls="tab-apis">APIs <span id="cApis" class="pill">0</span></button>
+    <button data-tab="graph" data-grp="map" role="tab" id="tabbtn-graph" aria-selected="false" aria-controls="tab-graph">Graph</button>
+    <button data-tab="settings" data-grp="map" role="tab" id="tabbtn-settings" aria-selected="false" aria-controls="tab-settings">Settings</button>
   </nav>
-  <main>
-    <section id="tab-overview" class="tab active">
+  <main id="main" tabindex="-1">
+    <section id="tab-overview" class="tab active" role="tabpanel" aria-labelledby="h-overview">
+      <h2 id="h-overview">Overview</h2>
+      <p class="muted small">Session summary and retention. Capture is RAM-only; nothing persists unless you export.</p>
       <div id="statGrid" class="stat-grid"></div>
       <div class="cols">
-        <div class="card"><h3>Storage budget</h3>
-          <div class="row"><select id="homeStorageSel" title="Retained capture budget — RAM + temporary session storage">
+        <section class="card" aria-labelledby="h-storage"><h3 id="h-storage">Storage budget</h3>
+          <div class="row"><label for="homeStorageSel">Budget</label><select id="homeStorageSel" title="Retained capture budget — RAM + temporary session storage">
             <option value="60">60 MB</option><option value="100">100 MB</option><option value="250">250 MB</option><option value="500">500 MB</option><option value="1024">1024 MB</option><option value="custom">custom…</option>
           </select>
-          <input id="homeStorageCustom" type="number" min="10" max="2048" step="10" title="Custom limit in MB" /></div>
-          <div id="homeStorageLive" class="mono small"></div>
+          <label for="homeStorageCustom">Custom MB</label><input id="homeStorageCustom" type="number" min="10" max="2048" step="10" title="Custom limit in MB" /></div>
+          <div id="homeStorageLive" class="mono small" role="status" aria-live="polite"></div>
           <p class="muted small">Hard cap for everything retained. When full: metadata continues, bodies drop first.</p>
-        </div>
-        <div class="card"><h3>Session</h3><div id="sessionInfo" class="mono small"></div>
+        </section>
+        <section class="card" aria-labelledby="h-session"><h3 id="h-session">Session</h3><div id="sessionInfo" class="mono small"></div>
+          <div id="sessionStrip" class="torn-strip" data-state="live" role="status" aria-label="Capture timeline"></div>
           <details id="storageDetails"><summary>Storage details</summary><div id="storageBody" class="mono small"></div></details>
           <div class="row"><button id="btnRecapture">Recapture / reload</button><button id="btnReindex">Reindex</button><button id="btnMemClean">Memory cleanup</button><button id="btnExport">Export JSON</button></div>
+          <div class="row"><button id="btnSaveSession" class="primary" title="Save this session to one .dsz file (explicit only)">Save session</button><button id="btnOpenSession" title="Open a saved .dsz session file">Open session</button><input id="fileOpenSession" type="file" accept=".dsz,.json,application/gzip,application/json" class="hidden" aria-label="Open session file" /></div>
           <p class="muted small">RAM-only: everything below lives in this panel's memory and is destroyed when DevTools closes. Export only happens when you click it.</p>
-        </div>
-        <div class="card"><h3>Diagnostics</h3><div id="diagList" class="diag"></div></div>
+        </section>
+        <section class="card" aria-labelledby="h-intercept"><h3 id="h-intercept">Interception (mock / block)</h3><div id="interceptList" class="mono small"></div>
+          <div id="interceptHint" class="muted small"></div>
+          <p class="muted small">Rules run in the page and vanish when the browser closes. Replay one-off requests from the Network or APIs tab.</p>
+        </section>
+        <section class="card" aria-labelledby="h-diag"><h3 id="h-diag">Diagnostics</h3><div id="diagList" class="diag" role="status" aria-live="polite"></div></section>
       </div>
     </section>
-    <section id="tab-search" class="tab">
+    <section id="tab-search" class="tab" role="tabpanel" aria-labelledby="h-search">
+      <h2 id="h-search">Search</h2>
       <p class="muted small">Search everything captured in RAM. Type to fuzzy-match strings across JS, JSON, DOM and headers.</p>
+      <label for="q">Search captured text</label>
       <div class="search-row">
         <input id="q" type="text" placeholder="Universal fuzzy search — try gpt-6 …" autocomplete="off" spellcheck="false" />
-        <select id="mode" title="Search mode">
+        <label for="mode">Mode</label><select id="mode" title="Search mode">
           <option value="fuzzy" selected>fuzzy</option>
           <option value="normalized">normalized</option>
           <option value="substring">substring</option>
@@ -66,109 +79,157 @@
         <button id="btnSearch" class="primary">Search</button>
       </div>
       <div id="scopeRow" class="scope-row"></div>
-      <div id="resultMeta" class="muted small"></div>
-      <div id="results" class="results"></div>
+      <div id="resultMeta" class="muted small" role="status" aria-live="polite"></div>
+      <div id="results" class="results" aria-live="polite"></div>
     </section>
-    <section id="tab-routes" class="tab">
+    <section id="tab-routes" class="tab" role="tabpanel" aria-labelledby="h-routes">
+      <h2 id="h-routes">Routes</h2>
       <p class="muted small">Every route seen on this origin. <b>Seen ×N</b> = times observed this session. Filter the list, then Open a route or Copy URLs to export.</p>
-      <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small"></span></div>
-      <div class="row"><input id="routeFilter" type="text" placeholder="filter routes…" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><button id="btnRoutesShowAll" title="Lift the 300-row render cap">Show all</button><span id="routeCount" class="muted small"></span></div>
-      <div class="table-wrap"><table id="routeTable"><thead><tr><th>Route</th><th title="How many times this route was seen this session">Seen</th><th>Via</th><th>Actions</th></tr></thead><tbody id="routeBody"></tbody></table></div>
+      <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small" role="status" aria-live="polite"></span></div>
+      <div class="row"><label for="routeFilter">Filter routes</label><input id="routeFilter" type="text" placeholder="filter routes — try seen:>5" aria-describedby="dslHintRoutes" title="Filter DSL: method:GET seen:>5 route:/api/* (plain text still works)" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><button id="btnRoutesShowAll" title="Lift the 300-row render cap" aria-expanded="false">Show all</button><button data-wrap-table="routeTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button><span id="routeCount" class="muted small" role="status" aria-live="polite"></span></div>
+      <div class="row chips-row"><span class="chips" role="group" aria-label="Route filter shortcuts"><button data-dsl-for="routeFilter" data-dsl="seen:>5" title="Only routes seen more than 5 times">seen:>5</button><button data-dsl-for="routeFilter" data-dsl="route:/api/*" title="Only routes under /api/">route:/api/*</button><button data-clear-for="routeFilter" title="Clear the filter">Clear</button></span><span id="dslHintRoutes" class="muted small">Shortcuts write filter text for you — plain text works too.</span></div>
+      <div class="table-wrap"><table id="routeTable"><caption class="muted small">Routes seen this session, with observation counts.</caption><thead><tr><th scope="col">Route</th><th scope="col" title="How many times this route was seen this session">Seen</th><th scope="col">Via</th><th scope="col">Actions</th></tr></thead><tbody id="routeBody"></tbody></table></div>
     </section>
-    <section id="tab-resources" class="tab">
+    <section id="tab-resources" class="tab" role="tabpanel" aria-labelledby="h-resources">
+      <h2 id="h-resources">Resources</h2>
       <p class="muted small">Every captured file, grouped by domain with per-group Show-all — click a URL to open it, View to preview contents.</p>
       <div class="row">
-        <input id="resFilter" placeholder="filter resources…" />
-        <select id="resType" title="Filter by resource type (built live from what was captured)"><option value="ALL">all types</option></select>
+        <label for="resFilter">Filter resources</label><input id="resFilter" placeholder="filter — try kind:chunk has:body" aria-describedby="dslHintRes" title="Filter DSL: kind:script host:cdn.* has:body -kind:media-meta (plain text still works)" />
+        <label for="resType">Type</label><select id="resType" title="Filter by resource type (built live from what was captured)"><option value="ALL">all types</option></select>
       </div>
+      <div class="row chips-row"><span class="chips" role="group" aria-label="Resource filter shortcuts"><button data-dsl-for="resFilter" data-dsl="kind:script" title="Only scripts">kind:script</button><button data-dsl-for="resFilter" data-dsl="kind:chunk" title="Only JS chunks">kind:chunk</button><button data-dsl-for="resFilter" data-dsl="has:body" title="Only resources with a captured body">has:body</button><button data-clear-for="resFilter" title="Clear the filter">Clear</button></span><span id="dslHintRes" class="muted small">Shortcuts write filter text for you — plain text works too.</span></div>
       <div class="row">
         <button id="btnResCopyUrls" title="Copy filtered resource URLs (up to 1000 lines)">Copy URLs</button>
-        <button id="btnResCopyAll" title="Copy filtered URLs + metadata + contents preview (bounded)">Copy URLs + contents</button>
-        <span id="resCount" class="muted small"></span>
+        <button id="btnResCopyAll" title="Copy filtered URLs + metadata + contents preview (bounded)">Copy with bodies</button>
+        <button data-wrap-table="resTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button>
+        <span id="resCount" class="muted small" role="status" aria-live="polite"></span>
       </div>
-      <div class="table-wrap"><table id="resTable"><thead><tr><th>URL</th><th>Type</th><th>Status</th><th>Size</th><th>Route</th><th>Via</th><th>Map</th><th>Indexed</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+      <div class="table-wrap"><table id="resTable"><caption class="muted small">Captured files grouped by domain.</caption><thead><tr><th scope="col">URL</th><th scope="col">Type</th><th scope="col">Status</th><th scope="col">Size</th><th scope="col">Route</th><th scope="col">Via</th><th scope="col">Map</th><th scope="col">Indexed</th><th scope="col">Actions</th></tr></thead><tbody></tbody></table></div>
     </section>
-    <section id="tab-network" class="tab">
+    <section id="tab-network" class="tab" role="tabpanel" aria-labelledby="h-network">
+      <h2 id="h-network">Network</h2>
       <p class="muted small">Every observed request, grouped by domain with per-group Show-all — filter by method or type, View a body or copy one as cURL.</p>
       <div class="row">
-        <select id="netMethod" title="Filter by HTTP method (built live from observed traffic)">
+        <label for="netMethod">Method</label><select id="netMethod" title="Filter by HTTP method (built live from observed traffic)">
           <option value="ALL" selected>all methods</option>
         </select>
-        <select id="netKind" title="Filter by content type (built live from observed traffic)"><option value="ALL">all types</option></select>
-        <input id="netFilter" type="text" placeholder="filter url / mime…" />
+        <label for="netKind">Type</label><select id="netKind" title="Filter by content type (built live from observed traffic)"><option value="ALL">all types</option></select>
+        <label for="netFilter">Filter requests</label><input id="netFilter" type="text" placeholder="filter — try method:POST status:>=400" title="Filter DSL: method:POST status:>=400 host:api.* mime:json has:auth -mime:image (plain text still works)" />
       </div>
       <div class="row">
         <button id="btnNetCopyUrls" title="Copy filtered request URLs (up to 1000 lines)">Copy URLs</button>
-        <button id="btnNetCopyAll" title="Copy filtered URLs + metadata + bodies preview (bounded)">Copy URLs + contents</button>
-        <span id="netCount" class="muted small"></span>
+        <button id="btnNetCopyAll" title="Copy filtered URLs + metadata + bodies preview (bounded)">Copy with bodies</button>
+        <button id="btnNetHar" title="Download observed requests as standard HAR 1.2">Export HAR</button>
+        <button id="btnNetHarImport" title="Import a HAR file (Burp / Charles / Chrome)">Import HAR</button>
+        <input id="fileHarImport" type="file" accept=".har,.json,application/json" class="hidden" aria-label="Import HAR file" />
+        <button data-wrap-table="netTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button>
+        <span id="netCount" class="muted small" role="status" aria-live="polite"></span>
       </div>
-      <div class="table-wrap"><table id="netTable"><thead><tr><th>Method</th><th>URL</th><th>Status</th><th>MIME</th><th>Route</th><th>Body</th><th>Note</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+      <div class="table-wrap"><table id="netTable"><caption class="muted small">Observed requests grouped by domain.</caption><thead><tr><th scope="col">Method</th><th scope="col">URL</th><th scope="col">Status</th><th scope="col">MIME</th><th scope="col">Route</th><th scope="col">Body</th><th scope="col">Note</th><th scope="col">Actions</th></tr></thead><tbody></tbody></table></div>
     </section>
-    <section id="tab-analyze" class="tab">
+    <section id="tab-analyze" class="tab" role="tabpanel" aria-labelledby="h-analyze">
+      <h2 id="h-analyze">Analyze</h2>
       <p class="muted small">Possible secrets found in captured text, grouped by severity — critical means likely live credentials, high sensitive tokens, medium review-worthy, info low-risk context. All analysis stays local in this panel's RAM.</p>
-      <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><button id="btnSecShowAll" title="Lift the 150-row render cap">Show all</button><span id="secCount" class="muted small"></span></div>
+      <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><button id="btnSecShowAll" title="Lift the 150-row render cap" aria-expanded="false">Show all</button><span id="secCount" class="muted small" role="status" aria-live="polite"></span></div>
       <div id="secList" class="results"></div>
     </section>
-    <section id="tab-apis" class="tab">
+    <section id="tab-apis" class="tab" role="tabpanel" aria-labelledby="h-apis">
+      <h2 id="h-apis">APIs</h2>
       <p class="muted small">APIs seen on the wire (called) plus API-like routes spotted in code but never requested (uncalled), grouped by domain — per-group Show-all lifts the 100-row cap — click a Kind badge for headers, sent body and preview.</p>
       <div class="row">
-        <select id="apiKind" title="Filter by API kind (built live from observed traffic)"><option value="ALL">all kinds</option></select>
+        <label for="apiKind">Kind</label><select id="apiKind" title="Filter by API kind (built live from observed traffic)"><option value="ALL">all kinds</option></select>
         <button id="btnApisCopyAll" title="Copy filtered API URLs (up to 1000 lines)">Copy all APIs</button>
-        <span id="apiCount" class="muted small"></span>
+        <button id="btnApisOpenApi" title="Download observed endpoints as openapi.json">Export openapi.json</button>
+        <button data-wrap-table="apisTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button>
+        <span id="apiCount" class="muted small" role="status" aria-live="polite"></span>
       </div>
-      <div class="table-wrap"><table id="apisTable"><thead><tr><th>Method</th><th>API URL</th><th>Kind</th><th>Detail</th><th>Actions</th></tr></thead><tbody id="apisBody"></tbody></table></div>
+      <div class="table-wrap"><table id="apisTable"><caption class="muted small">Observed and uncalled API endpoints grouped by domain.</caption><thead><tr><th scope="col">Method</th><th scope="col">API URL</th><th scope="col">Kind</th><th scope="col">Detail</th><th scope="col">Actions</th></tr></thead><tbody id="apisBody"></tbody></table></div>
     </section>
-    <section id="tab-graph" class="tab">
-      <p class="muted small" style="max-width:760px">The discovery graph is the <b>provenance map</b>: every node is a route, resource, JS chunk, API endpoint or frame, and every edge records <b>how it was found</b> (dom-link, dynamic-import, sourcemap-ref, deep-scan…). Use case: pick a search hit, then trace its chain here — e.g. <span class="mono">route /models → chunk assets/x.js → endpoint /api/models</span> — to see exactly which file and discovery step exposed a string, and what else that file pulled in.</p>
-      <div class="row"><span id="graphStats" class="muted small"></span><button id="btnGraphClear">Clear graph</button></div>
+    <section id="tab-graph" class="tab" role="tabpanel" aria-labelledby="h-graph">
+      <h2 id="h-graph">Graph</h2>
+      <p class="muted small">The discovery graph is the <b>provenance map</b>: every node is a route, resource, JS chunk, API endpoint or frame, and every edge records <b>how it was found</b> (dom-link, dynamic-import, sourcemap-ref, deep-scan…). Use case: pick a search hit, then trace its chain here — e.g. <span class="mono">route /models → chunk assets/x.js → endpoint /api/models</span> — to see exactly which file and discovery step exposed a string, and what else that file pulled in.</p>
+      <div class="row"><span id="graphStats" class="muted small" role="status" aria-live="polite"></span><button id="btnGraphClear">Clear graph</button></div>
       <div id="graphList" class="mono small graph"></div>
     </section>
-    <section id="tab-settings" class="tab">
+    <section id="tab-settings" class="tab" role="tabpanel" aria-labelledby="h-settings">
+      <h2 id="h-settings">Settings</h2>
+      <p class="muted small">Budgets, capture toggles, and permissions. Changes apply to this session immediately.</p>
       <div class="cols">
-        <div class="card"><h3>Memory budget</h3><div id="budgetRow" class="row"></div>
+        <section class="card" aria-labelledby="h-mem"><h3 id="h-mem">Memory budget</h3><div id="budgetRow" class="row" role="group" aria-label="Memory budget presets"></div>
           <p class="muted small">Storage budget lives on the Overview tab.</p>
-          <label>Max body KB <input id="setMaxBodyKB" type="number" min="16" step="16" /></label>
-          <label><input id="setRetainBin" type="checkbox" /> retain binary bodies</label>
+          <label for="setMaxBodyKB">Max body KB <input id="setMaxBodyKB" type="number" min="16" step="16" /></label>
+          <label for="setRetainBin"><input id="setRetainBin" type="checkbox" /> retain binary bodies</label>
           <details><summary>Advanced</summary>
-            <label>Deep concurrency (1–8) <input id="setDeepConc" type="number" min="1" max="8" /></label>
-            <label><input id="setDeepWs" type="checkbox" /> capture WebSocket frames — retain WS payloads when Deep Capture is on</label>
-            <label><input id="setDeepHook" type="checkbox" /> runtime hook — observe fetch/XHR/WS in the page via an opt-in page flag</label>
+            <label for="setDeepConc">Deep concurrency (1–8) <input id="setDeepConc" type="number" min="1" max="8" /></label>
+            <label for="setDeepWs"><input id="setDeepWs" type="checkbox" /> capture WebSocket frames — retain WS payloads when Deep Capture is on</label>
+            <label for="setDeepHook"><input id="setDeepHook" type="checkbox" /> runtime hook — observe fetch/XHR/WS in the page via an opt-in page flag</label>
           </details>
-          <label>Max response bytes <input id="setMaxResp" type="number" min="1024" step="1024" /></label>
-          <label>Max indexed chars / resource <input id="setMaxIdx" type="number" min="1024" step="1000" /></label>
-          <label>Max resources <input id="setMaxRes" type="number" min="10" step="10" /></label>
-          <label><input id="setRetainRaw" type="checkbox" /> retain raw response bodies</label>
-          <label><input id="setSrcMap" type="checkbox" /> analyze source maps</label>
-          <label><input id="setAdvJs" type="checkbox" /> advanced JS analysis</label>
-          <label><input id="setSecrets" type="checkbox" /> scan for exposed secrets (Analyze tab)</label>
-          <label><input id="setBinMeta" type="checkbox" /> catalog binary/media/font metadata</label>
-          <label>On budget <select id="setOnBudget"><option value="discard-oldest-raw">discard oldest raw</option><option value="stop-capture">stop capture</option><option value="stop-deep-analysis">stop deep analysis</option></select></label>
-        </div>
-        <div class="card"><h3>Capture toggles</h3><div id="capRow" class="checks"></div>
-          <h3>Deep Scan</h3><div id="deepRow" class="checks"></div>
-          <label>Max depth <input id="setDepth" type="number" min="0" max="5" /></label>
-          <label>Max pages <input id="setPages" type="number" min="1" max="200" /></label>
-          <label>Per-page request cap <input id="setPerPage" type="number" min="1" max="200" /></label>
-          <div class="row"><button id="btnDeep2">Start Deep Scan</button><button id="btnDeepStop">Stop</button></div>
-          <div id="deepStatus" class="mono small"></div>
-        </div>
-        <div class="card"><h3>Permissions &amp; privacy</h3>
+          <label for="setMaxResp">Max response bytes <input id="setMaxResp" type="number" min="1024" step="1024" /></label>
+          <label for="setMaxIdx">Max indexed chars / resource <input id="setMaxIdx" type="number" min="1024" step="1000" /></label>
+          <label for="setMaxRes">Max resources <input id="setMaxRes" type="number" min="10" step="10" /></label>
+          <label for="setRetainRaw"><input id="setRetainRaw" type="checkbox" /> retain raw response bodies</label>
+          <label for="setSrcMap"><input id="setSrcMap" type="checkbox" /> analyze source maps</label>
+          <label for="setAdvJs"><input id="setAdvJs" type="checkbox" /> advanced JS analysis</label>
+          <label for="setSecrets"><input id="setSecrets" type="checkbox" /> scan for exposed secrets (Analyze tab)</label>
+          <label for="setBinMeta"><input id="setBinMeta" type="checkbox" /> catalog binary/media/font metadata</label>
+          <label for="setOnBudget">On budget <select id="setOnBudget"><option value="discard-oldest-raw">discard oldest raw</option><option value="stop-capture">stop capture</option><option value="stop-deep-analysis">stop deep analysis</option></select></label>
+        </section>
+        <section class="card" aria-labelledby="h-cap"><h3 id="h-cap">Capture toggles</h3><div id="capRow" class="checks"></div>
+          <h3 id="h-deep">Deep Scan</h3><div id="deepRow" class="checks"></div>
+          <label for="setDepth">Max depth <input id="setDepth" type="number" min="0" max="5" /></label>
+          <label for="setPages">Max pages <input id="setPages" type="number" min="1" max="200" /></label>
+          <label for="setPerPage">Per-page request cap <input id="setPerPage" type="number" min="1" max="200" /></label>
+          <div class="row"><button id="btnDeep2" class="primary">Start Deep Scan</button><button id="btnDeepStop">Stop</button></div>
+          <div id="deepStatus" class="mono small" role="status" aria-live="polite"></div>
+        </section>
+        <section class="card" aria-labelledby="h-perm"><h3 id="h-perm">Permissions &amp; privacy</h3>
           <div id="permInfo" class="small"></div>
-          <div class="row"><button id="btnGrant">Grant site access</button><button id="btnDebugger">Enable Deep Capture (CDP)</button></div>
-          <div id="permStatus" class="mono small"></div>
+          <div class="row"><button id="btnGrant" class="primary">Grant site access</button><button id="btnDebugger">Enable Deep Capture (CDP)</button></div>
+          <div id="permStatus" class="mono small" role="status" aria-live="polite"></div>
           <div id="cdpTargets" class="mono small"></div>
           <p class="muted small">Deep Capture via chrome.debugger is strictly opt-in and announces a debugging banner in the tab. Base capture uses devtools.network + page-context eval and needs no extra grants.</p>
-        </div>
+        </section>
       </div>
     </section>
   </main>
-  <div id="viewer" class="viewer hidden" role="dialog" aria-label="Resource content preview">
+  <div id="actmenu" class="actmenu hidden" role="menu" aria-label="Row actions"></div>
+  <div id="viewer" class="viewer hidden" role="dialog" aria-modal="true" aria-labelledby="viewerTitle" aria-label="Resource content preview">
     <div class="viewer-card">
       <div class="viewer-head"><strong id="viewerTitle" class="mono">preview</strong>
-        <span class="viewer-actions"><button id="viewerOpen" title="Open this URL">Open ↗</button><button id="viewerCopy" title="Copy shown content">Copy</button><button id="viewerClose" title="Close preview">Close</button><button id="viewerX" title="Close preview (Esc)">✕</button></span>
+        <span class="viewer-actions"><button id="viewerOpen" title="Open this URL">Open ↗</button><button id="viewerCopy" title="Copy shown content">Copy</button><button id="viewerClose" title="Close preview (Esc)">Close</button></span>
       </div>
-      <div id="viewerMeta" class="muted small mono"></div>
-      <pre id="viewerBody" class="viewer-body mono"></pre>
+      <div id="viewerMeta" class="muted small mono" role="status"></div>
+      <pre id="viewerBody" class="viewer-body mono" tabindex="0"></pre>
+    </div>
+  </div>
+  <div id="replayModal" class="viewer hidden" role="dialog" aria-modal="true" aria-labelledby="replayTitle" aria-label="Replay request">
+    <div class="viewer-card rp-card">
+      <div class="viewer-head"><strong id="replayTitle" class="mono">Replay — edit &amp; resend</strong>
+        <span class="viewer-actions"><button id="replaySend" class="primary" title="Send the request now">Send</button><button id="replayClose" title="Close">Close</button></span>
+      </div>
+      <div class="rp-bar"><label for="replayMethod">Method</label><select id="replayMethod" title="Method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>HEAD</option><option>OPTIONS</option></select><label for="replayUrl">URL</label><input id="replayUrl" type="text" placeholder="https://…" title="Request URL" /></div>
+      <div class="rp-tabs" role="tablist" aria-label="Replay parts">
+        <button data-rptab="params" class="active" role="tab" aria-selected="true" aria-controls="rpPaneParams" title="Query parameters as key/value rows">Params</button>
+        <button data-rptab="headers" role="tab" aria-selected="false" aria-controls="rpPaneHeaders" title="Request headers as key/value rows">Headers</button>
+        <button data-rptab="body" role="tab" aria-selected="false" aria-controls="rpPaneBody" title="Raw request body">Body</button>
+      </div>
+      <div id="rpPaneParams" class="rp-pane" role="tabpanel"><div id="replayParamsTable"></div><button id="replayParamAdd" title="Add a query parameter row">+ Add param</button></div>
+      <div id="rpPaneHeaders" class="rp-pane hidden" role="tabpanel"><div id="replayHeadersTable"></div><button id="replayHeaderAdd" title="Add a header row">+ Add header</button></div>
+      <div id="rpPaneBody" class="rp-pane hidden" role="tabpanel"><label for="replayBody">Request body</label><textarea id="replayBody" rows="6" placeholder="(optional request body, ≤256 KB)" title="Request body"></textarea></div>
+      <div class="rp-resp-head"><strong>Response</strong><span id="replayMeta" class="muted small mono" role="status"></span><button id="replayCopyResp" title="Copy response body">Copy</button></div>
+      <div id="replayResp" class="rp-code mono" aria-label="Response body" tabindex="0"></div>
+    </div>
+  </div>
+  <div id="mockModal" class="viewer hidden" role="dialog" aria-modal="true" aria-labelledby="mockTitle" aria-label="Mock response">
+    <div class="viewer-card">
+      <div class="viewer-head"><strong id="mockTitle" class="mono">Mock — canned response</strong>
+        <span class="viewer-actions"><button id="mockSave" title="Save mock rule">Save rule</button><button id="mockClose" title="Close">Close</button></span>
+      </div>
+      <div class="row"><label for="mockMatch">URL contains</label><input id="mockMatch" type="text" placeholder="URL contains…" title="Match: URL substring" /></div>
+      <div class="row"><label for="mockMethod">Method</label><select id="mockMethod" title="Method"><option>ANY</option><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
+      <label for="mockStatus">Status</label><input id="mockStatus" type="number" min="100" max="999" value="200" title="Status code" /></div>
+      <div class="row"><label for="mockBody">Body</label><textarea id="mockBody" rows="6" placeholder='{"mock": true}' title="Mock body"></textarea></div>
+      <div id="mockMeta" class="muted small mono" role="status"></div>
     </div>
   </div>
   <script type="module" src="./dist/panel.js"></script>

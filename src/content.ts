@@ -354,3 +354,30 @@ try {
     try { if (hookArmed && rtBuf.length) flushRuntime(); } catch { /* ignore */ }
   }, 1000);
 } catch { /* ignore */ }
+
+// ---- Interception rules relay (Phase 1: mock/block) ------------------------
+// The MAIN-world interceptor can't touch chrome.storage, so this ISOLATED
+// observer forwards stored rules to the page via window.postMessage. Passive
+// capture above is untouched; with zero rules the push is a tiny no-op.
+function pushInterceptRules(): void {
+  try {
+    const storage = chrome.storage?.session;
+    if (!storage) return;
+    storage.get('deepscope-rules').then((got) => {
+      try {
+        const rules = Array.isArray((got as Record<string, unknown>)['deepscope-rules'])
+          ? ((got as Record<string, unknown>)['deepscope-rules'] as unknown[])
+          : [];
+        window.postMessage({ source: 'deepscope-rules', rules }, '*');
+      } catch { /* ignore */ }
+    }).catch(() => undefined);
+  } catch { /* storage unavailable — interceptor stays rule-free */ }
+}
+try {
+  pushInterceptRules();
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    try {
+      if (area === 'session' && changes && 'deepscope-rules' in changes) pushInterceptRules();
+    } catch { /* ignore */ }
+  });
+} catch { /* ignore */ }

@@ -128,8 +128,35 @@ export function groupByHost<T>(items: T[], urlOf: (t: T) => string): Array<{ hos
     });
 }
 
+/**
+ * Compressed/encrypted bodies arrive as mojibake (arena-style `*-gzip-js`
+ * RPC, protobuf, etc.). Rendering them as text is unreadable — detect and
+ * label instead. Heuristic: real text is JSON, mostly printable ASCII, or
+ * carries structure (whitespace / brackets / quotes); compressed bytes are
+ * none of those. Pure + tested.
+ */
+export function isBinaryText(s: string | undefined): boolean {
+  if (typeof s !== 'string' || s.length < 8) return false;
+  const sample = s.length > 2000 ? s.slice(0, 2000) : s;
+  try {
+    JSON.parse(sample.length === s.length ? s : sample);
+    return false; // parses → text (or a JSON prefix → text)
+  } catch { /* not JSON — keep testing */ }
+  let printable = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample.charCodeAt(i);
+    if ((c >= 32 && c <= 126) || c === 9 || c === 10 || c === 13) printable++;
+  }
+  if (printable / sample.length >= 0.85) return false;
+  if (/[\s{<>"'=;]/.test(sample)) return false; // structure → text
+  return true;
+}
+
+export const BINARY_BODY_NOTE = '(binary / compressed content — not shown as text)';
+
 export function snippetBody(s: string | undefined, cap = 1500): string {
-  if (!s) return '(request/response body not captured — enable retain raw + recapture)';
-  if (s.length > cap) return s.slice(0, cap) + `\n… [truncated ${s.length - cap} chars]`;
+  if (!s) return '(request/response body not captured - enable retain raw + recapture)';
+  if (isBinaryText(s)) return BINARY_BODY_NOTE;
+  if (s.length > cap) return s.slice(0, cap) + `\n. [truncated ${s.length - cap} chars]`;
   return s;
 }

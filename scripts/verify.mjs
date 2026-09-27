@@ -6,11 +6,17 @@ import { fuzzyScore, fuzzyMatch } from '../dist/fuzzy.js';
 import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals, extractJsAdvanced } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
-import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody } from '../dist/tables.js';
+import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody, isBinaryText } from '../dist/tables.js';
 import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon } from '../dist/rules.js';
 import { classifyApiKind, findExposures } from '../dist/exposure.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { CaptureStore } from '../dist/store.js';
+import { sanitizeReplayHeaders, truncateReplayBody, matchInterceptRule } from '../dist/replay.js';
+import { shouldFetchCdpBody, decodeCdpBody } from '../dist/cdp.js';
+import { buildSessionFile, validateSessionFile } from '../dist/session-file.js';
+import { inferSchema, templateOpenApiPath, buildOpenApiDoc } from '../dist/openapi.js';
+import { buildHarDoc, validateHar, normalizeHarEntry } from '../dist/har.js';
+import { parseFilterDsl, wildcardMatch, matchDslAll } from '../dist/filter-dsl.js';
 import { DiscoveryGraph } from '../dist/graph.js';
 import { defaultScope } from '../dist/types.js';
 
@@ -402,6 +408,159 @@ ok('store setCategory', () => {
   assert.equal(s.snapshot().total, 500);
   s.setCategory('bogus', 999); // unknown category ignored
   assert.equal(s.snapshot().total, 500);
+});
+
+// 34. v1.7.0: replay guards + interception rule matcher.
+ok('replay header sanitize + body clamp', () => {
+  const h = sanitizeReplayHeaders({ Authorization: 'Bearer x', Host: 'evil', 'Content-Length': '5', Connection: 'keep-alive', ok: 'yes' });
+  assert.deepEqual(h, { Authorization: 'Bearer x', ok: 'yes' });
+  assert.deepEqual(sanitizeReplayHeaders(null), {});
+  const t = truncateReplayBody('abcdef', 4);
+  assert.equal(t.text, 'abcd');
+  assert.equal(t.truncated, true);
+  assert.equal(truncateReplayBody('ab', 4).truncated, false);
+});
+ok('intercept rule matcher', () => {
+  const mock = { id: 'r1', kind: 'mock', match: '/api/users', method: 'GET' };
+  assert.equal(matchInterceptRule('https://x.com/api/users?page=1', 'GET', mock), true);
+  assert.equal(matchInterceptRule('https://x.com/api/users', 'POST', mock), false);
+  assert.equal(matchInterceptRule('https://x.com/other', 'GET', mock), false);
+  const any = { id: 'r2', kind: 'block', match: 'track', method: 'ANY' };
+  assert.equal(matchInterceptRule('https://t.com/track.js', 'GET', any), true);
+  const rx = { id: 'r3', kind: 'block', match: '\\.png(\\?|$)', method: 'ANY', useRegex: true };
+  assert.equal(matchInterceptRule('https://x.com/a.png?v=1', 'GET', rx), true);
+  assert.equal(matchInterceptRule('https://x.com/a.pngx', 'GET', rx), false);
+  const bad = { id: 'r4', kind: 'block', match: '([', method: 'ANY', useRegex: true };
+  assert.equal(matchInterceptRule('https://x.com/([', 'GET', bad), false); // bad regex never matches
+  assert.equal(matchInterceptRule('https://x.com/a', 'GET', { id: 'r5', kind: 'block', match: '' }), false);
+});
+
+// 35. v1.7.0 Phase 2: Deep Capture body gate + payload decode.
+ok('cdp body gate', () => {
+  const on = { retainRaw: true, retainBinary: false, maxBodyChars: 100 };
+  assert.equal(shouldFetchCdpBody('https://x.com/api/u', 'application/json', on), true);
+  assert.equal(shouldFetchCdpBody('https://x.com/a.png', 'image/png', on), false);
+  assert.equal(shouldFetchCdpBody('https://x.com/a.js', '', on), true);
+  assert.equal(shouldFetchCdpBody('https://x.com/a.png', 'image/png', { ...on, retainBinary: true }), true);
+  assert.equal(shouldFetchCdpBody('https://x.com/api', 'application/json', { ...on, retainRaw: false }), false);
+  assert.equal(shouldFetchCdpBody('ws://x.com/s', '', on), false);
+});
+ok('cdp body decode', () => {
+  const b64 = Buffer.from('hello world').toString('base64');
+  const d = decodeCdpBody(b64, true, 100);
+  assert.equal(d.text, 'hello world');
+  assert.equal(d.truncated, false);
+  const t = decodeCdpBody('abcdef', false, 4);
+  assert.equal(t.text, 'abcd');
+  assert.equal(t.truncated, true);
+  assert.equal(decodeCdpBody('', false, 100), null);
+  assert.equal(decodeCdpBody('!!!', true, 100), null);
+});
+
+// 36. v1.7.0 Phase 3: session file build + validate.
+ok('session file round-trip', () => {
+  const big = 'x'.repeat(60_000);
+  const f = buildSessionFile({
+    origin: 'https://x.com',
+    routes: [{ route: '/a' }],
+    resources: [{ url: 'https://x.com/a' }],
+    network: [{ url: 'https://x.com/a', method: 'GET' }],
+    bodies: { 'https://x.com/a': big, '': 'skip', 'https://x.com/b': '' },
+  });
+  assert.equal(f.tool, 'DeepScope');
+  assert.equal(f.format, 1);
+  assert.equal(f.bodies['https://x.com/a'].length, 50_000); // per-body cap
+  assert.equal('' in f.bodies, false);
+  assert.equal('https://x.com/b' in f.bodies, false);
+  const v = validateSessionFile(JSON.parse(JSON.stringify(f)));
+  assert.equal(v.ok, true);
+  assert.equal(validateSessionFile({}).ok, false);
+  assert.equal(validateSessionFile({ tool: 'DeepScope', format: 999, routes: [], resources: [], network: [] }).ok, false);
+  assert.equal(validateSessionFile({ tool: 'Other', format: 1, routes: [], resources: [], network: [] }).ok, false);
+});
+
+// 37. v1.7.0 Phase 4: OpenAPI schema inference + doc build.
+ok('openapi schema + paths', () => {
+  assert.deepEqual(inferSchema('a'), { type: 'string', example: 'a' });
+  assert.deepEqual(inferSchema(3).type, 'integer');
+  assert.equal(inferSchema([1, 2]).type, 'array');
+  const o = inferSchema({ id: 1, tags: ['x'], nested: { deep: true } });
+  assert.equal(o.type, 'object');
+  assert.equal(o.properties.tags.type, 'array');
+  assert.equal(templateOpenApiPath('/users/123/posts'), '/users/{id}/posts');
+  assert.equal(templateOpenApiPath('/api/v1/items/550e8400-e29b-41d4-a716-446655440000'), '/api/v1/items/{id}');
+  const doc = buildOpenApiDoc('https://x.com', [
+    { method: 'GET', url: 'https://x.com/api/users/42?role=admin', status: 200, resSample: '{"id":1,"name":"n"}' },
+    { method: 'POST', url: 'https://x.com/api/users', status: 201, reqSample: '{"name":"n"}' },
+    { method: 'GET', url: 'https://x.com/api/old', uncalled: true },
+    { method: 'GET', url: 'ws://x.com/sock' },
+  ]);
+  assert.equal(doc.openapi, '3.0.0');
+  assert.ok(doc.paths['/api/users/{id}'].get);
+  assert.ok(doc.paths['/api/users'].post.requestBody);
+  assert.deepEqual(doc['x-deepscope-uncalled'], ['https://x.com/api/old']);
+  assert.equal('ws://x.com/sock' in doc.paths, false);
+});
+
+// 38. v1.7.0 Phase 5: HAR build + validate + normalize.
+ok('har round-trip', () => {
+  const doc = buildHarDoc('https://x.com', [
+    { method: 'POST', url: 'https://x.com/api/u', status: 200, mime: 'application/json', reqHeaders: { a: 'b' }, reqBody: '{"n":1}', resBody: '{"id":2}', ts: 1700000000000, timingMs: 12 },
+    { method: 'GET', url: 'ws://x.com/s' },
+  ]);
+  assert.equal(doc.log.entries.length, 1);
+  assert.equal(doc.log.entries[0].request.method, 'POST');
+  assert.equal(doc.log.entries[0].response.content.text, '{"id":2}');
+  const v = validateHar(JSON.parse(JSON.stringify(doc)));
+  assert.equal(v.ok, true);
+  assert.equal(validateHar({}).ok, false);
+  const b64 = Buffer.from('hi').toString('base64');
+  const n = normalizeHarEntry({
+    startedDateTime: '2024-01-01T00:00:00.000Z', time: 5,
+    request: { method: 'get', url: 'https://y.com/a?b=c', headers: [{ name: 'h', value: 'v' }], postData: { text: 'q=1' } },
+    response: { status: 201, content: { mimeType: 'application/json', text: b64, encoding: 'base64' } },
+  });
+  assert.equal(n.method, 'GET');
+  assert.equal(n.resText, 'hi');
+  assert.equal(n.reqText, 'q=1');
+  assert.equal(normalizeHarEntry({}), null);
+});
+
+// 39. v1.7.0 Phase 6: filter DSL parse + match.
+ok('filter dsl', () => {
+  const t = parseFilterDsl('method:POST status:>=400 host:api.* has:auth -mime:image "quoted str"');
+  assert.equal(t.length, 6);
+  assert.deepEqual(t[0], { field: 'method', value: 'POST', negate: false });
+  assert.deepEqual(t[3], { field: 'has', value: 'auth', negate: false });
+  assert.deepEqual(t[4], { field: 'mime', value: 'image', negate: true });
+  assert.deepEqual(t[5], { field: null, value: 'quoted str', negate: false });
+  // Unknown fields degrade to substrings (existing filters keep working).
+  assert.deepEqual(parseFilterDsl('https://x.com/a?b=c'), [{ field: null, value: 'https://x.com/a?b=c', negate: false }]);
+  assert.equal(wildcardMatch('api.example.com', 'api.*'), true);
+  assert.equal(wildcardMatch('cdn.x.com', 'api.*'), false);
+  const rec = { method: 'POST', status: 500, host: 'api.x.com', mime: 'application/json', url: 'https://api.x.com/u', route: '/u', kind: 'api', hasAuth: true, hasBody: true, isError: true };
+  const hay = 'https://api.x.com/u application/json';
+  assert.equal(matchDslAll(parseFilterDsl('method:POST status:>=400 has:error -mime:image'), rec, hay), true);
+  assert.equal(matchDslAll(parseFilterDsl('status:<400'), rec, hay), false);
+  assert.equal(matchDslAll(parseFilterDsl('host:api.* has:auth'), rec, hay), true);
+  assert.equal(matchDslAll(parseFilterDsl('u'), rec, hay), true);
+  assert.equal(matchDslAll(parseFilterDsl('-u'), rec, hay), false);
+  assert.equal(matchDslAll(parseFilterDsl('has:body'), rec, hay), true);
+  assert.equal(matchDslAll(parseFilterDsl('status:500'), { ...rec, status: undefined }, hay), false);
+  assert.equal(matchDslAll([], rec, hay), true);
+});
+
+// 40. Screenshot fixes: binary/compressed bodies never render as mojibake.
+ok('binary body guard', () => {
+  assert.equal(isBinaryText('{"id":1,"name":"n"}'), false);
+  assert.equal(isBinaryText('hello world'), false);
+  assert.equal(isBinaryText(undefined), false);
+  assert.equal(isBinaryText('function min(){return 0}'), false); // minified JS stays text
+  assert.equal(isBinaryText('{"a":"你好世界"}'), false); // CJK JSON stays text
+  const gzipLike = Array.from({ length: 200 }, (_, i) => String.fromCharCode(0x4e00 + ((i * 7919) % 2000))).join('');
+  assert.equal(isBinaryText(gzipLike), true);
+  assert.ok(snippetBody(gzipLike).includes('binary'));
+  assert.equal(snippetBody('hello'), 'hello');
 });
 
 console.log(`\n${pass} checks passed.`);

@@ -7,10 +7,21 @@ import { MemoryLedger, formatBytes } from './memory.js';
 import { displayNameFor, searchIndex } from './search.js';
 import { extractHtml, resolveUrl } from './extractors.js';
 import { scanTextForSecrets } from './rules.js';
-import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody } from './tables.js';
+import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody, isBinaryText, BINARY_BODY_NOTE } from './tables.js';
 import { classifyApiKind, findExposures } from './exposure.js';
 import { CaptureStore } from './store.js';
 import type { StoreCategory } from './store.js';
+import { matchInterceptRule, REPLAY_MAX_REQ_CHARS } from './replay.js';
+import type { InterceptRule, ReplayResponse } from './replay.js';
+import { buildSessionFile, validateSessionFile, DSZ_MAX_ENTRIES, DSZ_MAX_BODIES } from './session-file.js';
+import type { SessionFile } from './session-file.js';
+import { buildOpenApiDoc } from './openapi.js';
+import type { OpenApiEndpoint } from './openapi.js';
+import { buildHarDoc, validateHar, normalizeHarEntry, HAR_MAX_ENTRIES } from './har.js';
+import { parseFilterDsl, matchDslAll } from './filter-dsl.js';
+import type { DslRecord } from './filter-dsl.js';
+import { fuzzyScore } from './fuzzy.js';
+import { normalize } from './normalize.js';
 import { newSessionId, idbPutBody, idbGetBody, idbDeleteBody, idbOldestUrls, idbDeleteSession, idbListSessions, idbSessionBytes } from './idb.js';
 import type { CdpNetEvent, CdpTargetInfo } from './cdp.js';
 import { isSubdomainOf } from './types.js';
@@ -63,6 +74,19 @@ let netMethod = 'ALL';
 let netKind = 'ALL';
 let resType = 'ALL';
 let apiKind = 'ALL';
+/** Global fuzzy URL finder (topbar): one query filters Routes, Resources,
+ *  Network and APIs together. Substring fast path, trigram-fuzzy fallback. */
+let globalUrlQ = '';
+function urlFindSuffix(): string {
+  return globalUrlQ.trim() ? ` · find: ${globalUrlQ.trim().slice(0, 40)}` : '';
+}
+function matchGlobalUrl(url: string): boolean {
+  const q = globalUrlQ.trim().toLowerCase();
+  if (!q) return true;
+  const u = (url ?? '').toLowerCase();
+  if (u.includes(q)) return true;
+  try { return fuzzyScore(normalize(q), normalize(url ?? '')) >= 0.45; } catch { return false; }
+}
 /** Analyze global Show-all: lift the 150-row render cap (up to the 2000 cap). */
 let secShowAll = false;
 /** Routes global Show-all: lift the 300-row render slice (up to the 1200 cap). */
@@ -82,6 +106,9 @@ const grpShowAll = new Set<string>();
 // API domain grouping: separate collapse state (first-party expanded, rest collapsed).
 const apiCollapsed = new Set<string>();
 const apiTouched = new Set<string>();
+// Kind sub-collapse inside host groups: key `${host}|${kind}` (res: ResourceKind,
+// net: mime group, api: ApiKind). Parent host collapse always wins — children
+// never render visible while it is set (checked first in every render loop).
 // Analyze host subgroups: keyed `sev|host`, default expanded.
 const anaCollapsed = new Set<string>();
 /** Local fallback for snippetBody (same behavior) if tables.js export is missing at runtime. */
@@ -190,10 +217,21 @@ const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;',
 function on(id: string, ev: string, fn: (e: Event) => void): void {
   try { document.getElementById(id)?.addEventListener(ev, fn); } catch { /* ignore */ }
 }
-/** Dismiss the content preview (Close / ✕ / backdrop / Esc all funnel here). */
+/** Dismiss the content preview (Close / backdrop / Esc all funnel here). */
 function closeViewer(): void {
   try { document.getElementById('viewer')?.classList.add('hidden'); } catch { /* ignore */ }
   viewerUrl = '';
+  modalReturnFocus();
+}
+/** Modal focus contract: take focus on open, trap Tab inside, return focus on close. */
+let modalReturnEl: HTMLElement | null = null;
+function modalTakeFocus(id: string): void {
+  try { modalReturnEl = document.activeElement instanceof HTMLElement ? document.activeElement : null; } catch { modalReturnEl = null; }
+  try { document.getElementById(id)?.focus(); } catch { /* ignore */ }
+}
+function modalReturnFocus(): void {
+  try { if (modalReturnEl?.isConnected) modalReturnEl.focus(); } catch { /* ignore */ }
+  modalReturnEl = null;
 }
 
 function diag(note: string, url?: string): void {
@@ -262,6 +300,10 @@ function enforceBudget(context: string): void {
   } else if (st === 'warn') {
     warn.classList.remove('hidden');
     warn.textContent = `Approaching memory budget: ${formatBytes(ledger.usedBytes)} / ${settings.budgetMB} MB (${ledger.pct.toFixed(0)}%). Policy on exceed: ${settings.onBudget}.`;
+  } else if (ledger.pct >= 80) {
+    warn.classList.remove('hidden');
+    warn.textContent = `Memory budget ${ledger.pct.toFixed(0)}% full — oldest raw bodies drop first past 100%. Export what matters now.`;
+    diagOnce('budget-80', 'memory budget 80% full — oldest raw bodies drop first past 100%');
   } else if (ledger.pct < 85) {
     warn.classList.add('hidden');
   }
@@ -573,8 +615,25 @@ async function evictIdbOldest(): Promise<void> {
 // ----- Deep Capture (CDP) wiring: opt-in only, never auto-attached -----
 function sendCdpStart(): void {
   try {
-    if (!panelPort) { diag('Deep Capture: panel relay unavailable — reopen DevTools and retry'); return; }
-    panelPort.postMessage({ type: 'cdp-start', tabId, opts: { captureWs: settings.deep.captureWsFrames } });
+    // Self-heal: extension reloads kill the old port while the panel looks
+    // alive (stale DevTools instance). Reconnect on demand instead of dying.
+    if (!panelPort) {
+      connectBackground();
+    }
+    if (!panelPort) {
+      diag('Deep Capture: panel relay unavailable — close DevTools completely and reopen it, then retry');
+      permStatus('Relay lost. Close DevTools completely (not just the tab), reopen with F12, then click again.');
+      return;
+    }
+    panelPort.postMessage({
+      type: 'cdp-start', tabId,
+      opts: {
+        captureWs: settings.deep.captureWsFrames,
+        retainRaw: settings.retainRaw,
+        retainBinary: settings.retainBinary,
+        maxBodyChars: settings.maxBodyBytes,
+      },
+    });
     diag('Deep Capture requested — waiting for debugger attach…');
   } catch (e) { diag(`Deep Capture start failed: ${String(e).slice(0, 120)}`); }
 }
@@ -729,6 +788,30 @@ function handleCdp(ev: CdpNetEvent): void {
     if (ev.ev === 'fail' && !e.note) e.note = 'request failed';
     recordNetworkStatus(e.method, e.url, ev.status);
   }
+  scheduleRender('network'); scheduleRender('overview');
+}
+
+/**
+ * Deep Capture body arrival (background pulled Network.getResponseBody).
+ * Same landing path as devtools getContent: mark the entry, index
+ * URL/headers for non-binary, and run the full ingest pipeline so
+ * worker/SW/iframe bodies become searchable — not just metadata.
+ */
+async function handleCdpBody(reqId: string, url: string, mime: string, text: string, truncated: boolean): Promise<void> {
+  if (paused || !reqId || !url || !text) return;
+  const e = findCdpEntry(reqId, url);
+  if (!e) return; // entry aged out of the buffer — drop, metadata already landed
+  const binKind = isBinaryKind(kindFor(url, mime));
+  e.bodyKept = true;
+  e.bodyChars = text.length;
+  if (truncated && !e.note) e.note = 'body truncated (Deep Capture cap)';
+  if (binKind && !e.note) e.note = 'binary body retained — not indexed';
+  if (!binKind) indexUrlAndHeaders(url, e);
+  await ingestText(url, text, {
+    mime, route: e.route, method: 'cdp-body',
+    initiator: e.initiator, status: e.status,
+    detail: truncated ? 'deep-capture body (truncated)' : 'deep-capture body',
+  });
   scheduleRender('network'); scheduleRender('overview');
 }
 
@@ -1042,6 +1125,11 @@ function connectBackground(): void {
         void handleContentBatch(msg as unknown as ContentBatch);
       } else if (msg.type === 'cdp') {
         try { handleCdp((msg as unknown as { ev: CdpNetEvent }).ev); } catch { /* ignore */ }
+      } else if (msg.type === 'cdp-body') {
+        try {
+          const b = msg as unknown as { reqId?: string; url?: string; mime?: string; text?: string; truncated?: boolean };
+          void handleCdpBody(b.reqId ?? '', b.url ?? '', b.mime ?? '', b.text ?? '', b.truncated === true);
+        } catch { /* ignore */ }
       } else if (msg.type === 'cdp-targets') {
         try { handleCdpTargets((msg as unknown as { targets: CdpTargetInfo[] }).targets ?? []); } catch { /* ignore */ }
       } else if (msg.type === 'cdp-state') {
@@ -1056,7 +1144,10 @@ function connectBackground(): void {
         diag(String(msg.note ?? 'background notice'), msg.url);
       }
     });
-    port.onDisconnect.addListener(() => { if (panelPort === port) panelPort = null; });
+    port.onDisconnect.addListener(() => {
+      if (panelPort === port) panelPort = null;
+      diag('panel relay disconnected (extension reloaded?) — close DevTools completely and reopen it');
+    });
   } catch { diag('background relay unavailable; devtools.network capture still works'); }
 }
 
@@ -1363,6 +1454,12 @@ function updateDeepStatus(extra = ''): void {
   $('deepStatus').textContent = scanning
     ? `scanning… visited ${scanVisited.size}/${settings.deepScan.maxPages} pages, fetched ${scanFetched}, queued ${scanQueue.length} ${extra}`
     : `idle — visited ${scanVisited.size} pages, fetched ${scanFetched} ${extra}`;
+  const ts = document.getElementById('topStatus');
+  if (ts) {
+    ts.textContent = scanning
+      ? `● Deep ${scanVisited.size}/${settings.deepScan.maxPages} · ${scanFetched} fetched`
+      : '● idle';
+  }
 }
 
 // ---------- search UI ----------
@@ -1511,10 +1608,23 @@ function renderMem(): void {
   let storeLimit = settings.storageMB * 1024 * 1024;
   try { const s = storeSnapshot(); storeTotal = s.total; storeLimit = s.limit; } catch { /* ignore */ }
   $('memText').textContent = `Live ${paused ? '○' : '●'} | Retained ${formatBytes(storeTotal)} / ${settings.storageMB} MB · ${netEntries.length} req · ${lastApiCount} apis`;
+  if (!scanning) {
+    const ts = document.getElementById('topStatus');
+    if (ts) ts.textContent = `${paused ? '○ paused' : '● live'} · ${formatBytes(storeTotal)} · ${netEntries.length} req`;
+  }
+  try {
+    const lamp = document.getElementById('clearLamp');
+    if (lamp) {
+      const state = cdpAttached ? 'deep' : sessionStoreOk ? 'granted' : 'base';
+      lamp.dataset.state = state;
+      lamp.setAttribute('aria-label', state === 'deep' ? 'Clearance: Deep Capture attached'
+        : state === 'granted' ? 'Clearance: site access granted' : 'Clearance: base capture — grant site access in Settings for full capture');
+    }
+  } catch { /* lamp is best-effort */ }
   $('memDetail').textContent = `idx ${formatBytes(ledger.indexBytes)} · raw ${formatBytes(ledger.rawBytes)} · ${ledger.resources} res · ${ledger.routes} routes · ${ledger.requests} req`;
   const f = $('memFill');
   f.style.width = `${Math.min(100, ledger.pct)}%`;
-  f.style.background = ledger.pct >= 95 ? 'var(--bad)' : ledger.pct >= 80 ? 'var(--warn)' : 'var(--ok)';
+  f.style.background = ledger.pct >= 95 ? 'var(--red-t)' : 'var(--acc)';
   $('cRoutes').textContent = String(routes.size);
   $('cRes').textContent = String(resources.size);
   $('cNet').textContent = String(netEntries.length);
@@ -1542,6 +1652,19 @@ function renderOverview(): void {
   ];
   $('statGrid').innerHTML = stats.map(([b, l]) => `<div class="stat"><b>${esc(b)}</b><span>${l}</span></div>`).join('');
   $('sessionInfo').innerHTML = `origin <b>${esc(sessionOrigin || '—')}</b><br/>route ${esc(sessionRoute)}<br/>mode ${scanning ? '<b>DEEP SCAN</b>' : 'passive'}${paused ? ' · <b>PAUSED</b>' : ''}<br/>raw bodies ${settings.retainRaw ? `kept (${rawBodies.size})` : 'dropped after indexing'}`;
+  try {
+    const strip = document.getElementById('sessionStrip');
+    if (strip) {
+      const tss = netEntries.map((n) => n.ts).filter((t) => typeof t === 'number');
+      if (tss.length) {
+        const fmt = (t: number) => { try { return new Date(t).toLocaleTimeString(); } catch { return '—'; } };
+        strip.textContent = `first seen ${fmt(Math.min(...tss))} → last seen ${fmt(Math.max(...tss))} · ${netEntries.length} requests · ${rawBodies.size} bodies kept`;
+      } else {
+        strip.textContent = 'no requests yet — browse the page or run a Deep Scan';
+      }
+      strip.dataset.state = ledger.over() ? 'over' : ledger.pct >= 80 ? 'warn' : 'live';
+    }
+  } catch { /* timeline is best-effort */ }
   renderHomeBudget();
 }
 
@@ -1588,11 +1711,44 @@ function routeFullUrl(r: string): string {
   return `${sessionOrigin}/${r.replace(/^\/*/, '')}`;
 }
 
+/** Filter-DSL adapters: rows → flat records (matchDslAll does the rest). */
+function dslHostOf(url: string): string {
+  try { return hostOf(url); } catch { return ''; }
+}
+
+function dslHasAuth(url: string, reqHeaders?: Record<string, string>): boolean {
+  try {
+    if (Object.keys(reqHeaders ?? {}).some((k) => k.toLowerCase() === 'authorization')) return true;
+    return /[?&#](token|api[-_]?key|access_token|auth|bearer|key)=/i.test(url);
+  } catch { return false; }
+}
+
+function dslNetRec(n: NetEntry): DslRecord {
+  return {
+    method: n.method, status: n.status, host: dslHostOf(n.url), mime: n.mime,
+    url: n.url, route: n.route, kind: groupMime(n.mime, n.url),
+    hasAuth: dslHasAuth(n.url, n.reqHeaders),
+    hasBody: (n.bodyChars ?? 0) > 0 || n.bodyKept === true,
+    isError: typeof n.status === 'number' && n.status >= 400,
+  };
+}
+
+function dslResRec(r: ResourceMeta): DslRecord {
+  return {
+    method: r.method, status: r.status, host: dslHostOf(r.url), mime: r.mime,
+    url: r.url, route: r.route, kind: r.kind,
+    hasBody: (r.size ?? 0) > 0,
+    isError: typeof r.status === 'number' && r.status >= 400,
+  };
+}
+
 function filteredRoutes(): Array<[string, { method: DiscoveryMethod; count: number }]> {
-  const f = ((document.getElementById('routeFilter') as HTMLInputElement | null)?.value ?? '').toLowerCase();
+  const input = (document.getElementById('routeFilter') as HTMLInputElement | null)?.value ?? '';
+  const terms = parseFilterDsl(input);
   const out: Array<[string, { method: DiscoveryMethod; count: number }]> = [];
   for (const [r, v] of routes) {
-    if (f && !r.toLowerCase().includes(f)) continue;
+    if (input && !matchDslAll(terms, { method: v.method, route: r, url: routeFullUrl(r), seen: v.count }, r)) continue;
+    if (globalUrlQ && !matchGlobalUrl(routeFullUrl(r))) continue;
     out.push([r, v]);
     if (out.length >= 1200) break;
   }
@@ -1607,17 +1763,22 @@ function renderRoutes(): void {
   const cap = routeShowAll ? 1200 : 300;
   const rows = all.slice(0, cap);
   ($('routeBody') as HTMLElement).innerHTML = rows.map(([r, v]) => {
-    const full = routeFullUrl(r);
-    return `<tr><td class="rt"><a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(full)}</a></td>`
-      + `<td class="num" title="Times seen this session">×${v.count}</td>`
-      + `<td><span class="badge kind">${esc(v.method)}</span></td>`
-      + `<td class="acts"><button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
-      + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></td></tr>`;
+    // Per-row guard: one malformed record must never blank or stale the table.
+    try {
+      const full = routeFullUrl(r);
+      const seen = typeof v?.count === 'number' ? v.count : 1;
+      const via = typeof v?.method === 'string' && v.method ? v.method : 'page';
+      return `<tr><td class="rt"><a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(full)}</a></td>`
+        + `<td class="num" title="Times seen this session">×${seen}</td>`
+        + `<td><span class="badge kind">${esc(via)}</span></td>`
+        + `<td class="acts"><button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
+        + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></td></tr>`;
+    } catch { return ''; }
   }).join('') || '<tr><td colspan="4" class="muted">no routes yet — browse the page or run Deep Scan</td></tr>';
   const rc = document.getElementById('routeCount');
   if (rc) {
     const base = `${all.length} shown${routes.size > all.length ? ` of ${routes.size}` : ''}`;
-    rc.textContent = routeShowAll ? `${base} (Show-all on: up to 1200)` : (all.length > 300 ? `${base} — showing 300 (capped)` : base);
+    rc.textContent = (routeShowAll ? `${base} (Show-all on: up to 1200)` : (all.length > 300 ? `${base} — showing 300 (capped)` : base)) + urlFindSuffix();
   }
   const rsb = document.getElementById('btnRoutesShowAll');
   if (rsb) rsb.textContent = routeShowAll ? 'Show less' : `Show all (${all.length})`;
@@ -1631,12 +1792,13 @@ async function copyFilteredRouteUrls(): Promise<void> {
 
 function filteredResources(): ResourceMeta[] {
   const input = ($('resFilter') as HTMLInputElement).value ?? '';
-  const f = input.toLowerCase();
+  const terms = parseFilterDsl(input);
   const out: ResourceMeta[] = [];
   // Single pass over live values — no intermediate arrays until the cap.
   for (const r of resources.values()) {
     if (resType !== 'ALL' && r.kind !== resType) continue;
-    if (f && !r.url.toLowerCase().includes(f) && !r.kind.includes(f)) continue;
+    if (input && !matchDslAll(terms, dslResRec(r), `${r.url} ${r.kind}`)) continue;
+    if (globalUrlQ && !matchGlobalUrl(r.url)) continue;
     out.push(r);
     if (out.length >= 1200) break;
   }
@@ -1680,23 +1842,21 @@ function renderResources(): void {
       const gh = esc(g.host);
       const showAll = grpShowAll.has(g.host);
       const cap = showAll ? 1000 : 100;
-      const showBtn = g.items.length > 100 ? ` <button data-act="gshowall" data-grp="${gh}" title="Toggle full group (100 ↔ 1000)">${showAll ? 'Show less' : `Show all (${g.items.length})`}</button>` : '';
-      out.push(`<tr class="grp"><td colspan="9"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} items · ${formatBytes(size)}</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopyall" data-grp="${gh}" title="Copy group URLs + contents (bounded)">Copy URLs+contents</button>${showBtn}</td></tr>`);
-      const hide = col ? ' class="hidden"' : '';
+      out.push(`<tr class="grp"><td colspan="9"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}" aria-expanded="${col ? 'false' : 'true'}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} items · ${formatBytes(size)}</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gmenu" data-grp="${gh}" title="More group actions">⋯</button></td></tr>`);
+      // Collapsed group hides every item row under it.
+      const gHide = col ? ' class="hidden"' : '';
       for (const r of g.items.slice(0, cap)) {
-        out.push(`<tr data-g="${gh}"${hide}><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
-          + `<td title="${esc(r.kind)}">${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
-          + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
-          + `<td title="${esc(r.indexed ? String(r.indexedStrings) + (r.error ? ` — ${r.error}` : '') : '—')}">${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
-          + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
-          + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
-          + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button></td></tr>`);
+        out.push(`<tr data-g="${gh}"${gHide}><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
+            + `<td title="${esc(r.kind)}">${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
+            + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
+            + `<td title="${esc(r.indexed ? String(r.indexedStrings) + (r.error ? ` — ${r.error}` : '') : '—')}">${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
+            + rowActsHtml(r.url) + `</tr>`);
       }
-      if (g.items.length > cap) out.push(`<tr data-g="${gh}"${hide}><td colspan="9" class="muted">… +${g.items.length - cap} more in this group — refine filters, use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
+      if (g.items.length > cap) out.push(`<tr data-g="${gh}"${gHide}><td colspan="9" class="muted">… +${g.items.length - cap} more in this group — refine filters, use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
     }
     tb.innerHTML = out.join('');
   }
-  $('resCount').textContent = `${all.length} shown${resources.size > all.length ? ` of ${resources.size}` : ''} · ${resType === 'ALL' ? 'all types' : resType}`;
+  $('resCount').textContent = `${all.length} shown${resources.size > all.length ? ` of ${resources.size}` : ''} · ${resType === 'ALL' ? 'all types' : resType}${urlFindSuffix()}`;
 }
 
 function syncNetOptions(): void {
@@ -1720,12 +1880,13 @@ function syncNetOptions(): void {
 
 function filteredNetEntries(): NetEntry[] {
   const input = (($('netFilter') as HTMLInputElement)?.value) ?? '';
-  const f = input.toLowerCase();
+  const terms = parseFilterDsl(input);
   const out: NetEntry[] = [];
   for (const n of netEntries) {
     if (netMethod !== 'ALL' && n.method !== netMethod) continue;
     if (netKind !== 'ALL' && groupMime(n.mime, n.url) !== netKind) continue;
-    if (f && !n.url.toLowerCase().includes(f) && !(n.mime ?? '').toLowerCase().includes(f)) continue;
+    if (input && !matchDslAll(terms, dslNetRec(n), `${n.url} ${n.mime ?? ''}`)) continue;
+    if (globalUrlQ && !matchGlobalUrl(n.url)) continue;
     out.push(n);
     if (out.length >= 1200) break;
   }
@@ -1757,24 +1918,21 @@ function renderNetwork(): void {
       const gh = esc(g.host);
       const showAll = grpShowAll.has(g.host);
       const cap = showAll ? 1000 : 100;
-      const showBtn = g.items.length > 100 ? ` <button data-act="gshowall" data-grp="${gh}" title="Toggle full group (100 ↔ 1000)">${showAll ? 'Show less' : `Show all (${g.items.length})`}</button>` : '';
-      out.push(`<tr class="grp"><td colspan="8"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} items · ${formatBytes(size)}</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopyall" data-grp="${gh}" title="Copy group URLs + contents (bounded)">Copy URLs+contents</button>${showBtn}</td></tr>`);
-      const hide = col ? ' class="hidden"' : '';
+      out.push(`<tr class="grp"><td colspan="8"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}" aria-expanded="${col ? 'false' : 'true'}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} items · ${formatBytes(size)}</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gmenu" data-grp="${gh}" title="More group actions">⋯</button></td></tr>`);
+      // Collapsed group hides every item row under it.
+      const gHide = col ? ' class="hidden"' : '';
       for (const n of g.items.slice(0, cap)) {
-        out.push(`<tr data-g="${gh}"${hide}><td>${esc(n.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(n.url)}" title="${esc(n.url)}">${esc(shortLabel(n.url))}</a></td>`
-          + `<td>${n.status ?? '—'}</td><td title="${esc(n.mime ?? '')}">${esc(n.mime ?? '')}</td><td title="${esc(n.route)}">${esc(n.route)}</td>`
-          + `<td>${n.bodyKept ? formatBytes(n.bodyChars) : n.bodyChars ? `${formatBytes(n.bodyChars)} (indexed)` : 'meta'}</td>`
-          + `<td class="muted" title="${esc(n.note ?? '')}">${esc(n.note ?? '')}</td>`
-          + `<td class="acts"><button data-act="open" data-url="${esc(n.url)}" title="Open ${esc(shortLabel(n.url))}">Open</button>`
-          + `<button data-act="copy" data-url="${esc(n.url)}" title="Copy URL">Copy</button>`
-          + `<button data-act="view" data-url="${esc(n.url)}" title="Preview captured content">View</button>`
-          + `<button data-act="curl" data-url="${esc(n.url)}" title="Copy as cURL">cURL</button></td></tr>`);
+        out.push(`<tr data-g="${gh}"${gHide}><td>${esc(n.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(n.url)}" title="${esc(n.url)}">${esc(shortLabel(n.url))}</a></td>`
+            + `<td>${n.status ?? '—'}</td><td title="${esc(n.mime ?? '')}">${esc(n.mime ?? '')}</td><td title="${esc(n.route)}">${esc(n.route)}</td>`
+            + `<td>${n.bodyKept ? formatBytes(n.bodyChars) : n.bodyChars ? `${formatBytes(n.bodyChars)} (indexed)` : 'meta'}</td>`
+            + `<td class="muted" title="${esc(n.note ?? '')}">${esc(n.note ?? '')}</td>`
+            + rowActsHtml(n.url, true) + `</tr>`);
       }
-      if (g.items.length > cap) out.push(`<tr data-g="${gh}"${hide}><td colspan="8" class="muted">… +${g.items.length - cap} more in this group — refine filters, use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
+      if (g.items.length > cap) out.push(`<tr data-g="${gh}"${gHide}><td colspan="8" class="muted">… +${g.items.length - cap} more in this group — refine filters, use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
     }
     tb.innerHTML = out.join('');
   }
-  $('netCount').textContent = `${all.length} shown${netEntries.length > all.length ? ` of ${netEntries.length}` : ''}`;
+  $('netCount').textContent = `${all.length} shown${netEntries.length > all.length ? ` of ${netEntries.length}` : ''}${urlFindSuffix()}`;
 }
 
 // ---------- shared URL actions (open / copy / view) ----------
@@ -1802,10 +1960,517 @@ function openUrl(url: string): void {
   window.open(url, '_blank');
 }
 
+// ---------- interception: replay / mock / block (Requestly-style) -----------
+/**
+ * Per-request actions seeded from observed traffic. Replay executes in the
+ * background worker (real cookies, CORS bypassed for permitted hosts).
+ * Mock/block rules live in chrome.storage.session (gone when the browser
+ * closes) and run in the page via the MAIN-world interceptor — zero new
+ * manifest permissions. Rules only take effect where site access is granted.
+ */
+let interceptRules: InterceptRule[] = [];
+let ruleSeq = 0;
+let sessionStoreOk = true;
+
+function rulesStorage(): chrome.storage.SessionStorageArea | null {
+  try {
+    const s = chrome.storage?.session;
+    if (!s) { sessionStoreOk = false; return null; }
+    return s;
+  } catch { sessionStoreOk = false; return null; }
+}
+
+async function loadInterceptRules(): Promise<void> {
+  interceptRules = [];
+  try {
+    const got = await rulesStorage()?.get('deepscope-rules');
+    const arr = (got as Record<string, unknown> | undefined)?.['deepscope-rules'];
+    if (Array.isArray(arr)) {
+      interceptRules = (arr as InterceptRule[]).filter((r) => r && (r.kind === 'mock' || r.kind === 'block') && typeof r.match === 'string');
+    }
+  } catch { /* start rule-free */ }
+  renderInterceptList();
+}
+
+async function saveInterceptRules(): Promise<void> {
+  try { await rulesStorage()?.set({ 'deepscope-rules': interceptRules.slice(0, 200) }); }
+  catch { sessionStoreOk = false; }
+  // The ISOLATED observer relays storage.session → page automatically.
+  renderInterceptList();
+}
+
+/** Register the MAIN-world interceptor next to the passive observer. */
+async function ensureInterceptRegistered(): Promise<void> {
+  if (!sessionOrigin) return;
+  try {
+    const held = await chrome.permissions.contains({ origins: [`${sessionOrigin}/*`] });
+    if (!held) return;
+    try { await chrome.scripting.unregisterContentScripts({ ids: ['deepscope-intercept'] }); }
+    catch { /* first registration — nothing to remove */ }
+    await chrome.scripting.registerContentScripts([{
+      id: 'deepscope-intercept', matches: [`${sessionOrigin}/*`], js: ['dist/intercept-main.js'],
+      runAt: 'document_start', allFrames: true, persistAcrossSessions: false, world: 'MAIN',
+    }]);
+  } catch (e) { diag(`interceptor registration: ${String(e).slice(0, 140)}`); }
+}
+
+/** Home-card rule list: toggle / delete; hint explains the grant gate. */
+function renderInterceptList(): void {
+  const box = document.getElementById('interceptList');
+  const hint = document.getElementById('interceptHint');
+  if (!box) return;
+  if (!interceptRules.length) {
+    box.innerHTML = '<span class="muted">no rules — Replay / Mock / Block any row in Network or APIs</span>';
+  } else {
+    box.innerHTML = interceptRules.map((r) => {
+      const id = esc(r.id);
+      const desc = esc(`${r.kind === 'mock' ? `mock ${r.status ?? 200}` : 'block'} · ${r.method ?? 'ANY'} · ${r.match}`);
+      const off = r.enabled === false ? ' (off)' : '';
+      return `<div>[${r.kind}] ${desc}${off} `
+        + `<button data-rule="toggle" data-id="${id}" title="Enable/disable">on/off</button> `
+        + `<button data-rule="del" data-id="${id}" title="Delete rule">del</button></div>`;
+    }).join('');
+  }
+  if (hint) {
+    hint.textContent = sessionStoreOk
+      ? 'Rules apply on pages where site access is granted (reload the page after granting).'
+      : 'Session storage unavailable — rules will not persist this session.';
+  }
+}
+
+function interceptListClick(e: Event): void {
+  const t = (e.target as HTMLElement).closest?.('[data-rule]') as HTMLElement | null;
+  if (!t) return;
+  const id = t.dataset.id ?? '';
+  const r = interceptRules.find((x) => x.id === id);
+  if (!r) return;
+  if (t.dataset.rule === 'del') interceptRules = interceptRules.filter((x) => x.id !== id);
+  else r.enabled = r.enabled === false ? true : false;
+  void saveInterceptRules();
+  diag(t.dataset.rule === 'del' ? 'rule deleted' : `rule ${r.enabled === false ? 'disabled' : 'enabled'}: ${r.match.slice(0, 80)}`);
+}
+
+function headersToText(h: Record<string, string> | undefined): string {
+  return Object.entries(h ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n');
+}
+
+function textToHeaders(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split('\n').slice(0, 64)) {
+    const i = line.indexOf(':');
+    if (i <= 0) continue;
+    const k = line.slice(0, i).trim();
+    const v = line.slice(i + 1).trim();
+    if (k && v && k.length <= 256 && v.length <= 16_384) out[k] = v;
+  }
+  return out;
+}
+
+/** Prefill the replay editor from a captured request and show it. */
+function openReplay(url: string): void {
+  const n = netEntries.find((x) => x.url === url);
+  // Uncalled ("u") endpoints were never requested, so no captured exchange exists —
+  // prefill from discovery instead of refusing: the user edits, then Sends.
+  let apiMethod = '';
+  if (!n) {
+    try { apiMethod = buildApiRows().find((r) => r.url === url)?.method ?? ''; } catch { apiMethod = ''; }
+  }
+  if (!n && !apiMethod) { diag('Replay: request no longer in buffer', url); return; }
+  const method = n?.method ?? apiMethod;
+  (document.getElementById('replayMethod') as HTMLSelectElement).value = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(method) ? method : 'GET';
+  (document.getElementById('replayUrl') as HTMLInputElement).value = url;
+  renderRpParams(url);
+  renderRpHeaders(headersToText(n?.reqHeaders));
+  const sentText = n?.reqBody ?? '';
+  const sentBinary = isBinaryText(sentText);
+  (document.getElementById('replayBody') as HTMLTextAreaElement).value = sentBinary ? '' : sentText.slice(0, REPLAY_MAX_REQ_CHARS);
+  if (sentBinary) diag('replay: sent body is binary/compressed — add a body manually if needed', url);
+  switchRpTab('params');
+  (document.getElementById('replayMeta') as HTMLElement).textContent = n
+    ? 'edit, then Send'
+    : 'uncalled endpoint — prefilled from discovery (no captured exchange); edit, then Send';
+  (document.getElementById('replayResp') as HTMLElement).innerHTML = '<div class="rp-empty" style="padding:6px 8px">no response yet</div>';
+  document.getElementById('replayModal')?.classList.remove('hidden');
+  modalTakeFocus('replayMethod');
+}
+
+/** Requestly-style tabs: params / headers / body. */
+function switchRpTab(which: string): void {
+  for (const t of ['params', 'headers', 'body']) {
+    document.querySelector(`[data-rptab="${t}"]`)?.classList.toggle('active', t === which);
+    document.getElementById(`rpPane${t[0].toUpperCase()}${t.slice(1)}`)?.classList.toggle('hidden', t !== which);
+  }
+  // Switching away from Params writes the table back into the URL box.
+  if (which !== 'params') syncRpParamsToUrl();
+}
+
+function escAttr(s: string): string {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+/** Query params of the URL box as editable rows (checked = included). */
+function renderRpParams(url: string): void {
+  const box = document.getElementById('replayParamsTable');
+  if (!box) return;
+  let pairs: Array<[string, string]> = [];
+  try {
+    const u = new URL(url);
+    u.searchParams.forEach((v, k) => { if (pairs.length < 60 && k) pairs.push([k, v]); });
+  } catch { /* relative URL — no params */ }
+  box.innerHTML = pairs.length
+    ? pairs.map(([k, v]) => rpKvRow(escAttr(k), escAttr(v), true)).join('')
+    : '<div class="rp-empty">no query params — add one below or type ?a=b in the URL</div>';
+}
+
+function rpKvRow(k: string, v: string, on: boolean): string {
+  return `<div class="rp-kv"><input type="checkbox"${on ? ' checked' : ''} title="Include" />`
+    + `<input type="text" class="rp-k" value="${k}" placeholder="key" title="Key" />`
+    + `<input type="text" class="rp-v" value="${v}" placeholder="value" title="Value" />`
+    + `<button data-rp="delrow" title="Remove row">✕</button></div>`;
+}
+
+/** Headers textarea text as editable rows (all checked). */
+function renderRpHeaders(text: string): void {
+  const box = document.getElementById('replayHeadersTable');
+  if (!box) return;
+  const rows = textToHeaders(text);
+  const keys = Object.keys(rows).slice(0, 60);
+  box.innerHTML = keys.length
+    ? keys.map((k) => rpKvRow(escAttr(k), escAttr(rows[k]), true)).join('')
+    : '<div class="rp-empty">no headers captured — add one below if needed</div>';
+}
+
+/** Read key/value rows from a table div (skips unchecked + empty keys). */
+function readRpKv(boxId: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  try {
+    const box = document.getElementById(boxId);
+    if (!box) return out;
+    for (const row of Array.from(box.querySelectorAll('.rp-kv'))) {
+      const on = (row.querySelector('input[type=checkbox]') as HTMLInputElement)?.checked !== false;
+      const k = (row.querySelector('.rp-k') as HTMLInputElement)?.value.trim() ?? '';
+      const v = (row.querySelector('.rp-v') as HTMLInputElement)?.value ?? '';
+      if (on && k && k.length <= 256 && v.length <= 16_384) out.push([k, v]);
+    }
+  } catch { /* ignore */ }
+  return out;
+}
+
+/** Write checked param rows back into the URL box (unchecked = dropped). */
+function syncRpParamsToUrl(): void {
+  try {
+    const input = document.getElementById('replayUrl') as HTMLInputElement;
+    const u = new URL(input.value.trim());
+    const params = readRpKv('replayParamsTable');
+    // Only sync when at least one row exists — a hand-typed URL stays intact.
+    if (!document.getElementById('replayParamsTable')?.querySelector('.rp-kv')) return;
+    u.search = '';
+    for (const [k, v] of params) u.searchParams.append(k, v);
+    input.value = u.toString();
+  } catch { /* invalid URL — leave the box alone */ }
+}
+
+/** Pretty-print a response body: JSON indented with line numbers, else raw lines. */
+function renderRpResponse(pre: HTMLElement, bodyText: string): void {
+  let pretty = bodyText;
+  try {
+    const v = JSON.parse(bodyText);
+    pretty = JSON.stringify(v, null, 2);
+  } catch { /* not JSON — show raw */ }
+  const lines = pretty.split('\n').slice(0, 400);
+  pre.innerHTML = lines.map((l, i) =>
+    `<div class="ln"><span class="no">${i + 1}</span><span class="tx">${esc(l) || ' '}</span></div>`).join('')
+    + (pretty.split('\n').length > 400 ? '<div class="ln"><span class="no">…</span><span class="tx">truncated to 400 lines</span></div>' : '');
+}
+
+/** Send the edited request via the background executor; render inline. */
+async function sendReplay(): Promise<void> {
+  const meta = document.getElementById('replayMeta') as HTMLElement;
+  const pre = document.getElementById('replayResp') as HTMLElement;
+  syncRpParamsToUrl();
+  const method = (document.getElementById('replayMethod') as HTMLSelectElement).value;
+  const url = (document.getElementById('replayUrl') as HTMLInputElement).value.trim();
+  const headers: Record<string, string> = {};
+  for (const [k, v] of readRpKv('replayHeadersTable')) headers[k] = v;
+  const bodyText = (document.getElementById('replayBody') as HTMLTextAreaElement).value;
+  if (!/^https?:/.test(url)) { meta.textContent = 'URL must start with http(s)://'; return; }
+  meta.textContent = 'sending…';
+  pre.innerHTML = '';
+  const id = `rp${Date.now().toString(36)}`;
+  let res: ReplayResponse;
+  try {
+    res = await chrome.runtime.sendMessage({
+      type: 'replay-request', id, method, url, headers,
+      bodyText: bodyText ? bodyText.slice(0, REPLAY_MAX_REQ_CHARS) : undefined,
+    }) as ReplayResponse;
+  } catch (e) {
+    meta.textContent = `send failed: ${String(e).slice(0, 140)}`;
+    return;
+  }
+  if (!res || res.id !== id || !res.ok) {
+    meta.innerHTML = `<span class="st-err">failed</span> ${esc(res?.error ?? 'no response from background')}`;
+    diag(`replay failed: ${res?.error ?? 'no response'}`, url);
+    return;
+  }
+  const cls = typeof res.status === 'number' && res.status >= 200 && res.status < 300 ? 'st-ok'
+    : typeof res.status === 'number' && res.status >= 400 ? 'st-err' : 'st-mid';
+  const kb = res.bodyText != null ? formatBytes(res.bodyText.length) : '0 B';
+  meta.innerHTML = `<span class="${cls}">${res.status ?? ''} ${esc(res.statusText ?? '')}</span> · ${res.ms ?? 0} ms · ${kb}${res.truncated ? ' · truncated to 512 KB' : ''}`;
+  renderRpResponse(pre, res.bodyText ?? '(empty body)');
+  diag(`replay ${res.status} in ${res.ms}ms`, url);
+}
+
+/** Prefill the mock editor from a captured response and show it. */
+function openMock(url: string): void {
+  const n = netEntries.find((x) => x.url === url);
+  (document.getElementById('mockMatch') as HTMLInputElement).value = url;
+  (document.getElementById('mockMethod') as HTMLSelectElement).value = n && /^(GET|POST|PUT|PATCH|DELETE)$/.test(n.method) ? n.method : 'ANY';
+  (document.getElementById('mockStatus') as HTMLInputElement).value = '200';
+  const kept = rawBodies.get(url);
+  const keptBinary = kept != null && isBinaryText(kept);
+  (document.getElementById('mockBody') as HTMLTextAreaElement).value = kept != null && !keptBinary ? kept.slice(0, 20_000) : '';
+  (document.getElementById('mockMeta') as HTMLElement).textContent = kept == null
+    ? 'no retained body — write the canned response manually'
+    : keptBinary ? 'retained body is binary/compressed — write the canned response manually' : 'prefilled from retained body — edit freely';
+  document.getElementById('mockModal')?.classList.remove('hidden');
+  modalTakeFocus('mockMatch');
+}
+
+/** Validate + store a mock rule from the editor. */
+function saveMock(): void {
+  const meta = document.getElementById('mockMeta') as HTMLElement;
+  const match = (document.getElementById('mockMatch') as HTMLInputElement).value.trim();
+  if (!match) { meta.textContent = 'match text is required (URL substring)'; return; }
+  let status = parseInt((document.getElementById('mockStatus') as HTMLInputElement).value, 10);
+  if (!Number.isFinite(status) || status < 100 || status > 999) status = 200;
+  const body = (document.getElementById('mockBody') as HTMLTextAreaElement).value.slice(0, 20_000);
+  const probe: InterceptRule = { id: '', kind: 'mock', match, method: (document.getElementById('mockMethod') as HTMLSelectElement).value };
+  if (!matchInterceptRule(match, probe.method ?? 'ANY', { ...probe, match })) {
+    meta.textContent = 'this rule matches nothing — check the match text';
+    return;
+  }
+  interceptRules.push({
+    id: `r${Date.now().toString(36)}${ruleSeq++}`, kind: 'mock', match,
+    method: (document.getElementById('mockMethod') as HTMLSelectElement).value, status, body, enabled: true,
+  });
+  document.getElementById('mockModal')?.classList.add('hidden');
+  void saveInterceptRules();
+  diag(`mock rule added: ${match.slice(0, 80)} — reload the page to apply`);
+}
+
+/** One-click block rule for a captured URL. */
+function addBlockRule(url: string): void {
+  const n = netEntries.find((x) => x.url === url);
+  if (!confirm(`Block this URL in the page?\n\n${url.slice(0, 160)}\n\nReload the page to apply. Remove it anytime under Overview → Interception.`)) return;
+  interceptRules.push({
+    id: `r${Date.now().toString(36)}${ruleSeq++}`, kind: 'block', match: url,
+    method: n?.method ?? 'ANY', enabled: true,
+  });
+  void saveInterceptRules();
+  diag(`block rule added: ${url.slice(0, 80)} — reload the page to apply`);
+}
+
+/** Shared per-request interception actions for Network + API rows. */
+function interceptAction(act: string, url: string): boolean {
+  if (act === 'replay') { openReplay(url); return true; }
+  if (act === 'mock') { openMock(url); return true; }
+  if (act === 'block') { addBlockRule(url); return true; }
+  return false;
+}
+
+type RowKind = 'res' | 'net' | 'route' | 'api';
+
+/**
+ * ONE path for every row action in every tab (tables + overflow menu).
+ * Rows show Open + View + a ⋯ menu; the menu carries the rest — this ends
+ * the clipped-button era (7 buttons never fit a fixed Actions column).
+ */
+function rowAction(act: string, url: string, kind: RowKind): void {
+  if (!act || !url) return;
+  if (act === 'open') { openUrl(url); return; }
+  if (act === 'copy') {
+    void copyText(url, kind === 'res' ? 'resource URL' : kind === 'net' ? 'request URL' : kind === 'route' ? 'route URL' : 'API URL');
+    return;
+  }
+  if (act === 'view') { void viewUrl(url); return; }
+  if (interceptAction(act, url)) return; // replay / mock / block
+  if (act === 'curl') {
+    const n = netEntries.find((x) => x.url === url);
+    if (!n) {
+      // Uncalled endpoint: no captured headers, but a bare cURL still replays it.
+      let apiMethod = '';
+      try { apiMethod = buildApiRows().find((r) => r.url === url)?.method ?? ''; } catch { apiMethod = ''; }
+      if (/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(apiMethod)) {
+        try { void copyText(`curl -X ${apiMethod.toUpperCase()} '${url.replace(/'/g, `'\\''`)}'`, 'cURL (uncalled endpoint)'); } catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
+        return;
+      }
+      diag('cURL: request no longer in buffer', url); return;
+    }
+    try { void copyText(buildCurl(n.method, n.url, n.reqHeaders ?? {}), 'cURL'); }
+    catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
+  }
+}
+
+/** Overflow menu items (uniform across Resources/Network/APIs). */
+const ROW_MENU_ITEMS: Array<{ act: string; label: string; title: string }> = [
+  { act: 'replay', label: 'Replay — edit & resend', title: 'Edit & resend this request' },
+  { act: 'mock', label: 'Mock response', title: 'Mock this URL with a canned response' },
+  { act: 'block', label: 'Block URL', title: 'Block this URL in the page' },
+  { act: 'copy', label: 'Copy URL', title: 'Copy URL' },
+  { act: 'curl', label: 'Copy as cURL', title: 'Copy as cURL' },
+];
+
+/** Compact actions cell: Open + View visible (+Replay on request rows), the rest in a ⋯ menu. */
+function rowActsHtml(url: string, replay = false): string {
+  const u = esc(url);
+  const label = esc(shortLabel(url));
+  return `<td class="acts"><button data-act="open" data-url="${u}" title="Open">Open</button>`
+    + `<button data-act="view" data-url="${u}" title="Preview captured content">View</button>`
+    + (replay ? `<button data-act="replay" data-url="${u}" title="Replay — edit & resend this request">Replay</button>` : '')
+    + `<button type="button" data-act="menu" data-url="${u}" title="More actions" aria-label="More actions for ${label}" aria-haspopup="menu" aria-expanded="false">⋯</button></td>`;
+}
+
+/** Anchor for Escape focus-return: the ⋯ button that opened the menu. */
+let actMenuTrigger: HTMLElement | null = null;
+
+/** One floating menu (body-level, so fixed-cell clipping can't eat it). */
+function hideActMenu(returnFocus = false): void {
+  try {
+    const m = document.getElementById('actmenu');
+    const wasOpen = !!m && !m.classList.contains('hidden');
+    m?.classList.add('hidden');
+    const t = actMenuTrigger;
+    actMenuTrigger = null;
+    try { t?.setAttribute('aria-expanded', 'false'); } catch { /* ignore */ }
+    if (returnFocus && wasOpen && t) {
+      try {
+        if (t.isConnected) { t.focus(); }
+        else {
+          // Trigger was replaced by a live re-render — focus its successor.
+          const url = m?.dataset.url ?? '';
+          let next: Element | null = null;
+          try {
+            const all = document.querySelectorAll('[data-act="menu"]');
+            for (let i = 0; i < all.length && !next; i++) {
+              if ((all[i] as HTMLElement).dataset.url === url) next = all[i];
+            }
+          } catch { /* ignore */ }
+          (next as HTMLElement | null)?.focus?.();
+        }
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+interface MenuCtx {
+  kind: RowKind;
+  url?: string;
+  grp?: string;
+  items: Array<{ act: string; label: string; title: string }>;
+}
+
+function toggleActMenu(btn: HTMLElement, ctx: MenuCtx): void {
+  const m = document.getElementById('actmenu');
+  if (!m) return;
+  const key = `${ctx.kind}|${ctx.url ?? ''}|${ctx.grp ?? ''}`;
+  const wasOpen = !m.classList.contains('hidden') && m.dataset.key === key;
+  hideActMenu();
+  if (wasOpen) return;
+  actMenuTrigger = btn;
+  m.dataset.key = key;
+  m.dataset.kind = ctx.kind;
+  m.dataset.url = ctx.url ?? '';
+  m.dataset.grp = ctx.grp ?? '';
+  m.innerHTML = ctx.items.map((i) => {
+    const u = ctx.url ? ` data-url="${esc(ctx.url)}"` : '';
+    const g = ctx.grp ? ` data-grp="${esc(ctx.grp)}"` : '';
+    return `<button type="button" data-act="${i.act}"${u}${g} title="${esc(i.title)}" role="menuitem">${esc(i.label)}</button>`;
+  }).join('');
+  m.classList.remove('hidden');
+  try { btn.setAttribute('aria-expanded', 'true'); } catch { /* ignore */ }
+  try {
+    const r = btn.getBoundingClientRect();
+    const mw = m.offsetWidth || 200;
+    const mh = m.offsetHeight || 200;
+    const gap = 4;
+    const pad = 8;
+    // Prefer below the ⋯ button; flip above when near the viewport bottom.
+    let top = r.bottom + gap;
+    if (top + mh > window.innerHeight - pad) top = r.top - mh - gap;
+    top = Math.max(pad, Math.min(top, window.innerHeight - mh - pad));
+    // Clamp horizontally so the menu never renders off-screen.
+    const left = Math.max(pad, Math.min(r.right - mw, window.innerWidth - mw - pad));
+    m.style.top = `${top}px`;
+    m.style.left = `${left}px`;
+  } catch { /* default position */ }
+}
+
+/** Group-header overflow items (the rest lives inline: toggle + Copy URLs). */
+function groupMenuItems(kind: RowKind): Array<{ act: string; label: string; title: string }> {
+  if (kind === 'api') {
+    return [
+      { act: 'gcopycurl', label: 'Copy cURLs', title: 'Copy group cURLs (called only, ≤30)' },
+      { act: 'gshowall', label: 'Show all / less', title: 'Toggle full group (100 ↔ 1000)' },
+    ];
+  }
+  return [
+    { act: 'gcopyall', label: 'Copy URLs + contents', title: 'Copy group URLs + contents (bounded)' },
+    { act: 'gshowall', label: 'Show all / less', title: 'Toggle full group (100 ↔ 1000)' },
+  ];
+}
+
+/** Group actions shared by inline header buttons and the overflow menu. */
+function groupAction(act: string, kind: RowKind, grp: string): void {
+  if (!act || !grp) return;
+  if (act === 'gcopy') {
+    if (kind === 'api') void copyApiGroupUrls(grp);
+    else if (kind === 'res' || kind === 'net') void copyGroupUrls(kind, grp);
+    return;
+  }
+  if (act === 'gcopyall') {
+    if (kind === 'res' || kind === 'net') void copyGroupAll(kind, grp);
+    return;
+  }
+  if (act === 'gcopycurl') {
+    if (kind === 'api') void copyApiGroupCurls(grp);
+    return;
+  }
+  if (act === 'gshowall') {
+    // Show-all reveals everything: expand the parent group, then lift the slice cap.
+    if (kind === 'api') {
+      apiCollapsed.delete(grp);
+    } else {
+      grpCollapsed.delete(grp);
+    }
+    if (grpShowAll.has(grp)) grpShowAll.delete(grp);
+    else grpShowAll.add(grp);
+    if (kind === 'api') renderApis();
+    else if (kind === 'res') renderResources();
+    else renderNetwork();
+  }
+}
+
+/** Menu clicks route through the same paths as header/row buttons. */
+function actMenuClick(e: Event): void {
+  const t = (e.target as HTMLElement).closest?.('[data-act]') as HTMLElement | null;
+  if (!t) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const m = document.getElementById('actmenu');
+  const kind = (m?.dataset.kind ?? 'net') as RowKind;
+  const act = t.dataset.act ?? '';
+  hideActMenu();
+  if (t.dataset.grp) groupAction(act, kind, t.dataset.grp);
+  else rowAction(act, t.dataset.url ?? m?.dataset.url ?? '', kind);
+}
+
 /** Resolve previewable content for a URL: retained raw body, else on-demand same-origin fetch. */
 async function resolveContent(url: string): Promise<{ text: string; meta: string; truncated: boolean }> {
   const kept = rawBodies.get(url);
   if (kept != null) {
+    if (isBinaryText(kept)) {
+      return { text: BINARY_BODY_NOTE, meta: `binary/compressed body · ${formatBytes(kept.length)} · metadata only`, truncated: false };
+    }
     const cap = 20_000;
     return {
       text: kept.length > cap ? kept.slice(0, cap) : kept,
@@ -1818,6 +2483,9 @@ async function resolveContent(url: string): Promise<{ text: string; meta: string
     if (idbReady) {
       const disk = await idbGetBody(sessionId, url);
       if (typeof disk === 'string' && disk.length) {
+        if (isBinaryText(disk)) {
+          return { text: BINARY_BODY_NOTE, meta: `binary/compressed body (temp-disk) · ${formatBytes(disk.length)}`, truncated: false };
+        }
         const cap = 20_000;
         return {
           text: disk.length > cap ? disk.slice(0, cap) : disk,
@@ -1847,6 +2515,7 @@ async function viewUrl(url: string): Promise<void> {
   $('viewerMeta').textContent = 'loading…';
   ($('viewerBody') as HTMLElement).textContent = '';
   $('viewer').classList.remove('hidden');
+  modalTakeFocus('viewerClose');
   const { text, meta } = await resolveContent(url);
   if (viewerUrl !== url) return; // superseded by a newer View click
   $('viewerMeta').textContent = meta;
@@ -1859,9 +2528,11 @@ function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
   e.preventDefault();
   const act = t.dataset.act;
   // Domain-group actions (header buttons carry data-grp, no data-url).
-  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopyall' || act === 'gshowall') {
+  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopyall' || act === 'gshowall' || act === 'gmenu') {
     const grp = t.dataset.grp ?? '';
     if (!grp || (kind !== 'res' && kind !== 'net')) return;
+    if (act === 'gmenu') { toggleActMenu(t, { kind, grp, items: groupMenuItems(kind) }); return; }
+    hideActMenu();
     if (act === 'gtoggle') {
       grpTouched.add(grp);
       if (grpCollapsed.has(grp)) grpCollapsed.delete(grp);
@@ -1870,28 +2541,14 @@ function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
       else renderNetwork();
       return;
     }
-    if (act === 'gshowall') {
-      if (grpShowAll.has(grp)) grpShowAll.delete(grp);
-      else grpShowAll.add(grp);
-      if (kind === 'res') renderResources();
-      else renderNetwork();
-      return;
-    }
-    if (act === 'gcopy') { void copyGroupUrls(kind, grp); return; }
-    void copyGroupAll(kind, grp);
+    groupAction(act ?? '', kind, grp);
     return;
   }
   const url = t.dataset.url ?? '';
+  if (act === 'menu') { e.preventDefault(); e.stopPropagation(); toggleActMenu(t, { kind, url, items: ROW_MENU_ITEMS }); return; }
+  hideActMenu();
   if (!url) return;
-  if (act === 'open') openUrl(url);
-  else if (act === 'copy') void copyText(url, kind === 'res' ? 'resource URL' : kind === 'net' ? 'request URL' : 'route URL');
-  else if (act === 'view') void viewUrl(url);
-  else if (act === 'curl' && kind === 'net') {
-    const n = netEntries.find((x) => x.url === url);
-    if (!n) { diag('cURL: request no longer in buffer', url); return; }
-    try { void copyText(buildCurl(n.method, n.url, n.reqHeaders ?? {}), 'cURL'); }
-    catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
-  }
+  rowAction(act ?? '', url, kind);
 }
 
 /** First-party host for domain grouping ('' while the origin is unknown). */
@@ -1926,7 +2583,7 @@ async function copyGroupUrls(kind: 'res' | 'net', grp: string): Promise<void> {
   if (kind === 'res') {
     const items = groupItems(filteredResources(), (r) => r.url, grp);
     if (!items.length) { diag('nothing to copy — group is empty'); return; }
-    await copyText(items.slice(0, 1000).map((r) => r.url).join('\n'), `${Math.min(items.length, 1000)} resource URLs (${grp})`);
+    await copyText(items.slice(0, 1000).map((r) => `${r.kind} ${r.url}`).join('\n'), `${Math.min(items.length, 1000)} resource URLs (${grp})`);
   } else {
     const items = groupItems(filteredNetEntries(), (n) => n.url, grp);
     if (!items.length) { diag('nothing to copy — group is empty'); return; }
@@ -1965,9 +2622,9 @@ async function copyGroupAll(kind: 'res' | 'net', grp: string): Promise<void> {
 }
 
 async function copyFilteredResUrls(): Promise<void> {
-  const urls = filteredResources().slice(0, 1000).map((r) => r.url);
-  if (!urls.length) { diag('nothing to copy — filters match zero resources'); return; }
-  await copyText(urls.join('\n'), `${urls.length} resource URLs`);
+  const items = filteredResources().slice(0, 1000);
+  if (!items.length) { diag('nothing to copy — filters match zero resources'); return; }
+  await copyText(items.map((r) => `${r.kind} ${r.url}`).join('\n'), `${items.length} resource URLs`);
 }
 
 async function copyFilteredResAll(): Promise<void> {
@@ -2004,18 +2661,45 @@ async function copyFilteredNetAll(): Promise<void> {
 // ---------- APIs tab ----------
 interface ApiRow { method: string; url: string; kind: ApiKind; detail: string; entry?: NetEntry }
 
-/** True when a request looks API-like: JSON mime or a non-Other API kind. */
-function apiLike(url: string, mime?: string): boolean {
+/** True when a kept response body parses as JSON (mislabelled servers included). */
+function resLooksJson(url: string): boolean {
+  try {
+    const t = rawBodies.get(url);
+    if (!t) return false;
+    const s = t.slice(0, 2048).trimStart();
+    if (!s.startsWith('{') && !s.startsWith('[')) return false;
+    JSON.parse(s.slice(0, 50000));
+    return true;
+  } catch { return false; }
+}
+
+/** True when a request looks API-like: JSON mime, a known API kind, a
+ *  body-carrying write, or a kept response that parses as JSON — even when
+ *  the server labelled it text/plain or octet-stream. */
+function apiLike(url: string, mime?: string, method?: string, hasReqBody?: boolean, sniffJson?: boolean): boolean {
   const m = mime ?? '';
-  return /json/i.test(m) || classifyApiKind(url, m) !== 'Other';
+  if (/json/i.test(m) || classifyApiKind(url, m) !== 'Other') return true;
+  if (hasReqBody && /^(POST|PUT|PATCH|DELETE)$/i.test(method ?? '')) return true;
+  if (sniffJson) return true;
+  return false;
 }
 
 function buildApiRows(): ApiRow[] {
   const rows: ApiRow[] = [];
   // (1) CALLED: observed network entries that look API-like (cap 500).
   const called = new Set<string>();
+  let sniffed = 0;
   for (const n of netEntries) {
-    if (!apiLike(n.url, n.mime)) continue;
+    const hasReq = !!(n.reqBody && n.reqBody.length);
+    // Cheap gates first; JSON-sniff (bounded) only for the leftovers.
+    let sniff = false;
+    if (!/json/i.test(n.mime ?? '') && classifyApiKind(n.url, n.mime ?? '') === 'Other'
+      && !(hasReq && /^(POST|PUT|PATCH|DELETE)$/i.test(n.method ?? ''))
+      && n.bodyChars > 0 && sniffed < 300) {
+      sniffed++;
+      sniff = resLooksJson(n.url);
+    }
+    if (!apiLike(n.url, n.mime, n.method, hasReq, sniff)) continue;
     called.add(n.url);
   }
   let nCalled = 0;
@@ -2026,7 +2710,7 @@ function buildApiRows(): ApiRow[] {
     nCalled++;
   }
   // (2) UNCALLED: API-like routes seen in code but never requested (cap 200).
-  const apiRouteRe = /\/api\/|\/graphql|\/trpc|v\d+\/|graphql/i;
+  const apiRouteRe = /\/api(\/|$|[?#])|\/graphql|\/trpc|\/rest\/|v\d+\/|\/ajax\/|\/rpc\b|\/query\b|\/gateway\/|graphql/i;
   let nUncalled = 0;
   for (const [route, v] of routes) {
     if (nUncalled >= 200) break;
@@ -2053,17 +2737,17 @@ function syncApiKindOptions(rows: ApiRow[]): void {
 }
 
 function apiRowHtml(r: ApiRow, grp = '', hide = ''): string {
-  const curl = r.entry ? `<button data-act="curl" data-url="${esc(r.url)}" title="Copy as cURL">cURL</button>` : '';
   const gAttr = grp ? ` data-g="${grp}"${hide}` : '';
+  const expanded = apiExpanded.has(r.url);
+  const short = esc(shortLabel(r.url));
   return `<tr${gAttr}><td>${esc(r.method)}</td><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
-    + `<td><button class="badge kind" data-act="expand" data-url="${esc(r.url)}" title="Toggle request detail">${esc(String(r.kind))}</button></td>`
+    + `<td><button class="badge kind" data-act="expand" data-url="${esc(r.url)}" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="${expanded ? 'Hide' : 'Show'} request detail for ${short}" title="Toggle request detail: headers, sent body, preview">${esc(String(r.kind))} ${expanded ? '▾' : '▸'}</button></td>`
     + `<td title="${esc(r.detail)}">${esc(r.detail)}${evidenceBadges(r.url, r.method)}</td>`
-    + `<td class="acts"><button data-act="open" data-url="${esc(r.url)}" title="Open ${esc(shortLabel(r.url))}">Open</button>`
-    + `<button data-act="copy" data-url="${esc(r.url)}" title="Copy URL">Copy</button>`
-    + `<button data-act="view" data-url="${esc(r.url)}" title="Preview captured content">View</button>${curl}</td></tr>`;
+    + rowActsHtml(r.url, true) + `</tr>`;
 }
 
-/** Lazily-built expandable detail: headers (≤12 each) + auth badges + sent + body preview. */
+/** Spec-sheet detail: verdict strip (badges + actions), then sent/preview bodies,
+ *  then request/response headers side by side as definition rows. */
 function apiDetailHtml(url: string): string {
   const n = netEntries.find((x) => x.url === url);
   const reqH = Object.entries(n?.reqHeaders ?? {}).slice(0, 12);
@@ -2072,19 +2756,147 @@ function apiDetailHtml(url: string): string {
   try {
     const hasAuth = Object.keys(n?.reqHeaders ?? {}).some((k) => k.toLowerCase() === 'authorization');
     const hasTokenParam = /[?&#](token|api[-_]?key|access_token|auth|bearer|key)=/i.test(url);
-    badges = (hasAuth ? '<span class="badge kind">auth-header</span>' : '<span class="badge">no-auth-header</span>')
-      + ' ' + (hasTokenParam ? '<span class="badge kind">token-param</span>' : '<span class="badge">no-token-param</span>');
+    badges = (hasAuth ? '<span class="badge kind">auth-header ✓</span>' : '<span class="badge">no auth header</span>')
+      + ' ' + (hasTokenParam ? '<span class="badge kind">token in URL ⚠</span>' : '');
   } catch { badges = '<span class="badge">auth unknown</span>'; }
-  const req = reqH.length ? reqH.map(([k, v]) => `${k}: ${v}`).join('\n') : '(no request headers captured)';
-  const res = resH.length ? resH.map(([k, v]) => `${k}: ${v}`).join('\n') : '(no response headers captured)';
   const sentRaw = (n as unknown as { reqBody?: string } | undefined)?.reqBody;
   const sent = safeSnippetBody(sentRaw, 1500);
-  const body = rawBodies.get(url)?.slice(0, 1500) ?? '(body not retained — enable retain raw + recapture)';
-  return `${badges}<br/><b>Sent body</b><br/>${esc(sent)}<br/><button data-act="copysent" data-url="${esc(url)}" title="Copy sent body">Copy sent</button><br/><b>request headers</b> (≤12)<br/>${esc(req)}<br/><b>response headers</b> (≤12)<br/>${esc(res)}<br/><b>body preview</b><br/>${esc(body)}<br/><button data-act="copybody" data-url="${esc(url)}" title="Copy body preview">Copy body</button>`;
+  const kept = rawBodies.get(url);
+  const body = kept != null
+    ? (isBinaryText(kept) ? BINARY_BODY_NOTE : kept.slice(0, 1500))
+    : '';
+  const kv = (rows: Array<[string, string]>) => rows.length
+    ? `<dl class="dt-kv">` + rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('') + `</dl>`
+    : `<div class="dt-empty">none captured</div>`;
+  const pre = (text: string, emptyNote: string) => text
+    ? `<pre class="dt-pre">${esc(text)}</pre>`
+    : `<div class="dt-empty">${emptyNote}</div>`;
+  return `<div class="dt"><div class="dt-url" title="Full URL — drag to select, double-click to select all">${esc(url)}</div><div class="dt-head"><div class="dt-badges">${badges}</div>`
+    + `<div class="dt-actions"><button data-act="copysent" data-url="${esc(url)}" title="Copy sent body">Copy sent</button>`
+    + (kept != null ? `<button data-act="copybody" data-url="${esc(url)}" title="Copy body preview">Copy body</button>` : '') + `</div></div>`
+    + `<div class="dt-grid">`
+    + `<section class="dt-sec"><h4 class="dt-h">Sent body</h4>${pre(sent, 'no sent body — GET requests rarely carry one')}</section>`
+    + `<section class="dt-sec"><h4 class="dt-h">Body preview</h4>${pre(body, 'not retained — turn on “retain raw response bodies” in Settings, then recapture')}</section>`
+    + `<section class="dt-sec"><h4 class="dt-h">Request headers (${reqH.length})</h4>${kv(reqH)}</section>`
+    + `<section class="dt-sec"><h4 class="dt-h">Response headers (${resH.length})</h4>${kv(resH)}</section>`
+    + `</div></div>`;
 }
 
 function filteredApiRows(all: ApiRow[]): ApiRow[] {
-  return apiKind === 'ALL' ? all : all.filter((r) => String(r.kind) === apiKind);
+  const kinded = apiKind === 'ALL' ? all : all.filter((r) => String(r.kind) === apiKind);
+  return globalUrlQ ? kinded.filter((r) => matchGlobalUrl(r.url)) : kinded;
+}
+
+/**
+ * Export observed requests as standard HAR 1.2 (explicit click only).
+ * Opens in Chrome DevTools, Charles, Burp, and every HAR viewer.
+ */
+function exportHar(): void {
+  try {
+    if (!netEntries.length) { diag('HAR: no requests observed yet'); return; }
+    const doc = buildHarDoc(sessionOrigin, netEntries.slice(0, HAR_MAX_ENTRIES).map((n) => ({
+      method: n.method, url: n.url, status: n.status, mime: n.mime, route: n.route,
+      initiator: n.initiator, reqHeaders: n.reqHeaders, resHeaders: n.resHeaders,
+      reqBody: n.reqBody, resBody: rawBodies.get(n.url), ts: n.ts, timingMs: n.timingMs,
+    })));
+    const blob = new Blob([JSON.stringify(doc, null, 1)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `deepscope-${(sessionOrigin || 'session').replace(/[^a-z0-9]+/gi, '-')}.har`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    diag(`HAR exported (${((doc.log ?? {}) as { entries?: unknown[] }).entries?.length ?? 0} entries)`);
+  } catch (e) {
+    diag(`HAR export failed: ${String(e).slice(0, 140)}`);
+  }
+}
+
+/**
+ * Import a foreign HAR (Burp / Charles / Chrome) into live state:
+ * entries + evidence + bounded body ingest, same as captured traffic.
+ */
+async function importHarFile(f: File): Promise<void> {
+  try {
+    if (f.size > 40_000_000) { diag('HAR too large (>40 MB) — refusing to open'); return; }
+    let json: unknown;
+    try { json = JSON.parse(await f.text()); } catch { diag('file is not valid JSON'); return; }
+    const v = validateHar(json);
+    if (!v.ok || !v.entries) { diag(`not a HAR file: ${v.error}`); return; }
+    const raws = v.entries.slice(0, HAR_MAX_ENTRIES);
+    let added = 0, indexed = 0;
+    // HAR entries are oldest-first; netEntries is newest-first → reverse.
+    for (const raw of raws.reverse()) {
+      try {
+        const h = normalizeHarEntry(raw);
+        if (!h) continue;
+        const e: NetEntry = {
+          id: `har-import-${Date.now()}-${added}`, url: h.url, method: h.method,
+          status: h.status, mime: h.mime, route: sessionRoute,
+          reqHeaders: h.reqHeaders, resHeaders: h.resHeaders,
+          bodyKept: false, bodyTruncated: false, bodyChars: h.resText.length,
+          ts: h.ts, reqId: `har-import-${Date.now()}-${added}`,
+          timingMs: h.timingMs, note: 'from HAR import',
+          ...(h.reqText ? { reqBody: h.reqText.slice(0, 2000) } : {}),
+        };
+        if (h.resText && added < 300 && !isBinaryKind(kindFor(h.url, h.mime ?? ''))) {
+          e.bodyKept = true;
+          contentHash.delete(h.url);
+          await ingestText(h.url, h.resText, {
+            mime: h.mime, route: sessionRoute, method: 'manual',
+            status: h.status, detail: `HAR import (${f.name.slice(0, 60)})`,
+          });
+          indexed++;
+        }
+        unshiftNet(e);
+        ledger.requests++;
+        recordNetworkEvidence(e.method, h.url, { status: h.status, mime: h.mime, workerKind: 'unknown', route: sessionRoute });
+        added++;
+      } catch { /* skip one bad entry */ }
+    }
+    diag(`HAR imported: ${added} requests, ${indexed} bodies indexed (${f.name.slice(0, 60)})`);
+    renderAll(); runSearch();
+  } catch (e) {
+    diag(`HAR import failed: ${String(e).slice(0, 140)}`);
+  }
+}
+/**
+ * Export observed endpoints as openapi.json (explicit click only). Called
+ * rows become operations with schemas inferred from real samples; uncalled
+ * code-seen routes are listed under x-deepscope-uncalled.
+ */
+function exportOpenApi(): void {
+  try {
+    const rows = buildApiRows();    const eps: OpenApiEndpoint[] = [];
+    for (const r of rows.slice(0, 700)) {
+      if (!/^https?:/i.test(r.url)) continue;
+      if (!r.entry) {
+        eps.push({ method: 'GET', url: r.url, uncalled: true });
+        continue;
+      }
+      const kept = rawBodies.get(r.url);
+      eps.push({
+        method: r.method && r.method !== '—' ? r.method : 'GET',
+        url: r.url,
+        status: r.entry.status,
+        reqSample: (r.entry.reqBody ?? '').slice(0, 20_000) || undefined,
+        resSample: (kept != null ? kept.slice(0, 20_000) : undefined),
+      });
+    }
+    if (!eps.some((e) => !e.uncalled)) {
+      diag('openapi: no called API endpoints observed yet — browse the app first');
+      return;
+    }
+    const doc = buildOpenApiDoc(sessionOrigin, eps);
+    const blob = new Blob([JSON.stringify(doc, null, 1)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `openapi-${(sessionOrigin || 'session').replace(/[^a-z0-9]+/gi, '-')}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    diag(`openapi.json exported (${Object.keys((doc.paths ?? {}) as object).length} paths)`);
+  } catch (e) {
+    diag(`openapi export failed: ${String(e).slice(0, 140)}`);
+  }
 }
 
 function renderApis(): void {
@@ -2097,7 +2909,21 @@ function renderApis(): void {
   const body = document.getElementById('apisBody');
   if (!body) return;
   if (!filtered.length) {
-    body.innerHTML = '<tr><td colspan="5" class="muted">no APIs yet — browse the page or run Deep Scan</td></tr>';
+    // Zero-state diagnosis: say exactly why, with evidence — never a bare zero.
+    let emptyNote = 'no APIs yet — browse the page or run Deep Scan';
+    if (all.length && apiKind !== 'ALL') {
+      emptyNote = `${all.length} APIs hidden by the Kind filter (${apiKind}) — set Kind to all kinds`;
+    } else if (!all.length && netEntries.length) {
+      const mimes = new Map<string, number>();
+      for (const n of netEntries.slice(0, 200)) {
+        const k = n.mime || '(no mime)';
+        mimes.set(k, (mimes.get(k) ?? 0) + 1);
+      }
+      const top = [...mimes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([m, c]) => `${m}×${c}`).join(', ');
+      emptyNote = `${netEntries.length} requests seen but none look like APIs — top response types ${top}; paths lack /api/, /graphql, /trpc, /v1/ markers and no JSON bodies were kept (turn on “retain raw response bodies” + recapture for JSON sniffing)`;
+      diagOnce('apis-zero-why', `APIs tab empty: ${netEntries.length} requests, top mimes ${top}`);
+    }
+    body.innerHTML = `<tr><td colspan="5" class="muted">${esc(emptyNote)}</td></tr>`;
     const cnt0 = document.getElementById('apiCount');
     if (cnt0) cnt0.textContent = `0 shown of ${all.length}${apiKind !== 'ALL' ? ` · ${apiKind}` : ''}`;
     return;
@@ -2119,33 +2945,44 @@ function renderApis(): void {
     const gh = esc(g.host);
     const showAll = grpShowAll.has(g.host);
     const cap = showAll ? 1000 : 100;
-    const showBtn = g.items.length > 100 ? ` <button data-act="gshowall" data-grp="${gh}" title="Toggle full group (100 ↔ 1000)">${showAll ? 'Show less' : `Show all (${g.items.length})`}</button>` : '';
-    out.push(`<tr class="grp"><td colspan="5"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} apis</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gcopycurl" data-grp="${gh}" title="Copy group cURLs (called only, ≤30)">Copy cURLs</button>${showBtn}</td></tr>`);
-    const hide = col ? ' class="hidden"' : '';
+    out.push(`<tr class="grp"><td colspan="5"><button data-act="gtoggle" data-grp="${gh}" title="Expand/collapse ${gh}" aria-expanded="${col ? 'false' : 'true'}">${col ? '▸' : '▾'}</button> <b>${gh}</b> <span class="muted">${g.items.length} apis</span> <button data-act="gcopy" data-grp="${gh}" title="Copy group URLs">Copy URLs</button> <button data-act="gmenu" data-grp="${gh}" title="More group actions">⋯</button></td></tr>`);
+    // Parent-first rule: a collapsed group hides EVERYTHING under it — API
+    // rows, detail rows, and the more-row. Flat: header → API rows directly.
+    const gHide = col ? ' class="hidden"' : '';
     for (const r of g.items.slice(0, cap)) {
       shown++;
-      out.push(apiRowHtml(r, gh, hide));
-      const det = apiExpanded.has(r.url) ? apiDetHtml.get(r.url) : undefined;
-      if (det) out.push(`<tr class="det" data-g="${gh}"${hide}><td colspan="5">${det}</td></tr>`);
+      // Per-row guard: one malformed record must never stale the table.
+      try {
+        out.push(apiRowHtml(r, gh, gHide));
+      } catch { shown--; continue; }
+      if (!col) {
+        const det = apiExpanded.has(r.url) ? apiDetHtml.get(r.url) : undefined;
+        if (det) out.push(`<tr class="det" data-g="${gh}"><td colspan="5">${det}</td></tr>`);
+      }
     }
-    if (g.items.length > cap) out.push(`<tr data-g="${gh}"${hide}><td colspan="5" class="muted">… +${g.items.length - cap} more in this group — refine the kind filter or use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
+    if (g.items.length > cap) out.push(`<tr data-g="${gh}"${gHide}><td colspan="5" class="muted">… +${g.items.length - cap} more in this group — refine the kind filter or use Copy URLs${showAll ? '' : ' or Show all'}</td></tr>`);
   }
   body.innerHTML = out.join('');
   const cnt = document.getElementById('apiCount');
-  if (cnt) cnt.textContent = `${shown} shown of ${all.length}${apiKind !== 'ALL' ? ` · ${apiKind}` : ''}`;
+  if (cnt) cnt.textContent = `${shown} shown of ${all.length}${apiKind !== 'ALL' ? ` · ${apiKind}` : ''}${urlFindSuffix()}`;
 }
 
 async function copyFilteredApiUrls(): Promise<void> {
-  const all = buildApiRows();
-  const urls = filteredApiRows(all).slice(0, 1000).map((r) => r.url);
-  if (!urls.length) { diag('nothing to copy — API filter matches zero rows'); return; }
-  await copyText(urls.join('\n'), `${urls.length} API URLs`);
+  const rows = filteredApiRows(buildApiRows()).slice(0, 1000).map((r) => apiCopyLine(r));
+  if (!rows.length) { diag('nothing to copy — API filter matches zero rows'); return; }
+  await copyText(rows.join('\n'), `${rows.length} API URLs`);
+}
+
+/** One typed copy line per API row: METHOD for called rows, kind for uncalled. */
+function apiCopyLine(r: ApiRow): string {
+  const tag = r.entry ? r.method : String(r.kind);
+  return `${tag} ${r.url}`;
 }
 
 async function copyApiGroupUrls(grp: string): Promise<void> {
   const items = groupItems(filteredApiRows(buildApiRows()), (r) => r.url, grp);
   if (!items.length) { diag('nothing to copy — group is empty'); return; }
-  await copyText(items.slice(0, 1000).map((r) => r.url).join('\n'), `${Math.min(items.length, 1000)} API URLs (${grp})`);
+  await copyText(items.slice(0, 1000).map(apiCopyLine).join('\n'), `${Math.min(items.length, 1000)} API URLs (${grp})`);
 }
 
 async function copyApiGroupCurls(grp: string): Promise<void> {
@@ -2164,24 +3001,25 @@ function apiClick(e: Event): void {
   if (!t) return;
   e.preventDefault();
   const act = t.dataset.act;
-  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopycurl' || act === 'gshowall') {
+  if (act === 'gtoggle' || act === 'gcopy' || act === 'gcopycurl' || act === 'gshowall' || act === 'gmenu') {
     const grp = t.dataset.grp ?? '';
     if (!grp) return;
+    if (act === 'gmenu') { toggleActMenu(t, { kind: 'api', grp, items: groupMenuItems('api') }); return; }
+    hideActMenu();
     if (act === 'gtoggle') {
       apiTouched.add(grp);
       if (apiCollapsed.has(grp)) apiCollapsed.delete(grp);
-      else apiCollapsed.add(grp);
+      else {
+        apiCollapsed.add(grp);
+        for (const u of [...apiExpanded]) {
+          try { if ((hostOf(u) || '(relative)') === grp) apiExpanded.delete(u); }
+          catch { /* ignore */ }
+        }
+      }
       renderApis();
       return;
     }
-    if (act === 'gshowall') {
-      if (grpShowAll.has(grp)) grpShowAll.delete(grp);
-      else grpShowAll.add(grp);
-      renderApis();
-      return;
-    }
-    if (act === 'gcopy') { void copyApiGroupUrls(grp); return; }
-    void copyApiGroupCurls(grp);
+    groupAction(act ?? '', 'api', grp);
     return;
   }
   const url = t.dataset.url ?? '';
@@ -2204,14 +3042,11 @@ function apiClick(e: Event): void {
     return;
   }
   if (!url) return;
-  if (act === 'open') openUrl(url);
-  else if (act === 'copy') void copyText(url, 'API URL');
-  else if (act === 'view') void viewUrl(url);
-  else if (act === 'curl') {
-    const n = netEntries.find((x) => x.url === url);
-    if (!n) { diag('cURL: request no longer in buffer', url); return; }
-    try { void copyText(buildCurl(n.method, n.url, n.reqHeaders ?? {}), 'cURL'); }
-    catch (err) { diag(`cURL copy failed: ${String(err).slice(0, 120)}`, url); }
+  if (act === 'menu') { e.preventDefault(); e.stopPropagation(); toggleActMenu(t, { kind: 'api', url, items: ROW_MENU_ITEMS }); return; }
+  hideActMenu();
+  if (act === 'open' || act === 'copy' || act === 'view' || act === 'curl'
+    || act === 'replay' || act === 'mock' || act === 'block') {
+    rowAction(act, url, 'api');
   } else if (act === 'copybody') {
     const b = rawBodies.get(url);
     void copyText(b != null ? b.slice(0, 20000) : '(body not retained — enable retain raw + recapture)', 'API body');
@@ -2264,9 +3099,10 @@ function renderAnalyze(): void {
         const p = f.prov;
         const loc = p.line && p.line > 0 ? ` · L${p.line}${p.column ? ':' + p.column : ''}` : '';
         const rule = f.label && f.label !== f.rule ? `${f.rule} · ${f.label}` : f.rule;
+        const clean = displayNameFor(f.text, 120);
         html += `<div class="res"><div class="head"><span class="badge sev-${f.sev}">${esc(f.sev)}</span>`
           + `<span class="badge" title="rule">${esc(rule)}</span>`
-          + `<span class="orig" title="${esc(f.text.slice(0, 400))}">${esc(displayNameFor(f.text, 120))}</span>`
+          + `<span class="orig" title="${esc(f.text.slice(0, 400))}">${esc(clean)}</span>`
           + `<span class="open"><button data-act="open" data-i="${i}" title="Open source">Open</button> <button data-act="copy" data-i="${i}" title="Copy finding">Copy</button></span></div>`
           + `<div class="prov">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div></div>`;
       }
@@ -2276,8 +3112,8 @@ function renderAnalyze(): void {
   }
   if (!html) html = '<span class="muted">no secret findings — enable “scan for exposed secrets” in Settings, then browse or Deep Scan</span>';
   else if (total > renderedSec.length) html += secShowAll
-    ? `<div class="muted small">showing ${renderedSec.length} of ${total} findings (Show-all on: full bounded list) — Copy findings exports up to 100</div>`
-    : `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports up to 100</div>`;
+    ? `<div class="muted small">showing ${renderedSec.length} of ${total} findings (Show-all on: full bounded list) — Copy findings exports this view</div>`
+    : `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports this view</div>`;
   box.innerHTML = html;
   const sc = document.getElementById('secCount');
   if (sc) sc.textContent = `${total} findings · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
@@ -2352,10 +3188,10 @@ async function copyAnaGroup(grp: string): Promise<void> {
 }
 
 async function copySecFindings(): Promise<void> {
-  if (!secFindings.length) { diag('nothing to copy — no secret findings'); return; }
-  const items = secFindings.slice(0, 100);
+  const items = renderedSec.length ? renderedSec : secFindings.slice(0, 100);
+  if (!items.length) { diag('nothing to copy — no secret findings'); return; }
   const parts = items.map((f) => `[${f.sev}] ${f.rule}${f.label && f.label !== f.rule ? ` (${f.label})` : ''}\n${f.text}\n— ${f.prov.resourceUrl} · route ${f.prov.route} · via ${f.prov.method}`);
-  await copyText(parts.join('\n\n'), `${items.length} secret findings`);
+  await copyText(parts.join('\n\n'), `${items.length} secret findings (current view)`);
 }
 
 function renderGraph(): void {
@@ -2541,12 +3377,71 @@ function wire(): void {
   // Preview dismissal FIRST + null-safe: closing must work even if a stale
   // panel.html is missing newer controls (wiring must never half-attach).
   on('viewerClose', 'click', closeViewer);
-  on('viewerX', 'click', closeViewer);
   on('viewer', 'click', (e) => { if ((e.target as HTMLElement).id === 'viewer') closeViewer(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeViewer(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hideActMenu(true); closeViewer(); } });
   on('viewerCopy', 'click', () => void copyText((document.getElementById('viewerBody') as HTMLElement)?.textContent ?? '', 'preview content'));
   on('viewerOpen', 'click', () => { if (viewerUrl) openUrl(viewerUrl); });
+  // Interception modals (null-safe like the viewer above).
+  on('replaySend', 'click', () => void sendReplay());
+  on('replayClose', 'click', () => { document.getElementById('replayModal')?.classList.add('hidden'); modalReturnFocus(); });
+  on('replayModal', 'click', (e) => { if ((e.target as HTMLElement).id === 'replayModal') { document.getElementById('replayModal')?.classList.add('hidden'); modalReturnFocus(); } });
+  document.querySelectorAll('[data-rptab]').forEach((b) => b.addEventListener('click', () => {
+    switchRpTab((b as HTMLElement).dataset.rptab ?? 'params');
+  }));
+  on('replayParamAdd', 'click', () => {
+    document.getElementById('replayParamsTable')?.insertAdjacentHTML('beforeend', rpKvRow('', '', true));
+  });
+  on('replayHeaderAdd', 'click', () => {
+    document.getElementById('replayHeadersTable')?.insertAdjacentHTML('beforeend', rpKvRow('', '', true));
+  });
+  on('replayModal', 'click', (e) => {
+    const t = (e.target as HTMLElement).closest?.('[data-rp="delrow"]') as HTMLElement | null;
+    t?.closest('.rp-kv')?.remove();
+  });
+  on('replayCopyResp', 'click', () => {
+    const pre = document.getElementById('replayResp');
+    const lines: string[] = [];
+    pre?.querySelectorAll('.tx').forEach((s) => lines.push(s.textContent ?? ''));
+    void copyText(lines.length ? lines.join('\n') : '', 'response body');
+  });
+  on('mockSave', 'click', saveMock);
+  on('mockClose', 'click', () => { document.getElementById('mockModal')?.classList.add('hidden'); modalReturnFocus(); });
+  on('mockModal', 'click', (e) => { if ((e.target as HTMLElement).id === 'mockModal') { document.getElementById('mockModal')?.classList.add('hidden'); modalReturnFocus(); } });
+  on('interceptList', 'click', interceptListClick);
+  on('actmenu', 'click', actMenuClick);
+  document.addEventListener('click', (e) => {
+    try {
+      const m = document.getElementById('actmenu');
+      if (!m || m.classList.contains('hidden')) return;
+      const t = e.target as HTMLElement;
+      if (m.contains(t)) return;
+      if (t.closest?.('[data-act="menu"]')) return; // the toggle handles it
+      hideActMenu();
+    } catch { /* ignore */ }
+  }, true);  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      hideActMenu(true);
+      closeViewer();
+      document.getElementById('replayModal')?.classList.add('hidden');
+      document.getElementById('mockModal')?.classList.add('hidden');
+      modalReturnFocus();
+    }
+    if (e.key === 'Tab') {
+      // Minimal focus trap: Tab cycles inside the open dialog, never behind it.
+      const open = [...document.querySelectorAll('.viewer')].find((m) => !(m as HTMLElement).classList.contains('hidden')) as HTMLElement | undefined;
+      if (!open) return;
+      const items = [...open.querySelectorAll('button, input, select, textarea, [tabindex]')]
+        .filter((el) => !(el as HTMLElement).hasAttribute('disabled') && (el as HTMLElement).tabIndex >= 0) as HTMLElement[];
+      if (!items.length) return;
+      const first = items[0]; const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  });
+  // A floating menu can't follow scrolled rows — dismiss it instead of stranding it.
+  document.addEventListener('scroll', () => hideActMenu(), true);
   document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => {
+    hideActMenu();
     document.querySelectorAll('#tabs button').forEach((x) => x.classList.remove('active'));
     document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
     b.classList.add('active');
@@ -2554,6 +3449,45 @@ function wire(): void {
   }));
   on('q', 'input', () => { clearTimeout(searchTimer); searchTimer = window.setTimeout(runSearch, 160); });
   on('btnSearch', 'click', runSearch);
+  on('topStatus', 'click', () => {
+    try { (document.querySelector('#tabs button[data-tab="settings"]') as HTMLElement | null)?.click(); } catch { /* ignore */ }
+  });
+  // Global fuzzy URL finder: one query filters Routes, Resources, Network, APIs.
+  on('urlFind', 'input', () => {
+    try { globalUrlQ = (document.getElementById('urlFind') as HTMLInputElement)?.value ?? ''; } catch { globalUrlQ = ''; }
+    renderRoutes(); renderResources(); renderNetwork(); renderApis();
+  });
+  on('urlFind', 'keydown', (e) => {
+    if ((e as KeyboardEvent).key !== 'Escape') return;
+    e.stopPropagation();
+    try { (document.getElementById('urlFind') as HTMLInputElement).value = ''; } catch { /* ignore */ }
+    globalUrlQ = '';
+    renderRoutes(); renderResources(); renderNetwork(); renderApis();
+  });
+  // Filter shortcut chips: click writes DSL into the tab's filter input.
+  document.querySelectorAll('[data-dsl-for]').forEach((b) => b.addEventListener('click', () => {
+    const input = document.getElementById((b as HTMLElement).dataset.dslFor ?? '') as HTMLInputElement | null;
+    if (!input) return;
+    const tok = (b as HTMLElement).dataset.dsl ?? '';
+    const cur = input.value.trim();
+    input.value = cur ? (cur.split(/\s+/).includes(tok) ? cur : `${cur} ${tok}`) : tok;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    try { input.focus(); } catch { /* ignore */ }
+  }));
+  document.querySelectorAll('[data-clear-for]').forEach((b) => b.addEventListener('click', () => {
+    const input = document.getElementById((b as HTMLElement).dataset.clearFor ?? '') as HTMLInputElement | null;
+    if (!input) return;
+    input.value = '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    try { input.focus(); } catch { /* ignore */ }
+  }));
+  // Per-table Wrap toggle: clipped one-liners by default, full wrapped URLs on demand.
+  document.querySelectorAll('[data-wrap-table]').forEach((b) => b.addEventListener('click', () => {
+    const table = document.getElementById((b as HTMLElement).dataset.wrapTable ?? '');
+    if (!table) return;
+    const on = table.classList.toggle('wrap-urls');
+    try { (b as HTMLElement).setAttribute('aria-pressed', String(on)); } catch { /* ignore */ }
+  }));
   on('mode', 'change', runSearch);
   // Click-to-open: event delegation for result "Open ↗" buttons + row click.
   on('results', 'click', (e) => {
@@ -2576,9 +3510,17 @@ function wire(): void {
   try { document.getElementById('netTable')?.querySelector('tbody')?.addEventListener('click', (e) => tableClick(e, 'net')); } catch { /* ignore */ }
   on('btnNetCopyUrls', 'click', () => void copyFilteredNetUrls());
   on('btnNetCopyAll', 'click', () => void copyFilteredNetAll());
+  on('btnNetHar', 'click', exportHar);
+  on('btnNetHarImport', 'click', () => document.getElementById('fileHarImport')?.click());
+  on('fileHarImport', 'change', (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    (e.target as HTMLInputElement).value = '';
+    if (f) void importHarFile(f);
+  });
   on('apiKind', 'change', (e) => { apiKind = (e.target as HTMLSelectElement).value; renderApis(); });
   on('apisBody', 'click', apiClick);
   on('btnApisCopyAll', 'click', () => void copyFilteredApiUrls());
+  on('btnApisOpenApi', 'click', exportOpenApi);
   on('btnDiscoverRoutes', 'click', () => void discoverRoutesNow());
   on('routeFilter', 'input', () => renderRoutes());
   on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
@@ -2595,6 +3537,7 @@ function wire(): void {
   on('homeStorageCustom', 'change', (e) => applyStorageMB(Number((e.target as HTMLInputElement).value), 'custom'));
   on('btnTheme', 'click', () => {
     settings.theme = settings.theme === 'light' ? 'dark' : 'light';
+    (settings as { themeExplicit?: boolean }).themeExplicit = true;
     applyTheme();
   });
   on('btnPause', 'click', () => { paused = !paused; syncPause(); });
@@ -2609,17 +3552,25 @@ function wire(): void {
     diag('memory cleanup: raw bodies dropped, index preserved');
     enforceBudget('manual-cleanup'); scheduleRender();
   });
-  on('btnExport', 'click', exportSession);
+  on('btnExport', 'click', exportSession);  on('btnSaveSession', 'click', () => void saveSessionFile());
+  on('btnOpenSession', 'click', () => document.getElementById('fileOpenSession')?.click());
+  on('fileOpenSession', 'change', (e) => {
+    const f = (e.target as HTMLInputElement).files?.[0];
+    (e.target as HTMLInputElement).value = '';
+    if (f) void openSessionFile(f);
+  });
   const deep = (): void => { if (scanning) stopDeepScan(); else void startDeepScan(); };
   on('btnDeep', 'click', deep);
   on('btnDeep2', 'click', () => void startDeepScan());
   on('btnDeepStop', 'click', () => stopDeepScan());
-  on('btnGraphClear', 'click', () => { graph.clear(); renderGraph(); });
+  on('btnGraphClear', 'click', () => { if (!confirm('Clear the discovery graph? Nodes and edges cannot be restored.')) return; graph.clear(); renderGraph(); });
   on('btnGrant', 'click', grantSite);
   on('btnDebugger', 'click', enableDebugger);
 }
 
 function clearSession(): void {
+  hideActMenu();
+  if (!confirm('Clear the current session? All captured data leaves RAM and cannot be undone. Export first if anything matters.')) return;
   sendCdpStop('clear');
   stopDeepScan('clear');
   // Session rotation: drop the old temp-disk session, mint a new id, bump gen
@@ -2649,6 +3600,8 @@ function clearSession(): void {
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0;
   lastResults = []; lastResultsById.clear();
   resType = 'ALL'; netMethod = 'ALL'; netKind = 'ALL';
+  globalUrlQ = '';
+  try { (document.getElementById('urlFind') as HTMLInputElement | null)!.value = ''; } catch { /* ignore */ }
   resTypeSig = ''; netMethodSig = ''; netKindSig = '';
   apiKind = 'ALL'; apiKindSig = ''; apiExpanded.clear(); apiDetHtml.clear();
   apiCollapsed.clear(); apiTouched.clear();
@@ -2682,7 +3635,7 @@ async function reindex(): Promise<void> {
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.6.3', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope 1.7.0', exportedAt: new Date().toISOString(), origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],
@@ -2699,6 +3652,135 @@ function exportSession(): void {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   diag('session exported (explicit user request)');
+}
+
+// ---------- saved sessions (.dsz) — explicit Save/Open only, RAM stays default
+/**
+ * Gzip a string with the platform codec. No dependency; available in all
+ * Chromium extension contexts. Throws when unavailable — caller diags.
+ */
+async function gzipString(text: string): Promise<Uint8Array> {
+  const CS = (window as unknown as { CompressionStream?: new (f: string) => TransformStream }).CompressionStream;
+  if (!CS) throw new Error('gzip unavailable in this browser');
+  const stream = new Blob([text]).stream().pipeThrough(new CS('gzip'));
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+async function gunzipBytes(bytes: Uint8Array): Promise<string> {
+  const DS = (window as unknown as { DecompressionStream?: new (f: string) => TransformStream }).DecompressionStream;
+  if (!DS) throw new Error('gunzip unavailable in this browser');
+  const b = bytes.byteOffset || bytes.length !== bytes.buffer.byteLength
+    ? bytes.slice().buffer as ArrayBuffer
+    : bytes.buffer as ArrayBuffer;
+  const stream = new Blob([b]).stream().pipeThrough(new DS('gzip'));
+  return new Response(stream).text();
+}
+
+function dszName(ext: string): string {
+  const host = (sessionOrigin || 'session').replace(/[^a-z0-9]+/gi, '-');
+  const d = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  return `deepscope-${host}-${d}.${ext}`;
+}
+
+/** Save session → one .dsz file (gzipped JSON). Explicit click only. */
+async function saveSessionFile(): Promise<void> {
+  try {
+    const file = buildSessionFile({
+      origin: sessionOrigin,
+      routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
+      resources: [...resources.values()],
+      network: netEntries.slice(0, DSZ_MAX_ENTRIES),
+      bodies: Object.fromEntries(rawBodies),
+    });
+    const gz = await gzipString(JSON.stringify(file));
+    if (gz.length > 32_000_000) { diag('session too large to save (>32 MB gzipped) — clear or lower retention first'); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([gz.buffer as ArrayBuffer], { type: 'application/gzip' }));
+    a.download = dszName('dsz');
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    diag(`session saved (${file.counts.resources} resources, ${file.counts.requests} requests, ${file.counts.bodies} bodies)`);
+  } catch (e) {
+    diag(`save failed: ${String(e).slice(0, 140)}`);
+  }
+}
+
+/** Restore a validated session file into live state (re-ingest → re-index). */
+async function restoreSessionFile(file: SessionFile): Promise<void> {
+  clearSession();
+  try { sessionOrigin = file.origin || sessionOrigin; } catch { /* keep */ }
+  try { $('scopeLabel').textContent = `scope: ${sessionOrigin}`; } catch { /* ignore */ }
+  let restored = 0;
+  // Resources first (meta), oldest-last so unshiftNet-equivalent order holds.
+  for (const r of (file.resources ?? []).slice(0, DSZ_MAX_ENTRIES)) {
+    try {
+      const url = String((r as { url?: unknown }).url ?? '');
+      if (!url) continue;
+      resources.set(url, { ...(r as object), url } as ResourceMeta);
+      restored++;
+    } catch { /* skip one bad record */ }
+  }
+  ledger.resources = resources.size;
+  // Network: file order is newest-first (live slice) — re-add oldest-first.
+  const nets = (file.network ?? []).slice(0, DSZ_MAX_ENTRIES).reverse();
+  for (const n of nets) {
+    try {
+      const url = String((n as { url?: unknown }).url ?? '');
+      if (!url) continue;
+      const e = { ...(n as object), url } as NetEntry;
+      unshiftNet(e);
+      ledger.requests++;
+      recordNetworkEvidence(e.method ?? 'GET', url, { status: e.status, mime: e.mime, workerKind: e.workerKind ?? 'unknown', route: e.route ?? sessionRoute });
+    } catch { /* skip one bad record */ }
+  }
+  // Routes.
+  for (const r of (file.routes ?? []).slice(0, DSZ_MAX_ENTRIES)) {
+    try {
+      const route = String((r as { route?: unknown }).route ?? '');
+      if (!route) continue;
+      const v = r as { method?: DiscoveryMethod; count?: number };
+      routes.set(route, { method: v.method ?? 'unknown', count: typeof v.count === 'number' ? v.count : 1 });
+    } catch { /* skip */ }
+  }
+  ledger.routes = routes.size;
+  // Bodies → full re-ingest pipeline (index + findings + budgets enforced).
+  const bodies = file.bodies && typeof file.bodies === 'object' ? file.bodies : {};
+  let reindexed = 0;
+  for (const [url, text] of Object.entries(bodies).slice(0, DSZ_MAX_BODIES)) {
+    try {
+      if (typeof text !== 'string' || !text) continue;
+      contentHash.delete(url); // allow ingest (fresh session, but be explicit)
+      const m = resources.get(url);
+      await ingestText(url, text, { kind: m?.kind, mime: m?.mime, route: m?.route ?? sessionRoute, method: m?.method ?? 'manual', status: m?.status });
+      reindexed++;
+    } catch { /* skip one bad body */ }
+  }
+  diag(`session opened: ${restored} resources, ${nets.length} requests, ${reindexed} bodies re-indexed`);
+  renderAll(); runSearch();
+}
+
+/** Open session ← .dsz (or plain JSON snapshot) via file picker. */
+async function openSessionFile(f: File): Promise<void> {
+  try {
+    if (f.size > 40_000_000) { diag('file too large (>40 MB) — refusing to open'); return; }
+    const raw = new Uint8Array(await f.arrayBuffer());
+    let text: string;
+    const isGzip = raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b;
+    try {
+      text = isGzip ? await gunzipBytes(raw) : new TextDecoder().decode(raw);
+    } catch {
+      diag('could not decode file — expected .dsz (gzipped) or JSON');
+      return;
+    }
+    let json: unknown;
+    try { json = JSON.parse(text); } catch { diag('file is not valid JSON'); return; }
+    const v = validateSessionFile(json);
+    if (!v.ok || !v.file) { diag(`not a session file: ${v.error}`); return; }
+    await restoreSessionFile(v.file);
+  } catch (e) {
+    diag(`open failed: ${String(e).slice(0, 140)}`);
+  }
 }
 
 /** Inline status line in the Permissions card — feedback where the user is looking. */
@@ -2740,6 +3822,7 @@ async function grantSite(): Promise<void> {
           runAt: 'document_idle', allFrames: true, persistAcrossSessions: false,
         }]);
         permStatus(`Site access granted for ${sessionOrigin} — observer registered.`);
+        await ensureInterceptRegistered();
       } catch (e) { diag(`content-script registration: ${String(e).slice(0, 140)}`); }
     }
   } catch (e) {
@@ -2803,6 +3886,10 @@ async function boot(): Promise<void> {
         deepScan: { ...settings.deepScan, ...(saved.deepScan ?? {}) },
         capture: { ...settings.capture, ...(saved.capture ?? {}) },
       };
+      // UI revamp migration: the calm light theme is the new default. Anyone
+      // who never explicitly picked a theme gets light once; an explicit
+      // toggle choice (recorded below) is always respected afterwards.
+      if (!(saved as { themeExplicit?: boolean }).themeExplicit) settings.theme = 'light';
       buildSettings(); ledger.setBudget(settings.budgetMB);
       try { store.setLimit(settings.storageMB * 1024 * 1024); } catch { /* ignore */ }
     }
@@ -2815,9 +3902,15 @@ async function boot(): Promise<void> {
   });
   syncDeepCapBtn();
   void syncGrantBtn();
+  // Interception: restore session rules + register the page-world interceptor
+  // when site access was already granted (persistAcrossSessions is false, so
+  // every DevTools open re-registers — cheap and idempotent).
+  await loadInterceptRules();
+  await ensureInterceptRegistered();
   renderAll(); runSearch();
   applyTheme();
   updateDeepStatus();
 }
 
 void boot();
+

@@ -9,3 +9,9 @@ release/
 .DS_Store
 Thumbs.db
 *.log
+# Local screenshots (never committed).
+Screenshot *.png
+# Design-skill working state (local cache, snapshots, decision mocks).
+.agents/
+.impeccable/
+skills-lock.json

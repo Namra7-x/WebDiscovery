@@ -9,7 +9,8 @@ export type DiscoveryMethod =
   | 'devtools-network' | 'webrequest' | 'dom-link' | 'dom-script' | 'dom-form'
   | 'router' | 'history-api' | 'js-string' | 'dynamic-import' | 'static-import'
   | 'fetch-target' | 'css-reference' | 'css-import' | 'sourcemap-ref'
-  | 'manifest-ref' | 'iframe' | 'sitemap' | 'deep-scan' | 'manual' | 'unknown';
+  | 'manifest-ref' | 'iframe' | 'sitemap' | 'deep-scan' | 'manual' | 'unknown'
+  | 'cdp-body'; // response body pulled via Deep Capture (Network.getResponseBody)
 
 export interface Provenance {
   resourceUrl: string;
@@ -171,7 +172,7 @@ export interface SessionSettings {
 
 export const DEFAULT_SETTINGS: SessionSettings = {
   budgetMB: 64,
-  theme: 'dark',
+  theme: 'light',
   maxResponseBytes: 2_000_000,
   maxIndexedChars: 400_000,
   maxResources: 3000,
