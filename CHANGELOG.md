@@ -2,6 +2,10 @@
 
 All notable changes to DeepScope. Dates are release dates (UTC).
 
+## [3.8.1] — 2026-09-27
+
+- Fixed the APIs tab staying empty while other tabs filled: no capture path ever scheduled the APIs section for re-render (only full renders did), so the tab kept its initial empty state while on-demand export worked. All 15 data-arrival sites now schedule it.
+
 ## [3.8.0] — 2026-09-27
 
 - Global fuzzy URL finder in the topbar: one query filters Routes, Resources, Network, and APIs together (substring fast path, trigram-fuzzy fallback). Composes with per-tab filters; Esc clears.

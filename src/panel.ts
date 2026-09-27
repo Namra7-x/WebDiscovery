@@ -431,7 +431,7 @@ async function ingestText(
   }
 
   // Follow-up discovery: imports / fetch targets / links (bounded, same-origin default)
-  scheduleRender('resources'); scheduleRender('graph'); scheduleRender('overview'); scheduleRender('routes');
+  scheduleRender('resources'); scheduleRender('graph'); scheduleRender('overview'); scheduleRender('routes'); scheduleRender('apis');
 }
 
 function commitUnits(
@@ -479,7 +479,7 @@ function commitUnits(
     // raw was never stored in non-retain mode; account only transiently
   }
   enforceBudget('index-commit');
-  scheduleRender('resources'); scheduleRender('graph'); scheduleRender('overview'); scheduleRender('routes');
+  scheduleRender('resources'); scheduleRender('graph'); scheduleRender('overview'); scheduleRender('routes'); scheduleRender('apis');
 }
 
 function upsertResource(url: string, m: ResourceMeta): void {
@@ -727,7 +727,7 @@ function handleCdp(ev: CdpNetEvent): void {
       ledger.requests++;
       recordNetworkEvidence(method, ev.url, { workerKind: wk, route: e.route });
     }
-    scheduleRender('network'); scheduleRender('overview');
+    scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
     return;
   }
   if (ev.ev === 'ws-frame') {
@@ -755,7 +755,7 @@ function handleCdp(ev: CdpNetEvent): void {
         diagOnce('ws-cap', 'WebSocket frame cap reached (32 KB/url or budget) — further frames metadata-only', ev.url);
       }
     }
-    scheduleRender('network'); scheduleRender('overview');
+    scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
     return;
   }
   const e = findCdpEntry(ev.reqId, ev.url, ev.method);
@@ -772,7 +772,7 @@ function handleCdp(ev: CdpNetEvent): void {
     unshiftNet(ne);
     ledger.requests++;
     recordNetworkEvidence(method, ev.url, { status: ev.status, mime: ev.mime, workerKind: wk, route: ne.route });
-    scheduleRender('network'); scheduleRender('overview');
+    scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
     return;
   }
   if (ev.ev === 'redirect' && ev.redirectUrl) {
@@ -788,7 +788,7 @@ function handleCdp(ev: CdpNetEvent): void {
     if (ev.ev === 'fail' && !e.note) e.note = 'request failed';
     recordNetworkStatus(e.method, e.url, ev.status);
   }
-  scheduleRender('network'); scheduleRender('overview');
+  scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
 }
 
 /**
@@ -812,7 +812,7 @@ async function handleCdpBody(reqId: string, url: string, mime: string, text: str
     initiator: e.initiator, status: e.status,
     detail: truncated ? 'deep-capture body (truncated)' : 'deep-capture body',
   });
-  scheduleRender('network'); scheduleRender('overview');
+  scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
 }
 
 function handleCdpTargets(targets: CdpTargetInfo[]): void {
@@ -1116,7 +1116,7 @@ function connectBackground(): void {
           if (!sessionOrigin) { sessionOrigin = u.origin; $('scopeLabel').textContent = `scope: ${sessionOrigin}`; }
           sessionRoute = u.pathname + u.search;
           touchRoute(sessionRoute, msg.kind === 'spa' ? 'history-api' : 'unknown');
-          scheduleRender('routes'); scheduleRender('overview');
+          scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis');
         } catch { /* ignore */ }
       } else if (msg.type === 'req-meta' && msg.url) {
         reqMetaByUrl.set(String(msg.url), { method: String(msg.method ?? 'GET'), initiator: (msg.initiator as string) ?? undefined });
@@ -1204,7 +1204,7 @@ async function handleContentBatch(b: ContentBatch): Promise<void> {
     try { considerDiscoveredUrl(b.url || sessionOrigin || '', String(r.url), sessionRoute, 'fetch-target'); } catch { /* ignore */ }
   }
   ledger.records = index.size; ledger.indexedChars = index.indexedChars; ledger.indexBytes = Math.round(index.indexBytes);
-  scheduleRender('routes'); scheduleRender('overview'); scheduleRender('graph');
+  scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis'); scheduleRender('graph');
 }
 
 async function fetchViaPage(url: string, route: string, method: DiscoveryMethod, opts: { gen?: number; signal?: AbortSignal } = {}): Promise<void> {
@@ -1255,17 +1255,17 @@ function hookDevtoolsNetwork(): void {
             unshiftNet(entry);
             ledger.requests++;
             recordNetworkEvidence(entry.method, url, { status, mime, workerKind: 'unknown', route: entry.route });
-            scheduleRender('network'); scheduleRender('overview');
+            scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
           }
           return;
         }
       }
       req.getContent((content, encoding) => {
         if (paused) return;
-        if (content == null) { diag('empty body (browser did not expose content)', url); unshiftNet(entry); scheduleRender('network'); scheduleRender('overview'); return; }
+        if (content == null) { diag('empty body (browser did not expose content)', url); unshiftNet(entry); scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview'); return; }
         let text = content;
         if (encoding === 'base64') {
-          try { text = atob(content).slice(0, settings.maxResponseBytes); } catch { diag('base64 body undecodable; kept metadata only', url); unshiftNet(entry); scheduleRender('network'); scheduleRender('overview'); return; }
+          try { text = atob(content).slice(0, settings.maxResponseBytes); } catch { diag('base64 body undecodable; kept metadata only', url); unshiftNet(entry); scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview'); return; }
         }
         const binKind = isBinaryKind(kindFor(url, mime));
         entry.bodyKept = settings.retainRaw;
@@ -1290,7 +1290,7 @@ function hookDevtoolsNetwork(): void {
           unshiftNet(he);
           recordNetworkEvidence(he.method, url, { status: he.status, mime: he.mime ?? undefined, workerKind: 'unknown', route: he.route });
         }
-        scheduleRender('network'); scheduleRender('overview');
+        scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
       } catch { /* ignore */ }
     });
   } catch { diag('devtools.network unavailable in this context'); }
@@ -1353,7 +1353,7 @@ async function startDeepScan(): Promise<void> {
   } catch { /* content helper absent; link parsing still works */ }
   for (const r of seeds) scanQueue.push({ route: r, depth: 0 });
   for (const r of seeds) touchRoute(r, 'router'); // Routes tab fills immediately
-  scheduleRender('routes'); scheduleRender('overview');
+  scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis');
   $('btnDeep').textContent = 'Stop Scan';
   ($('btnDeep2') as HTMLButtonElement).disabled = true;
   diag(`deep scan started: origin ${sessionOrigin}, depth≤${settings.deepScan.maxDepth}, pages≤${settings.deepScan.maxPages}`);
@@ -3358,7 +3358,7 @@ async function discoverRoutesNow(): Promise<void> {
   } catch {
     status.textContent = 'route discovery failed — reload the inspected page and retry';
   }
-  scheduleRender('routes'); scheduleRender('overview');
+  scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis');
 }
 
 function applyTheme(): void {
