@@ -157,7 +157,10 @@ export async function executeReplay(req: ReplayRequest): Promise<ReplayResponse>
       headers: resHeaders, bodyText, truncated, ms,
     };
   } catch (e) {
-    const m = e instanceof Error && e.name === 'AbortError' ? 'timed out after 30s' : String(e).slice(0, 200);
-    return errRes(id, `replay failed: ${m}`);
+    const raw = e instanceof Error && e.name === 'AbortError' ? 'timed out after 30s' : String(e).slice(0, 200);
+    const hint = /failed to fetch/i.test(raw)
+      ? ' — the browser blocked the request: grant site access for this origin (Settings → Grant site access, reload, Send again), or check for an invalid certificate / VPN / offline host'
+      : '';
+    return errRes(id, `replay failed: ${raw}${hint}`);
   }
 }

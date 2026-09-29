@@ -2,6 +2,10 @@
 
 All notable changes to DeepScope. Dates are release dates (UTC).
 
+## [3.8.2] — 2026-09-27
+
+- Fixed universal replay failure (`TypeError: Failed to fetch`): the background fetch is CORS-unblocked only for granted origins, but nothing asked. Send now requests the origin grant with the click gesture and explains a decline inline; residual network failures name the likely causes (grant, certificate, VPN, offline host).
+
 ## [3.8.1] — 2026-09-27
 
 - Fixed the APIs tab staying empty while other tabs filled: no capture path ever scheduled the APIs section for re-render (only full renders did), so the tab kept its initial empty state while on-demand export worked. All 15 data-arrival sites now schedule it.

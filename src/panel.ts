@@ -2194,6 +2194,22 @@ async function sendReplay(): Promise<void> {
   for (const [k, v] of readRpKv('replayHeadersTable')) headers[k] = v;
   const bodyText = (document.getElementById('replayBody') as HTMLTextAreaElement).value;
   if (!/^https?:/.test(url)) { meta.textContent = 'URL must start with http(s)://'; return; }
+  // Host permission preflight: the background fetch is CORS-unblocked only for
+  // granted origins. The Send click is a real user gesture, so request here.
+  try {
+    const origin = new URL(url).origin;
+    const perms = chrome.permissions;
+    if (perms && typeof perms.contains === 'function') {
+      const has = await perms.contains({ origins: [`${origin}/*`] });
+      if (!has && typeof perms.request === 'function') {
+        const granted = await perms.request({ origins: [`${origin}/*`] });
+        if (!granted) {
+          meta.innerHTML = `<span class="st-err">blocked</span> site access declined for ${esc(origin)} — replay needs it (or Settings → Grant site access, reload, Send again)`;
+          return;
+        }
+      }
+    }
+  } catch { /* permissions API unavailable — try the send anyway */ }
   meta.textContent = 'sending…';
   pre.innerHTML = '';
   const id = `rp${Date.now().toString(36)}`;
