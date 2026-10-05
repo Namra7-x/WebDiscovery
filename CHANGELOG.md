@@ -2,6 +2,26 @@
 
 All notable changes to DeepScope. Dates are release dates (UTC).
 
+## [3.10.0] — 2026-09-27
+
+- Source-map reconstruction: original sources behind `.map` files are unpacked and indexed whether the map arrives via `sourceMappingURL` comment or is captured directly (once-guarded, recursion-proof, capped). Search now matches original names, comments, and config keys; the Resources Map column shows rebuilt counts (`yes·N`). Search pipeline itself unchanged.
+- Verified: tsc clean, `verify.mjs` 46/46, manifest clean.
+
+## [3.9.1] — 2026-09-27
+
+- Analyze family filter: a Show dropdown (all findings / secrets / frameworks / security & headers) with live counts isolates each family; copy actions follow the visible view.
+
+## [3.9.0] — 2026-09-27
+
+- Framework fingerprinting: detects Next.js (incl. RSC/Flight + Server Actions), WordPress, Django, Rails, Laravel, Nuxt, SvelteKit, Astro, Firebase, Supabase, Stripe.js and more, with conditional CVE guidance (e.g. Next.js Flight RCE) that never asserts an unseen version.
+- Security hygiene audit: missing/weak CSP, clickjacking, HSTS, open CORS with credentials, cookie flags, and info-disclosing headers.
+- Fewer false-positive secrets: high-entropy fallback requires length, entropy, and mixed character classes; generic assignments reject short hex IDs; wider placeholder vocabulary. Real keys still fire.
+- Verified: tsc clean, `verify.mjs` 45/45, manifest clean.
+
+## [3.8.3] — 2026-09-27
+
+- Routes rows carry the full action set (Open, View, inline Replay, overflow menu with Mock/Block/Copy/cURL). Replay prefills any discovered URL as a GET when no captured exchange exists.
+
 ## [3.8.2] — 2026-09-27
 
 - Fixed universal replay failure (`TypeError: Failed to fetch`): the background fetch is CORS-unblocked only for granted origins, but nothing asked. Send now requests the origin grant with the click gesture and explains a decline inline; residual network failures name the likely causes (grant, certificate, VPN, offline host).

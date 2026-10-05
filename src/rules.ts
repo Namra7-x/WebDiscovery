@@ -70,12 +70,13 @@ export const SECRET_RULES: SecretRule[] = [
   { id: 'private_secret_token', label: 'Private/secret token assignment', severity: 'high', pattern: /\b(?:private_token|secret_token)\s*[:=]\s*['"]?[A-Za-z0-9\-_]{16,}['"]?/i },
   { id: 'x_api_key', label: 'X-API-Key header value', severity: 'medium', pattern: /\bx-api-key\s*[:=]\s*['"]?[A-Za-z0-9\-_]{16,}['"]?/i },
   { id: 'npm_auth_token', label: 'npm auth token', severity: 'high', pattern: /\b_authToken\s*[:=]\s*['"]?[A-Za-z0-9\-_]{16,}['"]?/ },
-  { id: 'generic_secret_assignment', label: 'Generic credential assignment', severity: 'medium', pattern: /\b(api[_-]?key|api[_-]?secret|secret[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token)\s*[:=]\s*["']?([^"'`\s]{8,128})/i },
+  { id: 'generic_secret_assignment', label: 'Generic credential assignment', severity: 'medium', pattern: /\b(api[_-]?key|api[_-]?secret|secret[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token)\s*[:=]\s*["']?((?![0-9a-fA-F]{12,24}(?:[^A-Za-z0-9]|$))[^"'`\s]{12,128})/i },
 ];
 
 const PLACEHOLDER_WORDS: ReadonlySet<string> = new Set([
   'example', 'test', 'testing', 'tests', 'demo', 'sample', 'placeholder',
-  'fake', 'dummy', 'mock', 'changeme', 'yourkey', 'insert', 'todo', 'xxx', 'xxxx',
+  'fake', 'dummy', 'mock', 'changeme', 'yourkey', 'your', 'here', 'null',
+  'undefined', 'none', 'empty', 'insert', 'todo', 'xxx', 'xxxx',
 ]);
 
 /**
@@ -116,6 +117,12 @@ export function scanTextForSecrets(text: string, maxHits = 3): SecretHit[] {
     if (!m) continue;
     const full = m[0];
     if (!full || isPlaceholder(full)) continue;
+    if (r.id === 'generic_secret_assignment' && m[2]) {
+      // Defense-in-depth for the pure-hex ≤24 rejection (commit hashes,
+      // color codes, short IDs): strip trailing punctuation then test.
+      const v = m[2].replace(/[^A-Za-z0-9]+$/, '');
+      if (/^[0-9a-fA-F]{12,24}$/.test(v)) continue;
+    }
     out.push({ rule: r.id, sev: r.severity, label: r.label });
     if (r.id === 'jwt' && out.length < maxHits) {
       if (decodeJwtAlg(full) === 'none') {
@@ -124,7 +131,7 @@ export function scanTextForSecrets(text: string, maxHits = 3): SecretHit[] {
     }
     if (out.length >= maxHits) break;
   }
-  if (out.length === 0 && out.length < maxHits && /^[A-Za-z0-9\-_+/=]{24,96}$/.test(text) && shannon(text) >= 4.7) {
+  if (out.length === 0 && out.length < maxHits && /^[A-Za-z0-9\-_+/=]{32,96}$/.test(text) && shannon(text) >= 4.8 && [/[A-Z]/, /[a-z]/, /[0-9]/, /[-_+/=]/].filter((re) => re.test(text)).length >= 3) {
     out.push({ rule: 'high_entropy_string', sev: 'medium', label: 'High-entropy string (possible secret)' });
   }
   return out;

@@ -28,6 +28,7 @@ import { isSubdomainOf } from './types.js';
 import type { WorkerKind } from './types.js';
 import type { ApiKind } from './exposure.js';
 import type { SearchResult, Severity, TextRecord } from './types.js';
+import { parseSourceMap, resolveSourceUrl } from './sourcemap.js';
 import {
   DEFAULT_SETTINGS, defaultScope,
   type DiscoveryMethod, type NetEntry, type ResourceKind, type ResourceMeta,
@@ -205,6 +206,10 @@ type IndexProv = { method: DiscoveryMethod; initiator?: string; parentUrl?: stri
 interface QueuedIndex { url: string; route: string; kind: ResourceKind; mime: string; prov: IndexProv; text: string; gen: number }
 const workerQueue: QueuedIndex[] = [];
 let smInflight = 0;
+/** Source-map rebuild counts (mapUrl → original sources indexed) for the Map column. */
+const smOriginals = new Map<string, number>();
+/** Per-map once-guard for direct-map reconstruction (ingestText hook). */
+const smRebuilt = new Set<string>();
 let deepActive = 0;
 const deepControllers = new Set<AbortController>();
 type RenderSection = 'network' | 'resources' | 'routes' | 'graph' | 'analyze' | 'apis' | 'overview';
@@ -422,6 +427,40 @@ async function ingestText(
     }
   }
 
+  // Directly-captured map bodies (devtools/CDP/deep-fetch landed the .map
+  // itself): rebuild original sources inline, same shape as fetchSourceMap.
+  if (settings.analyzeSourceMaps && (kind === 'source-map' || /\.map(\?|$)/i.test(url))) {
+    // Recursion guard: rebuilt originals keep kind 'source-map' but live at
+    // `mapUrl#srcPath` (always containing '#'). Only rebuild when the URL
+    // itself ends in `.map` before any '#' fragment, so originals never
+    // retrigger even though their kind matches.
+    const hashAt = url.indexOf('#');
+    const mapBase = hashAt >= 0 ? url.slice(0, hashAt) : url;
+    if (hashAt === -1 && (kind === 'source-map' || /\.map(\?|$)/i.test(mapBase)) && !smRebuilt.has(url)) {
+      let direct: { files: Array<{ path: string; content: string }> } | null = null;
+      try { direct = parseSourceMap(capped); } catch { direct = null; }
+      const directFiles = direct?.files ?? [];
+      if (directFiles.length) {
+        smRebuilt.add(url);
+        let rn = 0;
+        for (const f of directFiles) {
+          if (rn >= 400) break;
+          const srcName = f.path;
+          const content = f.content;
+          if (typeof content !== 'string' || content.length <= 10) continue;
+          void resolveSourceUrl(url, srcName);
+          await ingestText(`${url}#${srcName}`, content.slice(0, 200000), {
+            kind: 'source-map', mime: 'x-sourcemap', route, method: 'sourcemap-ref',
+            parentUrl: url, detail: `original source ${srcName} (compiled: ${shortLabel(url)})`,
+          });
+          rn++;
+        }
+        smOriginals.set(url, rn);
+        diag(`source map: ${rn} original sources indexed from ${shortLabel(url)}`);
+      }
+    }
+  }
+
   // Extract units in worker (in-flight cap 4, FIFO queue) or inline fallback
   const prov = { method: capKey, initiator: opts.initiator, parentUrl: opts.parentUrl, detail: opts.detail, jsonPath: opts.jsonPath };
   if (worker) {
@@ -527,29 +566,37 @@ function considerDiscoveredUrl(from: string, raw: string, route: string, kind: s
 }
 
 async function fetchSourceMap(minUrl: string, smUrl: string, route: string, gen?: number): Promise<void> {
+  if (!settings.analyzeSourceMaps) return;
   const g = gen ?? sessionGen;
   try {
     const text = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(smUrl)},{credentials:'same-origin'});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,3000000);}catch(e){return '__ERR__:'+String(e)}})()`, g);
     if (g !== sessionGen) return;
     if (!text || text.startsWith('__ERR__')) { diag(`source map unavailable (${text?.slice(0, 80) ?? 'fetch failed'}). Cross-origin maps need site access grant.`, smUrl); return; }
-    let map: { sources?: string[]; sourcesContent?: Array<string | null> };
-    try { map = JSON.parse(text); } catch { diag('source map malformed JSON', smUrl); return; }
-    const sources = map.sources ?? [];
-    const contents = map.sourcesContent ?? [];
-    let n = 0;
-    for (let i = 0; i < sources.length && n < 400; i++) {
-      const srcName = sources[i];
-      const content = contents[i];
-      if (typeof content === 'string' && content.length > 10) {
-        await ingestText(`${smUrl}#${srcName}`, content.slice(0, 200000), {
-          kind: 'source-map', mime: 'x-sourcemap', route, method: 'sourcemap-ref',
-          parentUrl: minUrl, detail: `original source ${srcName} (compiled: ${shortLabel(minUrl)})`,
-        });
-        n++;
-      } else {
-        if (index.add(srcName, { resourceUrl: smUrl, resourceKind: 'source-map', route, method: 'sourcemap-ref', parentUrl: minUrl, detail: `original path (compiled: ${shortLabel(minUrl)})` }) !== null) n++;
-      }
+    const parsed = parseSourceMap(text);
+    const files = parsed?.files ?? [];
+    if (!files.length) {
+      try { JSON.parse(text); } catch { diag('source map malformed JSON', smUrl); return; }
+      smOriginals.set(smUrl, 0);
+      diag(`source map: 0 original sources indexed from ${shortLabel(smUrl)}`);
+      return;
     }
+    let n = 0;
+    for (const f of files) {
+      if (g !== sessionGen) return;
+      if (n >= 400) break;
+      const srcName = f.path;
+      const content = f.content;
+      if (typeof content !== 'string' || content.length <= 10) continue;
+      // Normalized reference (absolute / webpack:// passthrough); the ingest
+      // URL stays `smUrl#srcName` so rebuilt originals never retrigger hooks.
+      void resolveSourceUrl(smUrl, srcName);
+      await ingestText(`${smUrl}#${srcName}`, content.slice(0, 200000), {
+        kind: 'source-map', mime: 'x-sourcemap', route, method: 'sourcemap-ref',
+        parentUrl: minUrl, detail: `original source ${srcName} (compiled: ${shortLabel(minUrl)})`,
+      });
+      n++;
+    }
+    smOriginals.set(smUrl, n);
     diag(`source map: ${n} original sources indexed from ${shortLabel(smUrl)}`);
   } catch (e) { if (!isStale(e)) diag(`source map fetch failed: ${String(e).slice(0, 120)}`, smUrl); }
 }
@@ -1771,8 +1818,7 @@ function renderRoutes(): void {
       return `<tr><td class="rt"><a href="#" data-act="open" data-url="${esc(full)}" title="${esc(full)}">${esc(full)}</a></td>`
         + `<td class="num" title="Times seen this session">×${seen}</td>`
         + `<td><span class="badge kind">${esc(via)}</span></td>`
-        + `<td class="acts"><button data-act="open" data-url="${esc(full)}" title="Open ${esc(full)}">Open</button>`
-        + `<button data-act="copy" data-url="${esc(full)}" title="Copy URL">Copy</button></td></tr>`;
+        + rowActsHtml(full, true) + `</tr>`;
     } catch { return ''; }
   }).join('') || '<tr><td colspan="4" class="muted">no routes yet — browse the page or run Deep Scan</td></tr>';
   const rc = document.getElementById('routeCount');
@@ -1848,7 +1894,7 @@ function renderResources(): void {
       for (const r of g.items.slice(0, cap)) {
         out.push(`<tr data-g="${gh}"${gHide}><td class="url"><a href="#" data-act="open" data-url="${esc(r.url)}" title="${esc(r.url)}">${esc(shortLabel(r.url))}</a></td>`
             + `<td title="${esc(r.kind)}">${r.kind}</td><td>${r.status ?? '—'}</td><td>${r.size != null ? formatBytes(r.size) : '—'}</td>`
-            + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td>${r.hasSourceMap ? 'yes' : '—'}</td>`
+            + `<td title="${esc(r.route)}">${esc(r.route)}</td><td title="${esc(r.method)}">${esc(r.method)}</td><td title="${esc(r.sourceMapUrl ?? r.url)}">${smOriginals.has(r.sourceMapUrl ?? r.url) ? 'yes·' + String(smOriginals.get(r.sourceMapUrl ?? r.url)) : (r.hasSourceMap ? 'yes' : '—')}</td>`
             + `<td title="${esc(r.indexed ? String(r.indexedStrings) + (r.error ? ` — ${r.error}` : '') : '—')}">${r.indexed ? r.indexedStrings : '—'}${r.error ? `<br/><span class="muted">${esc(r.error)}</span>` : ''}</td>`
             + rowActsHtml(r.url) + `</tr>`);
       }
@@ -2075,8 +2121,8 @@ function openReplay(url: string): void {
   if (!n) {
     try { apiMethod = buildApiRows().find((r) => r.url === url)?.method ?? ''; } catch { apiMethod = ''; }
   }
-  if (!n && !apiMethod) { diag('Replay: request no longer in buffer', url); return; }
-  const method = n?.method ?? apiMethod;
+  if (!n && !apiMethod && !/^https?:/i.test(url)) { diag('Replay: request no longer in buffer', url); return; }
+  const method = n?.method ?? apiMethod ?? 'GET';
   (document.getElementById('replayMethod') as HTMLSelectElement).value = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(method) ? method : 'GET';
   (document.getElementById('replayUrl') as HTMLInputElement).value = url;
   renderRpParams(url);
@@ -2088,7 +2134,9 @@ function openReplay(url: string): void {
   switchRpTab('params');
   (document.getElementById('replayMeta') as HTMLElement).textContent = n
     ? 'edit, then Send'
-    : 'uncalled endpoint — prefilled from discovery (no captured exchange); edit, then Send';
+    : apiMethod
+      ? 'uncalled endpoint — prefilled from discovery (no captured exchange); edit, then Send'
+      : 'prefilled from route — set the method and body, then Send';
   (document.getElementById('replayResp') as HTMLElement).innerHTML = '<div class="rp-empty" style="padding:6px 8px">no response yet</div>';
   document.getElementById('replayModal')?.classList.remove('hidden');
   modalTakeFocus('replayMethod');
@@ -3074,6 +3122,32 @@ function apiClick(e: Event): void {
 }
 
 // ---------- analyze (secret findings) ----------
+/** Finding family for the Analyze Show filter (rule-prefix based). */
+function anaFamily(f: SecFinding): string {
+  try {
+    if (f.rule.startsWith('fw-')) return 'framework';
+    if (f.rule.startsWith('hyg-')) return 'hygiene';
+  } catch { /* fall through to secrets */ }
+  return 'secrets';
+}
+function anaFamilyLabel(k: string): string {
+  return k === 'framework' ? 'frameworks' : k === 'hygiene' ? 'security & headers' : k === 'secrets' ? 'secrets' : k;
+}
+let anaKind = 'ALL';
+/** Rebuild the Show dropdown with live counts; reset a selection that went empty. */
+function syncAnaKindOptions(): void {
+  const sel = document.getElementById('anaKind') as HTMLSelectElement | null;
+  if (!sel) return;
+  const counts = new Map<string, number>();
+  for (const f of secFindings) counts.set(anaFamily(f), (counts.get(anaFamily(f)) ?? 0) + 1);
+  const order = ['ALL', 'secrets', 'framework', 'hygiene'];
+  const labels: Record<string, string> = { ALL: 'all findings', secrets: 'secrets', framework: 'frameworks', hygiene: 'security & headers' };
+  sel.innerHTML = order.map((k) => {
+    const n = k === 'ALL' ? secFindings.length : (counts.get(k) ?? 0);
+    return `<option value="${k}"${anaKind === k ? ' selected' : ''}>${labels[k]} (${n})</option>`;
+  }).join('');
+  if (anaKind !== 'ALL' && (counts.get(anaKind) ?? 0) === 0) anaKind = 'ALL';
+}
 const SEC_BLURB: Record<Severity, string> = {
   critical: 'critical — likely live credentials or private keys; rotate immediately if exposed',
   high: 'high — sensitive tokens or session secrets; verify and revoke if leaked',
@@ -3085,15 +3159,17 @@ function renderAnalyze(): void {
   refreshExposures();
   const pill = document.getElementById('cAnalyze');
   if (pill) pill.textContent = String(secFindings.length);
+  syncAnaKindOptions();
   const box = document.getElementById('secList');
   if (!box) return;
-  const total = secFindings.length;
-  const cap = secShowAll ? Math.min(secFindings.length, 2000) : 150;
+  const view = anaKind === 'ALL' ? secFindings : secFindings.filter((f) => anaFamily(f) === anaKind);
+  const total = view.length;
+  const cap = secShowAll ? Math.min(view.length, 2000) : 150;
   renderedSec.length = 0;
   renderedAnaGroups.clear();
   let html = '';
   for (const sev of ['critical', 'high', 'medium', 'info'] as Severity[]) {
-    const items = secFindings.filter((f) => f.sev === sev);
+    const items = view.filter((f) => f.sev === sev);
     if (!items.length) continue;
     html += `<div><span class="badge sev-${sev}">${sev}</span> <span class="muted small">${esc(SEC_BLURB[sev])} (${items.length})</span></div>`;
     let subgroups: Array<{ host: string; items: SecFinding[] }> = [];
@@ -3126,13 +3202,15 @@ function renderAnalyze(): void {
     }
     if (renderedSec.length >= cap) break;
   }
-  if (!html) html = '<span class="muted">no secret findings — enable “scan for exposed secrets” in Settings, then browse or Deep Scan</span>';
+  if (!html) html = anaKind === 'ALL'
+    ? '<span class="muted">no secret findings — enable “scan for exposed secrets” in Settings, then browse or Deep Scan</span>'
+    : `<span class="muted">no ${anaFamilyLabel(anaKind)} findings in view — set Show to all findings</span>`;
   else if (total > renderedSec.length) html += secShowAll
     ? `<div class="muted small">showing ${renderedSec.length} of ${total} findings (Show-all on: full bounded list) — Copy findings exports this view</div>`
     : `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports this view</div>`;
   box.innerHTML = html;
   const sc = document.getElementById('secCount');
-  if (sc) sc.textContent = `${total} findings · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
+  if (sc) sc.textContent = `${total} findings${anaKind !== 'ALL' ? ` · ${anaFamilyLabel(anaKind)} only (of ${secFindings.length})` : ''} · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
   const ssb = document.getElementById('btnSecShowAll');
   if (ssb) ssb.textContent = secShowAll ? 'Show less' : 'Show all';
 }
@@ -3149,6 +3227,14 @@ function refreshExposures(): void {
       params: (() => {
         try { return index.records.filter((rec) => rec.prov.detail === 'param').slice(0, 500).map((rec) => rec.text); }
         catch { return [] as string[]; }
+      })(),
+      resHeaders: (() => {
+        try { return netEntries.slice(0, 500).map((n) => ({ url: n.url, mime: n.mime ?? '', headers: n.resHeaders ?? {} })); }
+        catch { return []; }
+      })(),
+      reqHeaders: (() => {
+        try { return netEntries.slice(0, 500).map((n) => ({ url: n.url, headers: n.reqHeaders ?? {} })); }
+        catch { return []; }
       })(),
     };
     const findings = findExposures(input);
@@ -3544,6 +3630,10 @@ function wire(): void {
   on('routeBody', 'click', (e) => tableClick(e, 'route'));
   on('btnSecCopy', 'click', () => void copySecFindings());
   on('btnSecShowAll', 'click', () => { secShowAll = !secShowAll; renderAnalyze(); });
+  on('anaKind', 'change', () => {
+    try { anaKind = (document.getElementById('anaKind') as HTMLSelectElement).value; } catch { anaKind = 'ALL'; }
+    renderAnalyze();
+  });
   on('secList', 'click', secClick);
   on('homeStorageSel', 'change', (e) => {
     const v = (e.target as HTMLSelectElement).value;
@@ -3611,8 +3701,9 @@ function clearSession(): void {
   void syncHookFlag();
   index.clear(); graph.clear(); resources.clear(); rawBodies.clear(); rawOrder.length = 0;
   contentHash.clear(); netEntries.length = 0; routes.clear(); diags.length = 0;
+  smOriginals.clear(); smRebuilt.clear();
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
-  secShowAll = false; routeShowAll = false;
+  secShowAll = false; routeShowAll = false; anaKind = 'ALL';
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0;
   lastResults = []; lastResultsById.clear();
   resType = 'ALL'; netMethod = 'ALL'; netKind = 'ALL';

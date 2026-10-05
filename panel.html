@@ -84,7 +84,7 @@
     </section>
     <section id="tab-routes" class="tab" role="tabpanel" aria-labelledby="h-routes">
       <h2 id="h-routes">Routes</h2>
-      <p class="muted small">Every route seen on this origin. <b>Seen ×N</b> = times observed this session. Filter the list, then Open a route or Copy URLs to export.</p>
+      <p class="muted small">Every route seen on this origin. <b>Seen ×N</b> = times observed this session. Filter the list, then Open, View, or Replay a route — or Copy URLs to export.</p>
       <div class="row"><button id="btnDiscoverRoutes" title="Collect same-origin links from the current page right now">Discover page links</button><span id="routeStatus" class="muted small" role="status" aria-live="polite"></span></div>
       <div class="row"><label for="routeFilter">Filter routes</label><input id="routeFilter" type="text" placeholder="filter routes — try seen:>5" aria-describedby="dslHintRoutes" title="Filter DSL: method:GET seen:>5 route:/api/* (plain text still works)" /><button id="btnRoutesCopy" title="Copy filtered full URLs (up to 1000 lines)">Copy URLs</button><button id="btnRoutesShowAll" title="Lift the 300-row render cap" aria-expanded="false">Show all</button><button data-wrap-table="routeTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button><span id="routeCount" class="muted small" role="status" aria-live="polite"></span></div>
       <div class="row chips-row"><span class="chips" role="group" aria-label="Route filter shortcuts"><button data-dsl-for="routeFilter" data-dsl="seen:>5" title="Only routes seen more than 5 times">seen:>5</button><button data-dsl-for="routeFilter" data-dsl="route:/api/*" title="Only routes under /api/">route:/api/*</button><button data-clear-for="routeFilter" title="Clear the filter">Clear</button></span><span id="dslHintRoutes" class="muted small">Shortcuts write filter text for you — plain text works too.</span></div>
@@ -130,7 +130,7 @@
     <section id="tab-analyze" class="tab" role="tabpanel" aria-labelledby="h-analyze">
       <h2 id="h-analyze">Analyze</h2>
       <p class="muted small">Possible secrets found in captured text, grouped by severity — critical means likely live credentials, high sensitive tokens, medium review-worthy, info low-risk context. All analysis stays local in this panel's RAM.</p>
-      <div class="row"><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><button id="btnSecShowAll" title="Lift the 150-row render cap" aria-expanded="false">Show all</button><span id="secCount" class="muted small" role="status" aria-live="polite"></span></div>
+      <div class="row"><label for="anaKind">Show</label><select id="anaKind" title="Filter findings by family"><option value="ALL">all findings</option></select><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><button id="btnSecShowAll" title="Lift the 150-row render cap" aria-expanded="false">Show all</button><span id="secCount" class="muted small" role="status" aria-live="polite"></span></div>
       <div id="secList" class="results"></div>
     </section>
     <section id="tab-apis" class="tab" role="tabpanel" aria-labelledby="h-apis">

@@ -9,6 +9,9 @@ import { searchIndex, displayNameFor } from '../dist/search.js';
 import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody, isBinaryText } from '../dist/tables.js';
 import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon } from '../dist/rules.js';
 import { classifyApiKind, findExposures } from '../dist/exposure.js';
+import { findFrameworkFindings } from '../dist/framework.js';
+import { findHygieneFindings } from '../dist/hygiene.js';
+import { parseSourceMap, resolveSourceUrl } from '../dist/sourcemap.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { CaptureStore } from '../dist/store.js';
 import { sanitizeReplayHeaders, truncateReplayBody, matchInterceptRule } from '../dist/replay.js';
@@ -561,6 +564,65 @@ ok('binary body guard', () => {
   assert.equal(isBinaryText(gzipLike), true);
   assert.ok(snippetBody(gzipLike).includes('binary'));
   assert.equal(snippetBody('hello'), 'hello');
+});
+
+// 41. v3.9.0: framework fingerprint (conditional CVEs, never invented versions).
+ok('framework fingerprint', () => {
+  const f = findFrameworkFindings({
+    routes: [{ route: '/_next/static/chunks/app.js', method: 'script', count: 3 }],
+    resources: [{ url: 'https://x.com/_next/static/a.js', kind: 'script', hasSourceMap: false }],
+    urls: ['https://x.com/_next/static/a.js', 'https://x.com/wp-json/wp/v2/posts'],
+    params: [],
+    reqHeaders: [{ url: 'https://x.com/', headers: { 'next-action': 'abc' } }],
+    resHeaders: [{ url: 'https://x.com/', mime: 'text/x-component', headers: {} }],
+  });
+  const rules = new Set(f.map((x) => x.rule));
+  assert.ok(rules.has('fw-nextjs'), [...rules].join(','));
+  assert.ok(rules.has('fw-wordpress'), [...rules].join(','));
+  assert.ok(rules.has('fw-cve-next-flight'), [...rules].join(','));
+  assert.ok(f.length <= 60, `cap len=${f.length}`);
+});
+
+// 42. v3.9.0: security headers + cookie audit.
+ok('hygiene audit', () => {
+  const h = findHygieneFindings({
+    routes: [], resources: [], urls: [], params: [],
+    resHeaders: [{
+      url: 'https://x.com/', mime: 'text/html',
+      headers: {
+        'access-control-allow-origin': '*', 'access-control-allow-credentials': 'true',
+        'set-cookie': 'sess=abc; Path=/',
+      },
+    }],
+  });
+  const rules = new Set(h.map((x) => x.rule));
+  for (const r of ['hyg-csp-missing', 'hyg-cors-creds', 'hyg-cookie-httponly', 'hyg-cookie-secure']) {
+    assert.ok(rules.has(r), `missing ${r} in ${[...rules].join(',')}`);
+  }
+});
+
+// 43. v3.9.0: secret false positives tightened (hashes/IDs stay silent, real keys fire).
+ok('secret FP tightening', () => {
+  assert.deepEqual(scanTextForSecrets('api_key = "a1b2c3d4"'), []); // 8-hex id
+  assert.deepEqual(scanTextForSecrets('deadbeefcafe1234deadbeefcafe1234'), []); // 32-hex digest
+  assert.deepEqual(scanTextForSecrets('550e8400-e29b-41d4-a716-446655440000'), []); // uuid
+  assert.ok(scanTextForSecrets('api_key = "aB3xK9pQ2mZ7vL4qWeRt6"').some((x) => x.rule === 'generic_secret_assignment'));
+});
+
+// 44. v3.10.0: source-map reconstruction (pure, capped, never throws).
+ok('sourcemap parse', () => {
+  const good = JSON.stringify({
+    sources: ['src/a.ts', 'src/b.ts', 'empty'],
+    sourcesContent: ['const getUserToken=1', null, 'x'],
+  });
+  const p = parseSourceMap(good);
+  assert.equal(p.files.length, 1);
+  assert.equal(p.files[0].path, 'src/a.ts');
+  assert.equal(p.truncated, false);
+  assert.deepEqual(parseSourceMap('nope{').files, []);
+  assert.deepEqual(parseSourceMap('').files, []);
+  assert.equal(resolveSourceUrl('https://x.com/a/app.js.map', '../src/a.ts'), 'https://x.com/a/../src/a.ts'.replace('/a/../', '/'));
+  assert.equal(resolveSourceUrl('https://x.com/a.map', 'webpack://app/./src/a.ts'), 'webpack://app/./src/a.ts');
 });
 
 console.log(`\n${pass} checks passed.`);

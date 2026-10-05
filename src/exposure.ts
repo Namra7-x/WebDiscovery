@@ -4,6 +4,8 @@
 // auth-in-URL, interesting params, internal/staging domains).
 
 import type { Severity } from './types.js';
+import { findFrameworkFindings } from './framework.js';
+import { findHygieneFindings } from './hygiene.js';
 
 export type ApiKind = 'REST' | 'GraphQL' | 'tRPC' | 'gRPC-Web' | 'JSON-RPC' | 'SOAP' | 'SSE' | 'WebSocket' | 'Other';
 
@@ -45,6 +47,10 @@ export interface ExposureInput {
   resources: Array<{ url: string; kind: string; hasSourceMap: boolean }>;
   urls: string[];
   params: string[];
+  /** Response headers per observed URL (Set-Cookie + security headers audit). */
+  resHeaders?: Array<{ url: string; mime: string; headers: Record<string, string> }>;
+  /** Request headers per observed URL (Server-Action / RSC signal detection). */
+  reqHeaders?: Array<{ url: string; headers: Record<string, string> }>;
 }
 
 export interface ExposureFinding {
@@ -180,6 +186,21 @@ export function findExposures(input: ExposureInput): ExposureFinding[] {
       rule: 'expo-internal-domain',
     });
   }
+
+  // Framework fingerprint + hygiene audit live in their own modules (capped,
+  // deduped, exception-safe); merged here so one surface owns all findings.
+  try {
+    for (const f of findFrameworkFindings(input)) {
+      if (out.length >= 500) break;
+      out.push(f);
+    }
+  } catch { /* framework pass is best-effort */ }
+  try {
+    for (const f of findHygieneFindings(input)) {
+      if (out.length >= 800) break;
+      out.push(f);
+    }
+  } catch { /* hygiene pass is best-effort */ }
 
   return out;
 }

@@ -250,7 +250,7 @@ table.wrap-urls tbody tr:not(.grp) td:not(.acts):not(.url):not(.rt) {
   background: var(--paper); border: 1px solid var(--line);
   padding: 6px 9px; user-select: text; cursor: text;
 }
-#routeTable td.acts { width: 140px; }
+#routeTable td.acts { width: 215px; }
 #resTable td.acts { width: 170px; }
 #netTable td.acts, #apisTable td.acts { width: 240px; }
 td.acts { white-space: nowrap; overflow: visible; }
