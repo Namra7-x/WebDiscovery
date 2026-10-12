@@ -16,6 +16,13 @@ let deepCapture = false; // reserved for future CDP opt-in; reported in diagnost
 type NavInfo = { url: string; frameId: number; ts: number };
 const lastNav = new Map<number, NavInfo>();
 
+// Ensure isolated content scripts can access chrome.storage.session for mock/block rules
+try {
+  void chrome.storage?.session?.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
+} catch {
+  // session storage setAccessLevel unavailable in some Chromium versions / test runners
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'deepscope-panel') return;
   let tabId = -1;

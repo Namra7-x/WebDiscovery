@@ -853,19 +853,36 @@ export function extractFrameworkRoutes(html: string): { manifests: string[]; nex
   return { manifests, nextPages, isNuxt };
 }
 
-/** Flatten JSON with paths: {a:{b:1}} -> ["a.b = 1"...]. Bounded. */
+/** Flatten JSON with paths: {a:{b:1}} -> ["a.b = 1"...]. Bounded. Supports single JSON, NDJSON, and SSE streams. */
 export function extractJson(text: string): Extracted[] {
   const out: Extracted[] = [];
-  let obj: unknown;
-  try { obj = JSON.parse(text); } catch { return out; }
-  // OpenAPI/Swagger declared endpoints (INDEX-ONLY).
-  // NOTE: YAML specs are intentionally skipped — extractJson only parses
-  // JSON (JSON.parse); a YAML-only spec never reaches here.
-  // If parsed object has string `openapi` (3.x) or `swagger` ('2.0') AND
-  // object `paths`: for each path (cap 300) and each method in
-  // [get,put,post,delete,options,head,patch,trace] present: push kind
-  // 'endpoint', text = path (sliced), extra `openapi:<METHOD> <path> declared`.
-  {
+  const rootObjs: unknown[] = [];
+  try {
+    rootObjs.push(JSON.parse(text));
+  } catch {
+    // NDJSON / SSE line-by-line fallback
+    const lines = text.split('\n');
+    let parsedCount = 0;
+    for (const rawLine of lines) {
+      let line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith('data:')) line = line.slice(5).trim();
+      if ((line.startsWith('{') || line.startsWith('[')) && line.length > 1) {
+        try {
+          rootObjs.push(JSON.parse(line));
+          parsedCount++;
+          if (parsedCount >= 250) break;
+        } catch { /* skip non-json line */ }
+      }
+    }
+    if (!rootObjs.length) return out;
+  }
+
+  for (let rIdx = 0; rIdx < rootObjs.length; rIdx++) {
+    const obj = rootObjs[rIdx];
+    const rootPath = rootObjs.length > 1 ? `$[${rIdx}]` : '$';
+
+    // OpenAPI/Swagger declared endpoints (INDEX-ONLY).
     if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
       const rec = obj as Record<string, unknown>;
       const hasOpenapi = typeof rec['openapi'] === 'string';
@@ -881,8 +898,6 @@ export function extractJson(text: string): Extracted[] {
           const opRec = ops as Record<string, unknown>;
           for (const mm of METHODS) {
             if (!(mm in opRec)) continue;
-            // Consult canonical classifier (exposure.ts) for consistency;
-            // OpenAPI-declared paths are always indexed as 'endpoint' units.
             classifyEndpoint(path, 'application/json');
             const methodUp = mm.toUpperCase();
             const extra = `openapi:${methodUp} ${path} declared`;
@@ -894,41 +909,46 @@ export function extractJson(text: string): Extracted[] {
         }
       }
     }
-  }
-  const stack: Array<{ v: unknown; path: string }> = [{ v: obj, path: '$' }];
-  let count = 0;
-  while (stack.length && count < 4000) {
-    const { v, path } = stack.pop()!;
-    if (typeof v === 'string') {
-      if (v.length >= 2 && v.length <= MAX_UNIT_LEN) push(out, v, -1, -1, 'json-string', path);
-      // Strings that LOOK like routes/endpoints get a second searchable facet
-      // so `/api/models` inside JSON is found as an endpoint too.
-      if (typeof v === 'string' && v.includes('/') && v.length <= 220) {
-        const cls = classifyPath(v.trim());
-        if (cls === 'endpoint' || cls === 'route') push(out, v.trim(), -1, -1, cls === 'endpoint' ? 'endpoint' : 'route', path);
-      }
-      count++;
-    } else if (typeof v === 'number' || typeof v === 'boolean') {
-      push(out, String(v), -1, -1, 'json-scalar', path);
-      count++;
-    } else if (Array.isArray(v)) {
-      for (let i = v.length - 1; i >= 0 && i >= v.length - 60; i--) stack.push({ v: v[i], path: `${path}[${i}]` });
-    } else if (v && typeof v === 'object') {
-      const entries = Object.entries(v as Record<string, unknown>).slice(0, 80);
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const [k, val] = entries[i];
-        const p = path === '$' ? k : `${path}.${k}`;
-        push(out, k, -1, -1, 'json-key', p);
-        // JSON-RPC method facet (INDEX-ONLY): exact key `method` with a
-        // method-name string value gets an extra searchable unit.
-        if (k === 'method' && typeof val === 'string' && /^[A-Za-z_][\w.\-]{1,80}$/.test(val)) {
-          push(out, val, -1, -1, 'jsonrpc-method', p);
+
+    const stack: Array<{ v: unknown; path: string }> = [{ v: obj, path: rootPath }];
+    let count = 0;
+    while (stack.length && count < 4000) {
+      const { v, path } = stack.pop()!;
+      if (typeof v === 'string') {
+        if (v.length >= 2 && v.length <= MAX_UNIT_LEN) push(out, v, -1, -1, 'json-string', path);
+        // Strings that LOOK like routes/endpoints get a second searchable facet
+        if (typeof v === 'string' && v.includes('/') && v.length <= 220) {
+          const cls = classifyPath(v.trim());
+          if (cls === 'endpoint' || cls === 'route') push(out, v.trim(), -1, -1, cls === 'endpoint' ? 'endpoint' : 'route', path);
         }
-        stack.push({ v: val, path: p });
         count++;
-        if (count >= 4000) break;
+      } else if (typeof v === 'number' || typeof v === 'boolean') {
+        push(out, String(v), -1, -1, 'json-scalar', path);
+        count++;
+      } else if (Array.isArray(v)) {
+        for (let i = v.length - 1; i >= 0 && i >= v.length - 60; i--) stack.push({ v: v[i], path: `${path}[${i}]` });
+      } else if (v && typeof v === 'object') {
+        const entries = Object.entries(v as Record<string, unknown>).slice(0, 80);
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const [k, val] = entries[i];
+          const p = path === '$' ? k : `${path}.${k}`;
+          push(out, k, -1, -1, 'json-key', p);
+          // Composite key-value pair for instant attribute search (e.g. status: active, id: 101)
+          if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+            const pairStr = `${k}: ${val}`;
+            if (pairStr.length <= MAX_UNIT_LEN) push(out, pairStr, -1, -1, 'json-pair', p);
+          }
+          // JSON-RPC method facet (INDEX-ONLY)
+          if (k === 'method' && typeof val === 'string' && /^[A-Za-z_][\w.\-]{1,80}$/.test(val)) {
+            push(out, val, -1, -1, 'jsonrpc-method', p);
+          }
+          stack.push({ v: val, path: p });
+          count++;
+          if (count >= 4000) break;
+        }
       }
     }
+    if (out.length >= MAX_UNITS_PER_RESOURCE) break;
   }
   return out;
 }

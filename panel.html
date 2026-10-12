@@ -11,7 +11,7 @@
   <header id="topbar">
     <div class="brand"><span class="dot" aria-hidden="true"></span><span id="clearLamp" class="lamp" data-state="base" role="img" aria-label="Clearance: base capture — grant site access in Settings for full capture"></span><h1>DeepScope</h1><span id="scopeLabel" class="scope">scope: —</span></div>
     <div id="membar" class="membar" title="Live RAM accounting (session only, never persisted)">
-      <div class="mem-numbers" role="status" aria-live="polite" aria-label="Retention summary"><span id="memText">0 MB / 256 MB</span><span id="memDetail" class="muted"></span></div>
+      <div class="mem-numbers" role="status" aria-live="polite" aria-label="Retention summary"><span id="memText">0 MB / 60 MB</span><span id="memDetail" class="muted"></span></div>
       <div class="mem-track" aria-hidden="true"><div id="memFill" class="mem-fill"></div></div>
     </div>
     <div class="top-actions">
@@ -196,10 +196,19 @@
   <div id="viewer" class="viewer hidden" role="dialog" aria-modal="true" aria-labelledby="viewerTitle" aria-label="Resource content preview">
     <div class="viewer-card">
       <div class="viewer-head"><strong id="viewerTitle" class="mono">preview</strong>
-        <span class="viewer-actions"><button id="viewerOpen" title="Open this URL">Open ↗</button><button id="viewerCopy" title="Copy shown content">Copy</button><button id="viewerClose" title="Close preview (Esc)">Close</button></span>
+        <span class="viewer-actions"><button id="viewerFetchLive" title="Fetch live response data from endpoint">Fetch Live</button><button id="viewerOpen" title="Open this URL">Open ↗</button><button id="viewerCopy" title="Copy shown content">Copy</button><button id="viewerClose" title="Close preview (Esc)">Close</button></span>
+      </div>
+      <div id="viewerTabs" class="viewer-tabs" role="tablist" aria-label="View formats">
+        <button id="btnVModeFormatted" class="vtab active" data-vmode="formatted" role="tab" aria-selected="true" title="Formatted & beautified">Formatted</button>
+        <button id="btnVModeRaw" class="vtab" data-vmode="raw" role="tab" aria-selected="false" title="Raw unformatted text">Raw</button>
+        <button id="btnVModePreview" class="vtab hidden" data-vmode="preview" role="tab" aria-selected="false" title="Interactive Media Player / Image preview">Preview</button>
+        <button id="btnVModeHex" class="vtab" data-vmode="hex" role="tab" aria-selected="false" title="Hex Dump inspection">Hex Dump</button>
+        <button id="btnVModeInfo" class="vtab" data-vmode="info" role="tab" aria-selected="false" title="Headers, cURL, and Request Details">Headers &amp; Info</button>
       </div>
       <div id="viewerMeta" class="muted small mono" role="status"></div>
       <pre id="viewerBody" class="viewer-body mono" tabindex="0"></pre>
+      <div id="viewerMedia" class="viewer-media hidden"></div>
+      <div id="viewerInfo" class="viewer-info hidden mono" tabindex="0"></div>
     </div>
   </div>
   <div id="replayModal" class="viewer hidden" role="dialog" aria-modal="true" aria-labelledby="replayTitle" aria-label="Replay request">

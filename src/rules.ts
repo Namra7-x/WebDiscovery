@@ -116,7 +116,8 @@ export function scanTextForSecrets(text: string, maxHits = 3): SecretHit[] {
     const m = r.pattern.exec(text);
     if (!m) continue;
     const full = m[0];
-    if (!full || isPlaceholder(full)) continue;
+    const val = (m.length > 1 && m[m.length - 1] ? m[m.length - 1] : full).replace(/^["']|["']$/g, '');
+    if (!full || isPlaceholder(val)) continue;
     if (r.id === 'generic_secret_assignment' && m[2]) {
       // Defense-in-depth for the pure-hex ≤24 rejection (commit hashes,
       // color codes, short IDs): strip trailing punctuation then test.

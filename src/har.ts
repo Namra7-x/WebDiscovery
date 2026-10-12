@@ -91,7 +91,7 @@ export function buildHarDoc(origin: string, entries: HarLikeEntry[]): Record<str
   return {
     log: {
       version: '1.2',
-      creator: { name: 'DeepScope', version: '1.7.0' },
+      creator: { name: 'DeepScope', version: '3.11.0' },
       pages: origin ? [{ startedDateTime: new Date().toISOString(), id: 'page_1', title: origin }] : [],
       entries: harEntries,
     },

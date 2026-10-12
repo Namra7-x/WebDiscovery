@@ -22,6 +22,10 @@ import { buildHarDoc, validateHar, normalizeHarEntry } from '../dist/har.js';
 import { parseFilterDsl, wildcardMatch, matchDslAll } from '../dist/filter-dsl.js';
 import { DiscoveryGraph } from '../dist/graph.js';
 import { defaultScope } from '../dist/types.js';
+import {
+  detectContentCategory, beautifyJs, beautifyJson, beautifyCss, beautifyHtml,
+  formatHexDump, parseZipListing, isNonPrintableBinary, addLineNumbers
+} from '../dist/viewer.js';
 
 let pass = 0;
 const ok = (name, fn) => { fn(); pass++; console.log(`ok - ${name}`); };
@@ -415,7 +419,18 @@ ok('store setCategory', () => {
 
 // 34. v1.7.0: replay guards + interception rule matcher.
 ok('replay header sanitize + body clamp', () => {
-  const h = sanitizeReplayHeaders({ Authorization: 'Bearer x', Host: 'evil', 'Content-Length': '5', Connection: 'keep-alive', ok: 'yes' });
+  const h = sanitizeReplayHeaders({
+    Authorization: 'Bearer x',
+    Host: 'evil',
+    'Content-Length': '5',
+    Connection: 'keep-alive',
+    ':authority': 'arena.ai',
+    ':method': 'GET',
+    ':path': '/nextjs-api/model-catalog',
+    Cookie: 'session=123',
+    'Sec-Fetch-Mode': 'cors',
+    ok: 'yes',
+  });
   assert.deepEqual(h, { Authorization: 'Bearer x', ok: 'yes' });
   assert.deepEqual(sanitizeReplayHeaders(null), {});
   const t = truncateReplayBody('abcdef', 4);
@@ -623,6 +638,124 @@ ok('sourcemap parse', () => {
   assert.deepEqual(parseSourceMap('').files, []);
   assert.equal(resolveSourceUrl('https://x.com/a/app.js.map', '../src/a.ts'), 'https://x.com/a/../src/a.ts'.replace('/a/../', '/'));
   assert.equal(resolveSourceUrl('https://x.com/a.map', 'webpack://app/./src/a.ts'), 'webpack://app/./src/a.ts');
+});
+
+// 45. Universal Viewer: category sniff (magic bytes, MIME, extensions)
+ok('Universal Viewer: category detection', () => {
+  // Gzip magic bytes 1f 8b
+  assert.equal(detectContentCategory('blob', '', '', new Uint8Array([0x1f, 0x8b, 0x08])).category, 'gzip');
+  // Zip magic bytes 50 4b 03 04
+  assert.equal(detectContentCategory('archive.bin', '', '', new Uint8Array([0x50, 0x4b, 0x03, 0x04])).category, 'zip');
+  // PNG magic bytes 89 50 4e 47
+  assert.equal(detectContentCategory('test', '', '', new Uint8Array([0x89, 0x50, 0x4e, 0x47])).category, 'image');
+  // WASM magic bytes 00 61 73 6d
+  assert.equal(detectContentCategory('module', '', '', new Uint8Array([0x00, 0x61, 0x73, 0x6d])).category, 'binary');
+  // Extensions & MIME
+  assert.equal(detectContentCategory('https://example.com/audio.mp3', 'audio/mpeg').category, 'audio');
+  assert.equal(detectContentCategory('https://example.com/video.mp4', 'video/mp4').category, 'video');
+  assert.equal(detectContentCategory('https://example.com/logo.svg', 'image/svg+xml').category, 'svg');
+  assert.equal(detectContentCategory('https://example.com/app.js', 'application/javascript').category, 'javascript');
+  assert.equal(detectContentCategory('https://example.com/api/v1/user', 'application/json').category, 'json');
+  assert.equal(detectContentCategory('https://example.com/styles.css', 'text/css').category, 'css');
+  assert.equal(detectContentCategory('https://example.com/page', 'text/html').category, 'html');
+  assert.equal(detectContentCategory('https://example.com/feed', 'application/xml').category, 'xml');
+  // JSON content sniff with generic text/plain
+  assert.equal(detectContentCategory('https://example.com/unknown', 'text/plain', '{"foo":"bar"}').category, 'json');
+});
+
+// 46. Universal Viewer: beautify code & hex dump
+ok('Universal Viewer: beautification and hex dump', () => {
+  // Beautify minified JS
+  const minJs = 'function hello(){const a=1;if(a){return a;}else{return 0;}}';
+  const prettyJs = beautifyJs(minJs);
+  assert.ok(prettyJs.includes('1 | function hello() {'));
+  assert.ok(prettyJs.includes('return a;'));
+
+  // Beautify compact JSON
+  const compactJson = '{"name":"Alice","age":30,"roles":["admin","editor"]}';
+  const prettyJson = beautifyJson(compactJson);
+  assert.ok(prettyJson.includes('"name": "Alice"'));
+  assert.ok(prettyJson.includes('1 | {'));
+
+  // Hex Dump
+  const sampleBytes = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x2c, 0x20, 0x57, 0x6f, 0x72, 0x6c, 0x64, 0x21]);
+  const dump = formatHexDump(sampleBytes);
+  assert.ok(dump.includes('00000000'));
+  assert.ok(dump.includes('48 65 6C 6C 6F 2C 20 57'));
+  assert.ok(dump.includes('|Hello, World!|'));
+});
+
+// 47. Universal Viewer: ZIP archive listing
+ok('Universal Viewer: ZIP listing', () => {
+  // Construct a minimal valid ZIP local file header in memory
+  // Signature (4) PK\x03\x04 + Version (2) + Flags (2) + Method (2) + Time (2) + Date (2) + CRC (4)
+  // + CompSize (4) + UncompSize (4) + NameLen (2) + ExtraLen (2) + Name
+  const name = 'test.json';
+  const nameBytes = Buffer.from(name, 'utf-8');
+  const zipBuf = new Uint8Array(30 + nameBytes.length);
+  zipBuf[0] = 0x50; zipBuf[1] = 0x4b; zipBuf[2] = 0x03; zipBuf[3] = 0x04;
+  zipBuf[18] = 42; zipBuf[19] = 0; // comp size = 42
+  zipBuf[22] = 100; zipBuf[23] = 0; // uncomp size = 100
+  zipBuf[26] = nameBytes.length; zipBuf[27] = 0;
+  zipBuf[28] = 0; zipBuf[29] = 0; // extra len = 0
+  zipBuf.set(nameBytes, 30);
+
+  const list = parseZipListing(zipBuf);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].name, 'test.json');
+  assert.equal(list[0].compressedSize, 42);
+  assert.equal(list[0].uncompressedSize, 100);
+});
+
+// 48. Full-Spectrum API Response & NDJSON/SSE Indexing
+ok('Universal Indexing: NDJSON/SSE & API responses', () => {
+  // NDJSON streaming response with key-value pairs
+  const ndjson = '{"user":"alice","status":"active","code":200}\n{"user":"bob","status":"pending","code":202}';
+  const units = extractJson(ndjson);
+  const texts = new Set(units.map((u) => u.text));
+
+  assert.ok(texts.has('alice'), 'indexes string value');
+  assert.ok(texts.has('bob'), 'indexes string value');
+  assert.ok(texts.has('status: active'), 'indexes composite json-pair');
+  assert.ok(texts.has('user: alice'), 'indexes composite json-pair');
+  assert.ok(texts.has('code: 200'), 'indexes scalar json-pair');
+
+  // SSE stream
+  const sse = 'data: {"event":"message","id":"msg_101"}\ndata: {"event":"done","count":1}';
+  const sseUnits = extractJson(sse);
+  const sseTexts = new Set(sseUnits.map((u) => u.text));
+  assert.ok(sseTexts.has('msg_101'), 'indexes SSE string value');
+  assert.ok(sseTexts.has('id: msg_101'), 'indexes SSE composite json-pair');
+  assert.ok(sseTexts.has('event: message'), 'indexes SSE event pair');
+});
+
+// 51. Live Endpoint Response Inspection & Indexing
+ok('Live Endpoint Data: beautification of endpoint JSON responses & error payloads', () => {
+  // Live endpoint error response (e.g. 401/404 JSON)
+  const errPayload = '{"status":401,"error":"Unauthorized","message":"API token missing or expired"}';
+  const det = detectContentCategory('https://test.com/api/v1/user', 'application/json', errPayload);
+  assert.equal(det.category, 'json');
+  const beautified = beautifyJson(errPayload);
+  assert.ok(beautified.includes('"status": 401'));
+  assert.ok(beautified.includes('"error": "Unauthorized"'));
+
+  // Live fetch indexing into RamIndex with method 'live-fetch'
+  const idx = new RamIndex();
+  const units = extractJson(errPayload);
+  for (const u of units) {
+    idx.add(u.text, {
+      resourceUrl: 'https://test.com/api/v1/user',
+      resourceKind: 'api-json',
+      route: '/api/v1/user',
+      method: 'live-fetch',
+      jsonPath: u.extra,
+    });
+  }
+  const scope = defaultScope();
+  const hits = searchIndex(idx, 'Unauthorized', { mode: 'exact', scope });
+  assert.ok(hits.length >= 1);
+  assert.equal(hits[0].prov.method, 'live-fetch');
+  assert.equal(hits[0].prov.route, '/api/v1/user');
 });
 
 console.log(`\n${pass} checks passed.`);

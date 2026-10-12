@@ -53,8 +53,10 @@ function computeUnits(m: IndexRequest): Unit[] {
   const { text, url, mime, kind, advancedJs } = m;
   const isJs = kind === 'script' || kind === 'chunk' || /javascript|ecmascript/.test(mime) || /\.m?js($|\?)/.test(url);
   const isCss = kind === 'stylesheet' || /css/.test(mime) || /\.css($|\?)/.test(url);
-  const isJson = kind === 'api-json' || /json/.test(mime);
   const isHtml = kind === 'document' || kind === 'dom' || /html/.test(mime);
+  const trimmed = text.trimStart().slice(0, 80);
+  const looksLikeJson = !isHtml && (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('data: {"'));
+  const isJson = kind === 'api-json' || /json|ndjson/.test(mime) || looksLikeJson;
 
   let units: Unit[];
   if (isJson) units = extractJson(text).map(toUnit);

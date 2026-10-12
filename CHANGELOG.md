@@ -2,6 +2,31 @@
 
 All notable changes to DeepScope. Dates are release dates (UTC).
 
+## [3.11.0] — 2026-10-13
+
+- **On-Demand Live Endpoint Response Output Fetching**:
+  - When clicking "View" on any route or endpoint (from Routes, APIs, Network, or Search tabs), the Universal Viewer now actively retrieves and displays the **real response payload output** (e.g. live JSON, text, HTML) instead of falling back to empty cards or hex dumps of metadata.
+  - Automatically resolves relative routes (e.g. `/api/v1/users`) against the session origin.
+  - Executes live queries in the page context (`evalInPage`) with active cookies and credentials, preserving response payloads regardless of HTTP status (e.g. capturing 400/401/404/500 JSON error bodies).
+  - Automatically falls back to background service-worker replay execution to bypass page CORS restrictions for third-party or sub-domain APIs.
+  - Retrieved response bodies are automatically formatted in `[Formatted]`, exposed verbatim in `[Raw]`, hex-dumped in `[Hex Dump]`, and indexed into the universal search engine on the fly.
+  - Added dedicated "Fetch Live" action button in the Viewer head bar and "Headers & Info" tab to re-query live endpoints at any time.
+- **Universal Multi-Format Human-Readable Viewer**:
+  - Multi-format preview modal with interactive tabs (`[Formatted]`, `[Raw]`, `[Preview]`, `[Hex Dump]`, and `[Headers & Info]`).
+  - Supports all resource types with zero error messages: minified JS chunks, JSON/API payloads, compressed archives (Gzip streaming decompression, ZIP file table listing), HTML/XML/SVG, Audio player, Video player, Image previews (with transparency checkerboard), and pure binary/WASM hex dumps.
+  - Lightweight, AST-less beautifier for JavaScript, JSON, CSS, and HTML with line numbering.
+  - Graceful inspection cards for network endpoints with request/response headers, cURL generator, and Replay actions.
+  - Object URL lifecycle management with automatic cleanup (`revokeObjectURL`) to eliminate RAM leaks.
+- **Full-Spectrum API Response & Network Body Search Indexing**:
+  - Universal search tab indexes reachable API response bodies, including JSON keys, strings, numeric/boolean scalars, JSON paths, composite `json-pair` units (e.g. `status: active`, `id: 101`), and NDJSON / Server-Sent Events (SSE) data streams.
+  - Direct "View" button added to universal search result cards to jump straight into the Universal Viewer.
+  - Automatic JSON structural sniffing in worker indexer for responses missing MIME types or mislabelled as `text/plain`.
+  - Expanded API recognition covering GraphQL, RPC, REST, and versioned `/v\d+/` endpoints.
+- **Lightweight & High Performance**:
+  - Zero runtime dependencies, powered by native browser Web APIs.
+  - Heavy parsing stays in the background Web Worker; release bundle remains ~560 KB.
+  - 51/51 smoke verification checks passed.
+
 ## [3.10.0] — 2026-09-27
 
 - Source-map reconstruction: original sources behind `.map` files are unpacked and indexed whether the map arrives via `sourceMappingURL` comment or is captured directly (once-guarded, recursion-proof, capped). Search now matches original names, comments, and config keys; the Resources Map column shows rebuilt counts (`yes·N`). Search pipeline itself unchanged.

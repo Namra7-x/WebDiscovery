@@ -67,8 +67,9 @@ export interface DszValidate { ok: boolean; file?: SessionFile; error?: string }
 export function validateSessionFile(json: unknown): DszValidate {
   if (typeof json !== 'object' || json === null) return { ok: false, error: 'not a JSON object' };
   const o = json as Record<string, unknown>;
-  if (o['tool'] !== DSZ_MAGIC) return { ok: false, error: 'not a DeepScope session file (bad magic)' };
-  if (o['format'] !== DSZ_VERSION) return { ok: false, error: `unsupported session format (want ${DSZ_VERSION})` };
+  const tool = typeof o['tool'] === 'string' ? o['tool'] : '';
+  if (tool !== DSZ_MAGIC && !tool.startsWith('DeepScope')) return { ok: false, error: 'not a DeepScope session file (bad magic)' };
+  if (o['format'] !== undefined && o['format'] !== DSZ_VERSION) return { ok: false, error: `unsupported session format (want ${DSZ_VERSION})` };
   if (!Array.isArray(o['resources']) || !Array.isArray(o['network']) || !Array.isArray(o['routes'])) {
     return { ok: false, error: 'session file missing routes/resources/network' };
   }

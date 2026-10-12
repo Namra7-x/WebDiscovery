@@ -70,17 +70,22 @@ export const REPLAY_TIMEOUT_MS = 30_000;
 const STRIP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
+  'cookie', 'cookie2', 'origin', 'referer',
 ]);
 
-/** Drop headers that fetch forbids or owns; pure + unit-tested. */
+const VALID_HEADER_NAME = /^[a-zA-Z0-9!#$%&'*+\-.^_`|~]+$/;
+
+/** Drop headers that fetch forbids or owns, plus pseudo-headers (:authority etc.); pure + unit-tested. */
 export function sanitizeReplayHeaders(raw: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   if (typeof raw !== 'object' || raw === null) return out;
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof k !== 'string' || typeof v !== 'string') continue;
     const name = k.trim();
-    if (!name || name.length > 256 || v.length > 16_384) continue;
-    if (STRIP_HEADERS.has(name.toLowerCase())) continue;
+    if (!name || name.startsWith(':') || name.length > 256 || v.length > 16_384) continue;
+    if (!VALID_HEADER_NAME.test(name)) continue;
+    const lower = name.toLowerCase();
+    if (STRIP_HEADERS.has(lower) || lower.startsWith('sec-')) continue;
     out[name] = v;
   }
   return out;
@@ -132,6 +137,19 @@ export async function executeReplay(req: ReplayRequest): Promise<ReplayResponse>
         redirect: 'follow',
         signal: ctrl.signal,
       });
+    } catch (primaryErr) {
+      // If fetch failed with custom headers, retry with bare fetch
+      if (Object.keys(headers).length > 0) {
+        res = await fetch(url.toString(), {
+          method,
+          body,
+          credentials: 'include',
+          redirect: 'follow',
+          signal: ctrl.signal,
+        });
+      } else {
+        throw primaryErr;
+      }
     } finally {
       clearTimeout(timer);
     }

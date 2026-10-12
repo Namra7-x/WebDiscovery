@@ -34,6 +34,11 @@ import {
   type DiscoveryMethod, type NetEntry, type ResourceKind, type ResourceMeta,
   type SearchMode, type SearchScope, type SessionSettings,
 } from './types.js';
+import {
+  detectContentCategory, beautifyJs, beautifyJson, beautifyCss, beautifyHtml,
+  formatHexDump, decompressPayload, parseZipListing, toUint8Array, addLineNumbers,
+  type ContentCategory, type DetectResult,
+} from './viewer.js';
 
 const tabId = chrome.devtools.inspectedWindow.tabId;
 let settings: SessionSettings = structuredClone(DEFAULT_SETTINGS);
@@ -131,6 +136,13 @@ let resTypeSig = '';
 let netMethodSig = '';
 let netKindSig = '';
 let viewerUrl = '';
+type ViewerMode = 'formatted' | 'raw' | 'preview' | 'hex' | 'info';
+let viewerMode: ViewerMode = 'formatted';
+let viewerBlobUrl = '';
+let viewerFormattedText = '';
+let viewerRawText = '';
+let viewerHexText = '';
+let viewerInfoText = '';
 let lastApiCount = 0;
 
 // ---------- deep-capture / unified-budget / evidence (additive v1.6) ----------
@@ -225,8 +237,61 @@ function on(id: string, ev: string, fn: (e: Event) => void): void {
 /** Dismiss the content preview (Close / backdrop / Esc all funnel here). */
 function closeViewer(): void {
   try { document.getElementById('viewer')?.classList.add('hidden'); } catch { /* ignore */ }
+  if (viewerBlobUrl) {
+    try { URL.revokeObjectURL(viewerBlobUrl); } catch { /* ignore */ }
+    viewerBlobUrl = '';
+  }
+  try {
+    const mediaEl = document.getElementById('viewerMedia');
+    if (mediaEl) mediaEl.innerHTML = '';
+  } catch { /* ignore */ }
   viewerUrl = '';
+  viewerFormattedText = '';
+  viewerRawText = '';
+  viewerHexText = '';
+  viewerInfoText = '';
   modalReturnFocus();
+}
+
+/** Switch active viewer tab (formatted / raw / preview / hex / info). */
+function switchViewerMode(mode: ViewerMode): void {
+  viewerMode = mode;
+  document.querySelectorAll('#viewerTabs .vtab').forEach((b) => {
+    const active = (b as HTMLElement).dataset.vmode === mode;
+    b.classList.toggle('active', active);
+    b.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+
+  const bodyEl = document.getElementById('viewerBody');
+  const mediaEl = document.getElementById('viewerMedia');
+  const infoEl = document.getElementById('viewerInfo');
+
+  if (mode === 'preview') {
+    bodyEl?.classList.add('hidden');
+    infoEl?.classList.add('hidden');
+    mediaEl?.classList.remove('hidden');
+  } else if (mode === 'info') {
+    bodyEl?.classList.add('hidden');
+    mediaEl?.classList.add('hidden');
+    infoEl?.classList.remove('hidden');
+  } else {
+    mediaEl?.classList.add('hidden');
+    infoEl?.classList.add('hidden');
+    bodyEl?.classList.remove('hidden');
+
+    if (bodyEl) {
+      if (mode === 'formatted') {
+        bodyEl.textContent = viewerFormattedText || '(empty content)';
+      } else if (mode === 'raw') {
+        bodyEl.textContent = viewerRawText || '(empty content)';
+      } else if (mode === 'hex') {
+        if (!viewerHexText && (viewerRawText || viewerUrl)) {
+          viewerHexText = formatHexDump(viewerRawText);
+        }
+        bodyEl.textContent = viewerHexText || '(empty buffer)';
+      }
+    }
+  }
 }
 /** Modal focus contract: take focus on open, trap Tab inside, return focus on close. */
 let modalReturnEl: HTMLElement | null = null;
@@ -328,7 +393,7 @@ function enforceBudget(context: string): void {
 function kindFor(url: string, mime: string): ResourceKind {
   const u = url.toLowerCase();
   if (/\.map($|\?)|source-?map|application\/json\+sourcemap/.test(u + mime)) return 'source-map';
-  if (/json/.test(mime) || /\/api\//.test(u) && !/\.(js|css|png|jpg|woff)/.test(u)) return 'api-json';
+  if (/json|ndjson/.test(mime) || (/(\/api\/|\/graphql|\/v\d+\/|\/rpc|\/rest\/)/i.test(u) && !/\.(js|css|png|jpg|jpeg|gif|webp|svg|woff2?|ttf|otf)/.test(u))) return 'api-json';
   if (/javascript|ecmascript/.test(mime) || /\.m?js($|\?)/.test(u)) return /chunk|lazy|async|assets\//.test(u) ? 'chunk' : 'script';
   if (/css/.test(mime) || /\.css($|\?)/.test(u)) return 'stylesheet';
   if (/html/.test(mime) || u === sessionOrigin + '/' || !/\.\w{2,4}($|\?)/.test(u)) return 'document';
@@ -714,12 +779,12 @@ function workerKindFor(targetId?: string): WorkerKind {
 }
 
 /** Insert with index fix-up (netEntries is newest-first) + trim + map prune. */
-function unshiftNet(e: NetEntry): void {
+function unshiftNet(e: NetEntry, cap = 800): void {
   netEntries.unshift(e);
   for (const [k, v] of reqIdMap) reqIdMap.set(k, v + 1);
   if (e.reqId) reqIdMap.set(e.reqId, 0);
-  while (netEntries.length > 800) netEntries.pop();
-  if (reqIdMap.size > 1600) reqIdMap.clear();
+  while (netEntries.length > cap) netEntries.pop();
+  if (reqIdMap.size > cap * 2) reqIdMap.clear();
   else {
     for (const [k, v] of reqIdMap) {
       if (v < 0 || v >= netEntries.length || netEntries[v]?.reqId !== k) reqIdMap.delete(k);
@@ -1402,6 +1467,7 @@ async function startDeepScan(): Promise<void> {
   for (const r of seeds) touchRoute(r, 'router'); // Routes tab fills immediately
   scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis');
   $('btnDeep').textContent = 'Stop Scan';
+  $('btnDeep').setAttribute('aria-pressed', 'true');
   ($('btnDeep2') as HTMLButtonElement).disabled = true;
   diag(`deep scan started: origin ${sessionOrigin}, depth≤${settings.deepScan.maxDepth}, pages≤${settings.deepScan.maxPages}`);
   void pumpScan();
@@ -1414,6 +1480,7 @@ function stopDeepScan(reason = 'user'): void {
   scanning = false;
   scanQueue = [];
   $('btnDeep').textContent = 'Deep Scan';
+  $('btnDeep').setAttribute('aria-pressed', 'false');
   ($('btnDeep2') as HTMLButtonElement).disabled = false;
   if (inflight > 0) diag(`deep scan aborted (${reason}) — ${inflight} in-flight job(s) cancelled`);
   updateDeepStatus(`stopped (${reason})`);
@@ -1548,7 +1615,8 @@ function runSearch(): void {
     const sub = `${kindBadge} <span title="${esc(p.resourceUrl)}">${from}</span> · route ${esc(p.route)} · via ${esc(p.method)}${loc ? ` · ${loc}` : ''}${p.initiator ? ` · init ${esc(shortLabel(p.initiator))}` : ''}`;
     return `<div class="res" data-rid="${r.recordId}">`
       + `<div class="head"><span class="score">${r.score.toFixed(3)}</span><span class="orig" title="${esc(r.text.slice(0, 400))}">${name}</span>`
-      + `<button class="open" data-open="${r.recordId}" title="Open source: ${esc(p.resourceUrl)}${loc ? ' @ ' + loc : ''}">Open ↗</button></div>`
+      + `<div class="res-acts"><button class="view-hit" data-view-rec="${r.recordId}" title="View in Universal Viewer">View</button>`
+      + `<button class="open" data-open="${r.recordId}" title="Open source: ${esc(p.resourceUrl)}${loc ? ' @ ' + loc : ''}">Open ↗</button></div></div>`
       + `<div class="ctx-line">${hl}</div>`
       + `<div class="prov">${sub} ${jp}</div></div>`;
   }).join('');
@@ -1827,7 +1895,10 @@ function renderRoutes(): void {
     rc.textContent = (routeShowAll ? `${base} (Show-all on: up to 1200)` : (all.length > 300 ? `${base} — showing 300 (capped)` : base)) + urlFindSuffix();
   }
   const rsb = document.getElementById('btnRoutesShowAll');
-  if (rsb) rsb.textContent = routeShowAll ? 'Show less' : `Show all (${all.length})`;
+  if (rsb) {
+    rsb.textContent = routeShowAll ? 'Show less' : `Show all (${all.length})`;
+    rsb.setAttribute('aria-expanded', routeShowAll ? 'true' : 'false');
+  }
 }
 
 async function copyFilteredRouteUrls(): Promise<void> {
@@ -2018,10 +2089,21 @@ let interceptRules: InterceptRule[] = [];
 let ruleSeq = 0;
 let sessionStoreOk = true;
 
+/** Valid Chrome Match Pattern for an origin or URL (Chrome forbids port numbers in match patterns). */
+function originPattern(urlOrOrigin: string): string {
+  try {
+    const u = new URL(urlOrOrigin);
+    return `${u.protocol}//${u.hostname}/*`;
+  } catch {
+    return `${urlOrOrigin.replace(/\/+$/, '')}/*`;
+  }
+}
+
 function rulesStorage(): chrome.storage.SessionStorageArea | null {
   try {
     const s = chrome.storage?.session;
     if (!s) { sessionStoreOk = false; return null; }
+    try { void s.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' }); } catch { /* ignore */ }
     return s;
   } catch { sessionStoreOk = false; return null; }
 }
@@ -2049,12 +2131,13 @@ async function saveInterceptRules(): Promise<void> {
 async function ensureInterceptRegistered(): Promise<void> {
   if (!sessionOrigin) return;
   try {
-    const held = await chrome.permissions.contains({ origins: [`${sessionOrigin}/*`] });
+    const pat = originPattern(sessionOrigin);
+    const held = await chrome.permissions.contains({ origins: [pat] });
     if (!held) return;
     try { await chrome.scripting.unregisterContentScripts({ ids: ['deepscope-intercept'] }); }
     catch { /* first registration — nothing to remove */ }
     await chrome.scripting.registerContentScripts([{
-      id: 'deepscope-intercept', matches: [`${sessionOrigin}/*`], js: ['dist/intercept-main.js'],
+      id: 'deepscope-intercept', matches: [pat], js: ['dist/intercept-main.js'],
       runAt: 'document_start', allFrames: true, persistAcrossSessions: false, world: 'MAIN',
     }]);
   } catch (e) { diag(`interceptor registration: ${String(e).slice(0, 140)}`); }
@@ -2145,7 +2228,9 @@ function openReplay(url: string): void {
 /** Requestly-style tabs: params / headers / body. */
 function switchRpTab(which: string): void {
   for (const t of ['params', 'headers', 'body']) {
-    document.querySelector(`[data-rptab="${t}"]`)?.classList.toggle('active', t === which);
+    const el = document.querySelector(`[data-rptab="${t}"]`);
+    el?.classList.toggle('active', t === which);
+    el?.setAttribute('aria-selected', t === which ? 'true' : 'false');
     document.getElementById(`rpPane${t[0].toUpperCase()}${t.slice(1)}`)?.classList.toggle('hidden', t !== which);
   }
   // Switching away from Params writes the table back into the URL box.
@@ -2245,14 +2330,14 @@ async function sendReplay(): Promise<void> {
   // Host permission preflight: the background fetch is CORS-unblocked only for
   // granted origins. The Send click is a real user gesture, so request here.
   try {
-    const origin = new URL(url).origin;
+    const pat = originPattern(url);
     const perms = chrome.permissions;
     if (perms && typeof perms.contains === 'function') {
-      const has = await perms.contains({ origins: [`${origin}/*`] });
+      const has = await perms.contains({ origins: [pat] });
       if (!has && typeof perms.request === 'function') {
-        const granted = await perms.request({ origins: [`${origin}/*`] });
+        const granted = await perms.request({ origins: [pat] });
         if (!granted) {
-          meta.innerHTML = `<span class="st-err">blocked</span> site access declined for ${esc(origin)} — replay needs it (or Settings → Grant site access, reload, Send again)`;
+          meta.innerHTML = `<span class="st-err">blocked</span> site access declined for ${esc(pat)} — replay needs it (or Settings → Grant site access, reload, Send again)`;
           return;
         }
       }
@@ -2318,6 +2403,7 @@ function saveMock(): void {
     method: (document.getElementById('mockMethod') as HTMLSelectElement).value, status, body, enabled: true,
   });
   document.getElementById('mockModal')?.classList.add('hidden');
+  modalReturnFocus();
   void saveInterceptRules();
   diag(`mock rule added: ${match.slice(0, 80)} — reload the page to apply`);
 }
@@ -2391,7 +2477,7 @@ function rowActsHtml(url: string, replay = false): string {
   return `<td class="acts"><button data-act="open" data-url="${u}" title="Open">Open</button>`
     + `<button data-act="view" data-url="${u}" title="Preview captured content">View</button>`
     + (replay ? `<button data-act="replay" data-url="${u}" title="Replay — edit & resend this request">Replay</button>` : '')
-    + `<button type="button" data-act="menu" data-url="${u}" title="More actions" aria-label="More actions for ${label}" aria-haspopup="menu" aria-expanded="false">⋯</button></td>`;
+    + `<button type="button" data-act="menu" data-url="${u}" title="More actions" aria-label="More actions for ${label}" aria-haspopup="menu" aria-expanded="false"${replay ? ' data-has-replay="1"' : ''}>⋯</button></td>`;
 }
 
 /** Anchor for Escape focus-return: the ⋯ button that opened the menu. */
@@ -2528,12 +2614,145 @@ function actMenuClick(e: Event): void {
   else rowAction(act, t.dataset.url ?? m?.dataset.url ?? '', kind);
 }
 
-/** Resolve previewable content for a URL: retained raw body, else on-demand same-origin fetch. */
+interface EndpointFetchResult {
+  ok: boolean;
+  text?: string;
+  status?: number;
+  statusText?: string;
+  mime?: string;
+  headers?: Record<string, string>;
+  error?: string;
+  source: 'page' | 'background';
+}
+
+const VALID_FETCH_HEADER_NAME = /^[a-zA-Z0-9!#$%&'*+\-.^_`|~]+$/;
+const STRIP_FETCH_HEADERS = new Set([
+  'host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
+  'cookie', 'cookie2', 'origin', 'referer',
+]);
+
+/** Sanitize headers before in-page eval or background fetch to prevent Blink TypeError: Invalid name */
+function cleanFetchHeaders(raw?: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw || typeof raw !== 'object') return { 'Accept': '*/*' };
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k !== 'string' || typeof v !== 'string') continue;
+    const name = k.trim();
+    if (!name || name.startsWith(':') || name.length > 256 || v.length > 16_384) continue;
+    if (!VALID_FETCH_HEADER_NAME.test(name)) continue;
+    const lower = name.toLowerCase();
+    if (STRIP_FETCH_HEADERS.has(lower) || lower.startsWith('sec-')) continue;
+    out[name] = v;
+  }
+  if (!Object.keys(out).some((k) => k.toLowerCase() === 'accept')) {
+    out['Accept'] = '*/*';
+  }
+  return out;
+}
+
+/**
+ * On-demand live fetch for endpoints & routes.
+ * 1. Checks origin and tries in-page fetch via evalInPage with full page credentials (cookies/auth).
+ *    Crucially captures response text regardless of HTTP status code (so error JSON like 400/401/404 is visible!).
+ * 2. If blocked by CORS or page eval fails, falls back to background replay executor (CORS-bypassed via extension host permissions).
+ */
+async function fetchEndpointData(url: string, method = 'GET', reqHeaders?: Record<string, string>): Promise<EndpointFetchResult> {
+  const fullUrl = routeFullUrl(url);
+  if (!/^https?:\/\//i.test(fullUrl)) {
+    return { ok: false, error: 'not an HTTP/HTTPS endpoint', source: 'page' };
+  }
+
+  const m = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/i.test(method) ? method.toUpperCase() : 'GET';
+  const headers = cleanFetchHeaders(reqHeaders);
+
+  // 1. Try in-page fetch if origin matches (or subdomains/third party per settings)
+  if (sameOriginOk(fullUrl)) {
+    try {
+      const pageResult = await evalInPage<{ ok: boolean; status?: number; statusText?: string; mime?: string; headers?: Record<string, string>; text?: string; error?: string }>(
+        `(async () => {
+          try {
+            const cleanHeaders = ${JSON.stringify(headers)};
+            let r;
+            try {
+              r = await fetch(${JSON.stringify(fullUrl)}, {
+                method: ${JSON.stringify(m)},
+                credentials: 'include',
+                headers: cleanHeaders,
+              });
+            } catch {
+              r = await fetch(${JSON.stringify(fullUrl)}, {
+                method: ${JSON.stringify(m)},
+                credentials: 'include',
+              });
+            }
+            const status = r.status;
+            const statusText = r.statusText;
+            const mime = r.headers.get('content-type') || '';
+            const hdrs = {};
+            try { r.headers.forEach((v, k) => { hdrs[k] = v; }); } catch {}
+            const text = await r.text();
+            return { ok: true, status, statusText, mime, headers: hdrs, text: text.slice(0, 1000000) };
+          } catch (e) {
+            return { ok: false, error: String(e).slice(0, 180) };
+          }
+        })()`
+      );
+      if (pageResult && pageResult.ok && typeof pageResult.text === 'string') {
+        return {
+          ok: true,
+          text: pageResult.text,
+          status: pageResult.status,
+          statusText: pageResult.statusText,
+          mime: pageResult.mime,
+          headers: pageResult.headers,
+          source: 'page',
+        };
+      }
+    } catch { /* fall through to background replay fetch */ }
+  }
+
+  // 2. Fallback to background replay fetch (bypasses page CORS via extension permissions)
+  try {
+    const id = `live-${Date.now().toString(36)}`;
+    const bgRes = (await chrome.runtime.sendMessage({
+      type: 'replay-request',
+      id,
+      method: m,
+      url: fullUrl,
+      headers,
+    })) as ReplayResponse;
+    if (bgRes && bgRes.ok && typeof bgRes.bodyText === 'string') {
+      return {
+        ok: true,
+        text: bgRes.bodyText,
+        status: bgRes.status,
+        statusText: bgRes.statusText,
+        mime: bgRes.headers?.['content-type'],
+        headers: bgRes.headers,
+        source: 'background',
+      };
+    }
+    return {
+      ok: false,
+      error: bgRes?.error ?? 'background fetch failed',
+      source: 'background',
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: String(e).slice(0, 140),
+      source: 'background',
+    };
+  }
+}
+
+/** Resolve previewable content for a URL: retained raw body, else on-demand live fetch. */
 async function resolveContent(url: string): Promise<{ text: string; meta: string; truncated: boolean }> {
   const kept = rawBodies.get(url);
   if (kept != null) {
     if (isBinaryText(kept)) {
-      return { text: BINARY_BODY_NOTE, meta: `binary/compressed body · ${formatBytes(kept.length)} · metadata only`, truncated: false };
+      return { text: formatHexDump(kept, 4096), meta: `binary/compressed body · ${formatBytes(kept.length)}`, truncated: kept.length > 4096 };
     }
     const cap = 20_000;
     return {
@@ -2548,7 +2767,7 @@ async function resolveContent(url: string): Promise<{ text: string; meta: string
       const disk = await idbGetBody(sessionId, url);
       if (typeof disk === 'string' && disk.length) {
         if (isBinaryText(disk)) {
-          return { text: BINARY_BODY_NOTE, meta: `binary/compressed body (temp-disk) · ${formatBytes(disk.length)}`, truncated: false };
+          return { text: formatHexDump(disk, 4096), meta: `binary/compressed body (temp-disk) · ${formatBytes(disk.length)}`, truncated: disk.length > 4096 };
         }
         const cap = 20_000;
         return {
@@ -2561,29 +2780,267 @@ async function resolveContent(url: string): Promise<{ text: string; meta: string
   } catch { /* fall through to on-demand fetch */ }
   const meta0 = resources.get(url);
   if (meta0 && (meta0.kind === 'media-meta' || meta0.kind === 'font-meta')) {
-    return { text: '(binary/media/font — metadata only, never copied into the index)', meta: `${meta0.kind} · ${meta0.mime ?? ''}`, truncated: false };
-  }
-  if (!sameOriginOk(url)) {
-    return { text: '(cross-origin — grant site access, then recapture to preview content)', meta: 'no body retained', truncated: false };
+    return { text: `(${meta0.kind}: ${url})`, meta: `${meta0.kind} · ${meta0.mime ?? ''}`, truncated: false };
   }
   try {
-    const text = await evalInPage<string>(`(async()=>{try{const r=await fetch(${JSON.stringify(url)},{credentials:'same-origin'});if(!r.ok)return '__ERR__:HTTP '+r.status;const t=await r.text();return t.slice(0,20000);}catch(e){return '__ERR__:'+String(e).slice(0,160)}})()`);
-    if (!text || text.startsWith('__ERR__')) return { text: `(unavailable: ${text?.slice(0, 120) ?? 'fetch failed'})`, meta: 'fetch failed', truncated: false };
-    return { text, meta: `fetched on demand · showing up to 20 KB · ${text.length >= 20000 ? 'truncated' : `${formatBytes(text.length)}`}`, truncated: text.length >= 20000 };
-  } catch (e) { return { text: `(preview failed: ${String(e).slice(0, 120)})`, meta: 'error', truncated: false }; }
+    const fetched = await fetchEndpointData(url);
+    if (fetched.ok && typeof fetched.text === 'string') {
+      const text = fetched.text;
+      const cap = 20_000;
+      return {
+        text: text.length > cap ? text.slice(0, cap) : text,
+        meta: `fetched on demand (${fetched.source}) · ${formatBytes(text.length)}${text.length > cap ? ` · showing first ${formatBytes(cap)}` : ''}`,
+        truncated: text.length > cap,
+      };
+    }
+    return { text: `(${url} - ${fetched.error ?? 'fetch unavailable'})`, meta: 'fetch unavailable', truncated: false };
+  } catch (e) {
+    return { text: `(${url} - error: ${String(e).slice(0, 120)})`, meta: 'error', truncated: false };
+  }
 }
 
-async function viewUrl(url: string): Promise<void> {
+/** Universal Multi-Format Human-Readable Viewer: renders and inspects any payload without failure states.
+ *  When viewing routes/APIs without retained bodies, actively executes live fetches to show the real endpoint response!
+ */
+async function viewUrl(url: string, forceLive = false): Promise<void> {
+  closeViewer();
   viewerUrl = url;
   $('viewerTitle').textContent = shortLabel(url);
-  $('viewerMeta').textContent = 'loading…';
-  ($('viewerBody') as HTMLElement).textContent = '';
+  $('viewerMeta').textContent = 'resolving resource…';
+  const bodyEl = $('viewerBody') as HTMLElement;
+  const mediaEl = $('viewerMedia') as HTMLElement;
+  const infoEl = $('viewerInfo') as HTMLElement;
+  bodyEl.textContent = 'loading content…';
+  mediaEl.innerHTML = '';
+  infoEl.innerHTML = '';
   $('viewer').classList.remove('hidden');
   modalTakeFocus('viewerClose');
-  const { text, meta } = await resolveContent(url);
-  if (viewerUrl !== url) return; // superseded by a newer View click
-  $('viewerMeta').textContent = meta;
-  ($('viewerBody') as HTMLElement).textContent = text;
+
+  const targetUrl = routeFullUrl(url);
+
+  // Metadata lookup
+  const resMeta = resources.get(targetUrl) ?? resources.get(url);
+  const netEntry = netEntries.find((x) => x.url === targetUrl || x.url === url);
+  let mime = netEntry?.mime ?? resMeta?.mime ?? '';
+  let status = netEntry?.status ?? resMeta?.status;
+  let method = netEntry?.method ?? resMeta?.method ?? 'GET';
+  if (method === '—' || !/^[A-Z]+$/.test(method)) {
+    try {
+      const apiRow = buildApiRows().find((r) => r.url === targetUrl || r.url === url);
+      if (apiRow?.method && /^[A-Z]+$/.test(apiRow.method)) method = apiRow.method;
+      else method = 'GET';
+    } catch { method = 'GET'; }
+  }
+
+  if (forceLive) {
+    rawBodies.delete(url);
+    rawBodies.delete(targetUrl);
+  }
+
+  // 1. Body retrieval from RAM or IDB
+  let rawText = forceLive ? '' : (rawBodies.get(targetUrl) ?? rawBodies.get(url) ?? '');
+  let fromStore = !!rawText;
+  if (!rawText && !forceLive && idbReady) {
+    try {
+      const disk = (await idbGetBody(sessionId, targetUrl)) ?? (await idbGetBody(sessionId, url));
+      if (typeof disk === 'string' && disk) { rawText = disk; fromStore = true; }
+    } catch { /* ignore */ }
+  }
+
+  let fetchSource: 'cached' | 'page' | 'background' | 'none' = fromStore ? 'cached' : 'none';
+  let fetchErr = '';
+
+  // 2. On-demand live fetch if body not cached (e.g. uncalled routes/endpoints or discarded body)
+  if (!rawText && /^https?:\/\//i.test(targetUrl)) {
+    $('viewerMeta').textContent = `fetching live endpoint response (${method} ${shortLabel(targetUrl)})…`;
+    try {
+      const fetched = await fetchEndpointData(targetUrl, method, netEntry?.reqHeaders);
+      if (fetched.ok && typeof fetched.text === 'string') {
+        rawText = fetched.text;
+        fetchSource = fetched.source;
+        if (fetched.status != null) status = fetched.status;
+        if (fetched.mime) mime = fetched.mime;
+        if (fetched.headers && Object.keys(fetched.headers).length) {
+          if (netEntry) netEntry.resHeaders = { ...(netEntry.resHeaders ?? {}), ...fetched.headers };
+        }
+        // Cache the retrieved endpoint body so subsequent views are instant
+        if (rawText.length <= settings.maxResponseBytes) {
+          rawBodies.set(targetUrl, rawText);
+          if (!rawOrder.includes(targetUrl)) rawOrder.push(targetUrl);
+        }
+        // Ingest the fetched endpoint output into universal search index!
+        void ingestText(targetUrl, rawText, {
+          mime: mime || 'application/json',
+          route: sessionRoute,
+          method: 'live-fetch',
+          status,
+        });
+      } else {
+        fetchErr = fetched.error ?? 'endpoint returned empty or unreadable response';
+      }
+    } catch (e) {
+      fetchErr = String(e).slice(0, 140);
+    }
+  }
+
+  if (viewerUrl !== url) return; // superseded
+
+  // Detect category from URL, MIME, and actual response payload
+  const det = detectContentCategory(targetUrl, mime, rawText);
+  let category = det.category;
+  let formatted = '';
+  let decompressedNote = '';
+
+  // Handle Decompression (Gzip / Deflate)
+  if (category === 'gzip' && rawText) {
+    const decomp = await decompressPayload(rawText);
+    if (decomp.text && !decomp.error) {
+      decompressedNote = `decompressed ${decomp.format} (${formatBytes(rawText.length)} → ${formatBytes(decomp.text.length)})`;
+      rawText = decomp.text;
+      const subDet = detectContentCategory(targetUrl, mime, rawText);
+      category = subDet.category;
+    }
+  }
+
+  // Handle ZIP archives
+  if (category === 'zip' && rawText) {
+    const zipFiles = parseZipListing(rawText);
+    if (zipFiles.length) {
+      formatted = `ZIP Archive: ${zipFiles.length} file(s)\n`
+        + '='.repeat(70) + '\n'
+        + 'Index | Comp Size   | Uncomp Size | Path\n'
+        + '-'.repeat(70) + '\n'
+        + zipFiles.map((z, idx) => `${String(idx + 1).padStart(5)} | ${formatBytes(z.compressedSize).padEnd(11)} | ${formatBytes(z.uncompressedSize).padEnd(11)} | ${z.name}`).join('\n');
+    }
+  }
+
+  // Beautify / Format based on category
+  if (!formatted && rawText) {
+    if (category === 'javascript') {
+      formatted = beautifyJs(rawText);
+    } else if (category === 'json') {
+      formatted = beautifyJson(rawText);
+    } else if (category === 'css') {
+      formatted = beautifyCss(rawText);
+    } else if (category === 'html' || category === 'xml' || category === 'svg') {
+      formatted = beautifyHtml(rawText);
+    } else if (category === 'binary' || isBinaryText(rawText)) {
+      formatted = formatHexDump(rawText);
+    } else {
+      formatted = addLineNumbers(rawText);
+    }
+  }
+
+  // Handle Media Preview (Image, Audio, Video, SVG)
+  const isMedia = category === 'image' || category === 'audio' || category === 'video' || category === 'svg';
+  const previewTabBtn = document.getElementById('btnVModePreview');
+  if (isMedia) {
+    previewTabBtn?.classList.remove('hidden');
+    let mediaSrc = targetUrl;
+    if (rawText && (category === 'image' || category === 'audio' || category === 'video')) {
+      try {
+        const u8 = toUint8Array(rawText);
+        viewerBlobUrl = URL.createObjectURL(new Blob([u8.buffer as ArrayBuffer], { type: mime || (category === 'image' ? 'image/png' : category === 'audio' ? 'audio/mpeg' : 'video/mp4') }));
+        mediaSrc = viewerBlobUrl;
+      } catch { mediaSrc = targetUrl; }
+    }
+    if (category === 'image') {
+      mediaEl.innerHTML = `<img src="${esc(mediaSrc)}" alt="${esc(shortLabel(targetUrl))}" title="${esc(targetUrl)}" /><div class="muted small mono">${esc(det.label)} · ${formatBytes(rawText.length || (netEntry?.bodyChars ?? 0))}</div>`;
+    } else if (category === 'svg') {
+      mediaEl.innerHTML = `<div style="max-width:100%;max-height:450px;overflow:auto;display:flex;justify-content:center">${rawText ? rawText : `<img src="${esc(targetUrl)}" alt="svg" />`}</div><div class="muted small mono">${esc(det.label)}</div>`;
+    } else if (category === 'audio') {
+      mediaEl.innerHTML = `<audio controls src="${esc(mediaSrc)}" style="width:100%;max-width:540px"></audio><div class="muted small mono">${esc(det.label)} · ${formatBytes(rawText.length || (netEntry?.bodyChars ?? 0))}</div>`;
+    } else if (category === 'video') {
+      mediaEl.innerHTML = `<video controls src="${esc(mediaSrc)}" style="max-width:100%;max-height:420px"></video><div class="muted small mono">${esc(det.label)} · ${formatBytes(rawText.length || (netEntry?.bodyChars ?? 0))}</div>`;
+    }
+  } else {
+    previewTabBtn?.classList.add('hidden');
+  }
+
+  // If no raw body was retrieved (unreachable endpoint or empty body)
+  if (!rawText) {
+    const cardLines = [
+      `[Endpoint Summary]`,
+      `URL:     ${targetUrl}`,
+      `Method:  ${method}`,
+      `Status:  ${status != null ? status : '—'}`,
+      `MIME:    ${mime || '—'}`,
+      `Notice:  ${fetchErr ? `Live fetch could not reach endpoint (${fetchErr})` : status === 204 ? 'HTTP 204 No Content (endpoint returned an empty 0-byte body)' : 'No response body data returned by endpoint'}`,
+    ];
+    if (netEntry?.reqHeaders && Object.keys(netEntry.reqHeaders).length) {
+      cardLines.push('', `[Request Headers]`);
+      for (const [hk, hv] of Object.entries(netEntry.reqHeaders)) cardLines.push(`${hk}: ${hv}`);
+    }
+    if (netEntry?.resHeaders && Object.keys(netEntry.resHeaders).length) {
+      cardLines.push('', `[Response Headers]`);
+      for (const [hk, hv] of Object.entries(netEntry.resHeaders)) cardLines.push(`${hk}: ${hv}`);
+    }
+    const curl = netEntry ? buildCurl(netEntry.method, netEntry.url, netEntry.reqHeaders ?? {}) : `curl -X ${method} '${targetUrl.replace(/'/g, `'\\''`)}'`;
+    cardLines.push('', `[cURL Command]`, curl);
+    formatted = cardLines.join('\n');
+    viewerFormattedText = formatted;
+    viewerRawText = formatted;
+    viewerHexText = formatHexDump(formatted);
+  } else {
+    viewerFormattedText = formatted || rawText;
+    viewerRawText = rawText;
+    viewerHexText = formatHexDump(rawText);
+  }
+
+  // Populate Headers & Info tab
+  const curlCmd = netEntry ? buildCurl(netEntry.method, netEntry.url, netEntry.reqHeaders ?? {}) : `curl -X ${method} '${targetUrl.replace(/'/g, `'\\''`)}'`;
+  const fetchSourceLabel = fetchSource === 'cached' ? 'retained body'
+    : fetchSource === 'page' ? 'live fetched (page context)'
+    : fetchSource === 'background' ? 'live fetched (background service-worker)'
+    : fetchErr ? `fetch blocked (${fetchErr})` : 'metadata-only capture';
+
+  let infoHtml = `<table>`
+    + `<tr><th>URL</th><td class="mono" style="word-break:break-all">${esc(targetUrl)}</td></tr>`
+    + `<tr><th>Method / Status</th><td class="mono">${esc(method)} · ${status != null ? `<span class="${status >= 400 ? 'st-err' : 'st-ok'}">${status}</span>` : '—'}</td></tr>`
+    + `<tr><th>Live Fetch Source</th><td><span class="badge">${esc(fetchSourceLabel)}</span></td></tr>`
+    + `<tr><th>Content Category</th><td><span class="badge kind">${esc(det.label)}</span>${decompressedNote ? ` <span class="badge">${esc(decompressedNote)}</span>` : ''}</td></tr>`
+    + `<tr><th>MIME Type</th><td class="mono">${esc(mime || '—')}</td></tr>`
+    + `<tr><th>Payload Size</th><td class="mono">${formatBytes(rawText.length || (netEntry?.bodyChars ?? 0))} (${rawText.length} characters)</td></tr>`
+    + (netEntry?.route ? `<tr><th>Route</th><td class="mono">${esc(netEntry.route)}</td></tr>` : '')
+    + `</table>`;
+
+  if (netEntry?.reqHeaders && Object.keys(netEntry.reqHeaders).length) {
+    infoHtml += `<div class="dt-h" style="margin-top:10px">Request Headers (${Object.keys(netEntry.reqHeaders).length})</div><table>`;
+    for (const [k, v] of Object.entries(netEntry.reqHeaders)) infoHtml += `<tr><th>${esc(k)}</th><td class="mono" style="word-break:break-all">${esc(v)}</td></tr>`;
+    infoHtml += `</table>`;
+  }
+  if (netEntry?.resHeaders && Object.keys(netEntry.resHeaders).length) {
+    infoHtml += `<div class="dt-h" style="margin-top:10px">Response Headers (${Object.keys(netEntry.resHeaders).length})</div><table>`;
+    for (const [k, v] of Object.entries(netEntry.resHeaders)) infoHtml += `<tr><th>${esc(k)}</th><td class="mono" style="word-break:break-all">${esc(v)}</td></tr>`;
+    infoHtml += `</table>`;
+  }
+  infoHtml += `<div class="dt-h" style="margin-top:10px">Quick Actions</div><div class="vcard-actions">`
+    + `<button id="btnVCardFetch" class="primary" title="Fetch live response data again">Fetch Live</button>`
+    + `<button id="btnVCardCurl" title="Copy cURL command">Copy cURL</button>`
+    + `<button id="btnVCardReplay" title="Open Replay editor">Replay Request</button>`
+    + `<button id="btnVCardOpen" title="Open in new tab">Open ↗</button>`
+    + `</div>`;
+  infoEl.innerHTML = infoHtml;
+  viewerInfoText = `URL: ${targetUrl}\nMethod: ${method}\nStatus: ${status ?? '—'}\nSource: ${fetchSourceLabel}\nMIME: ${mime}\nCategory: ${det.label}\n\n${curlCmd}`;
+
+  $('btnVCardFetch')?.addEventListener('click', () => { void viewUrl(url, true); });
+  $('btnVCardCurl')?.addEventListener('click', () => void copyText(curlCmd, 'cURL command'));
+  $('btnVCardReplay')?.addEventListener('click', () => { closeViewer(); openReplay(targetUrl); });
+  $('btnVCardOpen')?.addEventListener('click', () => openUrl(targetUrl));
+
+  // Meta bar status
+  const metaParts: string[] = [det.label];
+  if (status != null) metaParts.push(`HTTP ${status}`);
+  if (decompressedNote) metaParts.push(decompressedNote);
+  if (rawText.length) metaParts.push(formatBytes(rawText.length));
+  if (fetchSource === 'cached') metaParts.push('retained body');
+  else if (fetchSource === 'page') metaParts.push('live fetched (page)');
+  else if (fetchSource === 'background') metaParts.push('live fetched (background)');
+  else if (fetchErr) metaParts.push(`error: ${fetchErr}`);
+  $('viewerMeta').textContent = metaParts.join(' · ');
+
+  // Switch to default mode (Preview for media, Formatted for code/data)
+  switchViewerMode(isMedia ? 'preview' : 'formatted');
 }
 
 function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
@@ -2609,7 +3066,12 @@ function tableClick(e: Event, kind: 'res' | 'net' | 'route'): void {
     return;
   }
   const url = t.dataset.url ?? '';
-  if (act === 'menu') { e.preventDefault(); e.stopPropagation(); toggleActMenu(t, { kind, url, items: ROW_MENU_ITEMS }); return; }
+  if (act === 'menu') {
+    e.preventDefault(); e.stopPropagation();
+    const items = t.dataset.hasReplay === '1' ? ROW_MENU_ITEMS.filter((i) => i.act !== 'replay') : ROW_MENU_ITEMS;
+    toggleActMenu(t, { kind, url, items });
+    return;
+  }
   hideActMenu();
   if (!url) return;
   rowAction(act ?? '', url, kind);
@@ -3106,7 +3568,12 @@ function apiClick(e: Event): void {
     return;
   }
   if (!url) return;
-  if (act === 'menu') { e.preventDefault(); e.stopPropagation(); toggleActMenu(t, { kind: 'api', url, items: ROW_MENU_ITEMS }); return; }
+  if (act === 'menu') {
+    e.preventDefault(); e.stopPropagation();
+    const items = t.dataset.hasReplay === '1' ? ROW_MENU_ITEMS.filter((i) => i.act !== 'replay') : ROW_MENU_ITEMS;
+    toggleActMenu(t, { kind: 'api', url, items });
+    return;
+  }
   hideActMenu();
   if (act === 'open' || act === 'copy' || act === 'view' || act === 'curl'
     || act === 'replay' || act === 'mock' || act === 'block') {
@@ -3140,13 +3607,13 @@ function syncAnaKindOptions(): void {
   if (!sel) return;
   const counts = new Map<string, number>();
   for (const f of secFindings) counts.set(anaFamily(f), (counts.get(anaFamily(f)) ?? 0) + 1);
+  if (anaKind !== 'ALL' && (counts.get(anaKind) ?? 0) === 0) anaKind = 'ALL';
   const order = ['ALL', 'secrets', 'framework', 'hygiene'];
   const labels: Record<string, string> = { ALL: 'all findings', secrets: 'secrets', framework: 'frameworks', hygiene: 'security & headers' };
   sel.innerHTML = order.map((k) => {
     const n = k === 'ALL' ? secFindings.length : (counts.get(k) ?? 0);
     return `<option value="${k}"${anaKind === k ? ' selected' : ''}>${labels[k]} (${n})</option>`;
   }).join('');
-  if (anaKind !== 'ALL' && (counts.get(anaKind) ?? 0) === 0) anaKind = 'ALL';
 }
 const SEC_BLURB: Record<Severity, string> = {
   critical: 'critical — likely live credentials or private keys; rotate immediately if exposed',
@@ -3212,7 +3679,10 @@ function renderAnalyze(): void {
   const sc = document.getElementById('secCount');
   if (sc) sc.textContent = `${total} findings${anaKind !== 'ALL' ? ` · ${anaFamilyLabel(anaKind)} only (of ${secFindings.length})` : ''} · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
   const ssb = document.getElementById('btnSecShowAll');
-  if (ssb) ssb.textContent = secShowAll ? 'Show less' : 'Show all';
+  if (ssb) {
+    ssb.textContent = secShowAll ? 'Show less' : 'Show all';
+    ssb.setAttribute('aria-expanded', secShowAll ? 'true' : 'false');
+  }
 }
 
 /** Fold exposure-engine findings into secFindings (deduped, capped, gated on
@@ -3381,29 +3851,6 @@ function buildSettings(): void {
   on('setSecrets', 'change', (e) => settings.analyzeSecrets = (e.target as HTMLInputElement).checked);
   on('setBinMeta', 'change', (e) => settings.includeBinaryMeta = (e.target as HTMLInputElement).checked);
   on('setOnBudget', 'change', (e) => settings.onBudget = (e.target as HTMLSelectElement).value as SessionSettings['onBudget']);
-  // Unified storage budget (RAM + temp-disk overflow). Presets + custom input
-  // (clamp 10..2048); setLimit applies live. Source-map/capture toggles above
-  // keep their exact semantics.
-  const storages: number[] = [60, 100, 250, 500, 1024];
-  const srow = document.getElementById('storageRow');
-  if (srow) {
-    srow.innerHTML = storages.map((b) => `<button data-s="${b}" class="${settings.storageMB === b ? 'primary' : ''}">${b} MB</button>`).join('');
-    srow.querySelectorAll('button').forEach((el) => el.addEventListener('click', () => {
-      settings.storageMB = Number((el as HTMLElement).dataset.s);
-      try { store.setLimit(settings.storageMB * 1024 * 1024); } catch { /* ignore */ }
-      buildSettings(); renderMem();
-    }));
-  }
-  const setSMB = document.getElementById('setStorageMB') as HTMLInputElement | null;
-  if (setSMB) {
-    setSMB.value = String(settings.storageMB);
-    setSMB.addEventListener('change', (e) => {
-      const v = Math.min(2048, Math.max(10, Number((e.target as HTMLInputElement).value) || 250));
-      settings.storageMB = v;
-      try { store.setLimit(v * 1024 * 1024); } catch { /* ignore */ }
-      buildSettings(); renderMem();
-    });
-  }
   const setMB = document.getElementById('setMaxBodyKB') as HTMLInputElement | null;
   if (setMB) {
     setMB.value = String(Math.round(settings.maxBodyBytes / 1024));
@@ -3467,10 +3914,12 @@ function applyTheme(): void {
   const light = settings.theme === 'light';
   document.body.dataset.theme = light ? 'light' : 'dark';
   $('btnTheme').textContent = light ? '◐ Dark' : '◐ Light';
+  $('btnTheme').setAttribute('aria-pressed', light ? 'true' : 'false');
 }
 
 function syncPause(): void {
   $('btnPause').textContent = paused ? 'Resume' : 'Pause';
+  $('btnPause').setAttribute('aria-pressed', paused ? 'true' : 'false');
   try { chrome.runtime.sendMessage({ type: 'set-paused', paused }); } catch { /* ignore */ }
   renderOverview();
 }
@@ -3481,8 +3930,20 @@ function wire(): void {
   on('viewerClose', 'click', closeViewer);
   on('viewer', 'click', (e) => { if ((e.target as HTMLElement).id === 'viewer') closeViewer(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { hideActMenu(true); closeViewer(); } });
-  on('viewerCopy', 'click', () => void copyText((document.getElementById('viewerBody') as HTMLElement)?.textContent ?? '', 'preview content'));
+  on('viewerCopy', 'click', () => {
+    let textToCopy = '';
+    if (viewerMode === 'raw') textToCopy = viewerRawText;
+    else if (viewerMode === 'hex') textToCopy = viewerHexText || (viewerRawText ? formatHexDump(viewerRawText) : '');
+    else if (viewerMode === 'info') textToCopy = viewerInfoText;
+    else textToCopy = viewerFormattedText || viewerRawText;
+    void copyText(textToCopy, `viewer content (${viewerMode})`);
+  });
+  on('viewerFetchLive', 'click', () => { if (viewerUrl) void viewUrl(viewerUrl, true); });
   on('viewerOpen', 'click', () => { if (viewerUrl) openUrl(viewerUrl); });
+  document.querySelectorAll('#viewerTabs .vtab').forEach((b) => b.addEventListener('click', (e) => {
+    const m = (e.currentTarget as HTMLElement).dataset.vmode;
+    if (m) switchViewerMode(m as ViewerMode);
+  }));
   // Interception modals (null-safe like the viewer above).
   on('replaySend', 'click', () => void sendReplay());
   on('replayClose', 'click', () => { document.getElementById('replayModal')?.classList.add('hidden'); modalReturnFocus(); });
@@ -3544,9 +4005,13 @@ function wire(): void {
   document.addEventListener('scroll', () => hideActMenu(), true);
   document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => {
     hideActMenu();
-    document.querySelectorAll('#tabs button').forEach((x) => x.classList.remove('active'));
+    document.querySelectorAll('#tabs button').forEach((x) => {
+      x.classList.remove('active');
+      x.setAttribute('aria-selected', 'false');
+    });
     document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
     b.classList.add('active');
+    b.setAttribute('aria-selected', 'true');
     try { document.getElementById(`tab-${(b as HTMLElement).dataset.tab}`)?.classList.add('active'); } catch { /* ignore */ }
   }));
   on('q', 'input', () => { clearTimeout(searchTimer); searchTimer = window.setTimeout(runSearch, 160); });
@@ -3591,8 +4056,13 @@ function wire(): void {
     try { (b as HTMLElement).setAttribute('aria-pressed', String(on)); } catch { /* ignore */ }
   }));
   on('mode', 'change', runSearch);
-  // Click-to-open: event delegation for result "Open ↗" buttons + row click.
+  // Click-to-open: event delegation for result "View" / "Open ↗" buttons + row click.
   on('results', 'click', (e) => {
+    const vbtn = (e.target as HTMLElement).closest?.('[data-view-rec]') as HTMLElement | null;
+    if (vbtn?.dataset.viewRec) {
+      const rec = lastResultsById.get(Number(vbtn.dataset.viewRec));
+      if (rec?.prov?.resourceUrl) { void viewUrl(rec.prov.resourceUrl); return; }
+    }
     const t = (e.target as HTMLElement).closest?.('[data-open]') as HTMLElement | null;
     if (t?.dataset.open) { void openSource(Number(t.dataset.open)); return; }
     const row = (e.target as HTMLElement).closest?.('.res') as HTMLElement | null;
@@ -3647,7 +4117,7 @@ function wire(): void {
     applyTheme();
   });
   on('btnPause', 'click', () => { paused = !paused; syncPause(); });
-  on('btnClear', 'click', clearSession);
+  on('btnClear', 'click', () => { clearSession(true); });
   on('btnRecapture', 'click', () => { try { chrome.devtools.inspectedWindow.reload(); } catch { diag('reload failed'); } });
   on('btnReindex', 'click', reindex);
   on('btnMemClean', 'click', () => {
@@ -3674,9 +4144,9 @@ function wire(): void {
   on('btnDebugger', 'click', enableDebugger);
 }
 
-function clearSession(): void {
+function clearSession(prompt = true): boolean {
   hideActMenu();
-  if (!confirm('Clear the current session? All captured data leaves RAM and cannot be undone. Export first if anything matters.')) return;
+  if (prompt && !confirm('Clear the current session? All captured data leaves RAM and cannot be undone. Export first if anything matters.')) return false;
   sendCdpStop('clear');
   stopDeepScan('clear');
   // Session rotation: drop the old temp-disk session, mint a new id, bump gen
@@ -3722,6 +4192,7 @@ function clearSession(): void {
   $('results').innerHTML = ''; $('resultMeta').textContent = '';
   diag('session cleared (RAM released)');
   renderAll();
+  return true;
 }
 
 async function reindex(): Promise<void> {
@@ -3730,23 +4201,30 @@ async function reindex(): Promise<void> {
     return;
   }
   index.clear();
+  contentHash.clear();
   diag(`reindexing ${rawBodies.size} retained resources…`);
   for (const [url, text] of rawBodies) {
     const m = resources.get(url);
     // eslint-disable-next-line no-await-in-loop
     await ingestText(url, text, { kind: m?.kind, mime: m?.mime, route: m?.route ?? sessionRoute, method: m?.method ?? 'manual', status: m?.status });
-    contentHash.delete(url); // allow re-ingest (ingestText dedupes otherwise)
   }
+  diag(`reindexing complete: ${index.size} tokens in index`);
+  runSearch();
+  renderAll();
 }
 
 function exportSession(): void {
   // Explicit user action only.
   const payload = {
-    tool: 'DeepScope 1.7.0', exportedAt: new Date().toISOString(), origin: sessionOrigin,
+    tool: 'DeepScope',
+    format: 1,
+    version: '3.10.0',
+    exportedAt: new Date().toISOString(),
+    origin: sessionOrigin,
     counts: { routes: routes.size, resources: resources.size, requests: netEntries.length, strings: index.size },
     routes: [...routes.entries()].map(([route, v]) => ({ route, ...v })),
     resources: [...resources.values()],
-    network: netEntries.slice(0, 500),
+    network: netEntries.slice(0, DSZ_MAX_ENTRIES),
     graph: { nodes: [...graph.nodes.values()].slice(0, 1000), edges: graph.edges.slice(0, 2000) },
     memory: ledger.stats(),
     note: 'Provenance included per record in-app; raw bodies included only if retainRaw was on.',
@@ -3815,7 +4293,7 @@ async function saveSessionFile(): Promise<void> {
 
 /** Restore a validated session file into live state (re-ingest → re-index). */
 async function restoreSessionFile(file: SessionFile): Promise<void> {
-  clearSession();
+  if (!clearSession(true)) return;
   try { sessionOrigin = file.origin || sessionOrigin; } catch { /* keep */ }
   try { $('scopeLabel').textContent = `scope: ${sessionOrigin}`; } catch { /* ignore */ }
   let restored = 0;
@@ -3836,7 +4314,7 @@ async function restoreSessionFile(file: SessionFile): Promise<void> {
       const url = String((n as { url?: unknown }).url ?? '');
       if (!url) continue;
       const e = { ...(n as object), url } as NetEntry;
-      unshiftNet(e);
+      unshiftNet(e, DSZ_MAX_ENTRIES);
       ledger.requests++;
       recordNetworkEvidence(e.method ?? 'GET', url, { status: e.status, mime: e.mime, workerKind: e.workerKind ?? 'unknown', route: e.route ?? sessionRoute });
     } catch { /* skip one bad record */ }
@@ -3902,7 +4380,7 @@ function permStatus(msg: string): void {
 async function syncGrantBtn(): Promise<void> {
   try {
     const held = sessionOrigin
-      ? await chrome.permissions.contains({ origins: [`${sessionOrigin}/*`] })
+      ? await chrome.permissions.contains({ origins: [originPattern(sessionOrigin)] })
       : false;
     const btn = document.getElementById('btnGrant') as HTMLButtonElement | null;
     if (btn && !btn.disabled) btn.textContent = held ? 'Site access: ON' : 'Grant site access';
@@ -3918,14 +4396,15 @@ async function grantSite(): Promise<void> {
       diag('open a page first, then grant access');
       return;
     }
+    const pat = originPattern(sessionOrigin);
     permStatus(`Asking the browser for access to ${sessionOrigin}…`);
-    const ok = await chrome.permissions.request({ origins: [`${sessionOrigin}/*`] });
+    const ok = await chrome.permissions.request({ origins: [pat] });
     diag(ok ? `site access granted for ${sessionOrigin}: registering content observer` : 'site access declined — eval-based capture continues');
     permStatus(ok ? `Site access granted for ${sessionOrigin}.` : 'Site access declined — eval-based capture continues.');
     if (ok) {
       try {
         await chrome.scripting.registerContentScripts([{
-          id: 'deepscope-observer', matches: [`${sessionOrigin}/*`], js: ['dist/content.js'],
+          id: 'deepscope-observer', matches: [pat], js: ['dist/content.js'],
           runAt: 'document_idle', allFrames: true, persistAcrossSessions: false,
         }]);
         permStatus(`Site access granted for ${sessionOrigin} — observer registered.`);
