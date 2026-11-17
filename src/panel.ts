@@ -418,68 +418,75 @@ async function ingestText(
   } = {},
 ): Promise<void> {
   if (paused || !text) return;
+  // Canonical absolute URL normalization: prevent relative + absolute duplicate entries
+  const canonicalUrl = (url.startsWith('/') && sessionOrigin) ? sessionOrigin + url : url;
+  if (canonicalUrl !== url && resources.has(url)) {
+    resources.delete(url);
+  }
+  const targetUrl = canonicalUrl;
+
   const route = opts.route ?? sessionRoute;
   const mime = opts.mime ?? '';
-  const kind = opts.kind ?? kindFor(url, mime);
+  const kind = opts.kind ?? kindFor(targetUrl, mime);
   if (isBinaryKind(kind) && !settings.includeBinaryMeta) return;
   if (isBinaryKind(kind)) {
-    upsertResource(url, { url, kind, route, method: opts.method ?? 'devtools-network', status: opts.status, mime, size: text.length, indexed: false, hasSourceMap: false, indexedStrings: 0, ts: Date.now() });
+    upsertResource(targetUrl, { url: targetUrl, kind, route, method: opts.method ?? 'devtools-network', status: opts.status, mime, size: text.length, indexed: false, hasSourceMap: false, indexedStrings: 0, ts: Date.now() });
     // Binary bodies stay metadata-only by default; retainBinary (+retainRaw)
     // keeps a bounded copy for View/copy without ever indexing binary bytes.
-    if (settings.retainBinary && settings.retainRaw && !metaOnlyBody && !rawBodies.has(url)
+    if (settings.retainBinary && settings.retainRaw && !metaOnlyBody && !rawBodies.has(targetUrl)
       && text.length <= settings.maxBodyBytes && storeCanRetain(text.length, 'raw-bodies')) {
-      rawBodies.set(url, text);
-      rawOrder.push(url);
+      rawBodies.set(targetUrl, text);
+      rawOrder.push(targetUrl);
       ledger.rawBytes += text.length;
       storeAdd('raw-bodies', text.length);
     }
     return; // metadata only — never index binary bytes
   }
   const capKey = opts.method ?? 'devtools-network';
-  if (!captureAllowed(kind)) { diag(`skipped by capture toggle: ${kind}`, url); return; }
-  if (resources.size >= settings.maxResources) { diag(`resource cap reached (${settings.maxResources}); skipping`, url); return; }
+  if (!captureAllowed(kind)) { diag(`skipped by capture toggle: ${kind}`, targetUrl); return; }
+  if (resources.size >= settings.maxResources) { diag(`resource cap reached (${settings.maxResources}); skipping`, targetUrl); return; }
   // Dedupe identical URL+content
   let h = 0;
   for (let i = 0; i < text.length; i += 7) h = (Math.imul(h, 33) + text.charCodeAt(i)) >>> 0;
-  if (contentHash.get(url) === h) return;
-  contentHash.set(url, h);
+  if (contentHash.get(targetUrl) === h) return;
+  contentHash.set(targetUrl, h);
 
   const capped = text.length > settings.maxResponseBytes
     ? text.slice(0, settings.maxResponseBytes)
     : text;
   const truncated = capped.length < text.length;
-  if (truncated) diag(`truncated to maxResponseBytes (${formatBytes(settings.maxResponseBytes)})`, url);
+  if (truncated) diag(`truncated to maxResponseBytes (${formatBytes(settings.maxResponseBytes)})`, targetUrl);
 
   const indexedSlice = capped.slice(0, settings.maxIndexedChars);
   const meta: ResourceMeta = {
-    url, kind, route, method: capKey, initiator: opts.initiator, status: opts.status, mime,
+    url: targetUrl, kind, route, method: capKey, initiator: opts.initiator, status: opts.status, mime,
     size: capped.length, indexed: false, hasSourceMap: false, indexedStrings: 0, ts: Date.now(),
   };
   if (truncated) meta.error = 'truncated: exceeded maxResponseBytes';
-  const isNewResource = !resources.has(url);
-  resources.set(url, meta);
+  const isNewResource = !resources.has(targetUrl);
+  resources.set(targetUrl, meta);
   ledger.resources = resources.size;
   if (isNewResource && kind === 'chunk') ledger.chunks++;
 
   // Route + graph bookkeeping
   touchRoute(route, capKey);
   graph.addNode(graph.routeNode(route), route, 'route', route);
-  graph.addNode(url, shortLabel(url), kind === 'chunk' ? 'chunk' : url.includes('/api/') ? 'endpoint' : 'resource', url);
-  graph.link(graph.routeNode(route), url, capKey);
+  graph.addNode(targetUrl, shortLabel(targetUrl), kind === 'chunk' ? 'chunk' : targetUrl.includes('/api/') ? 'endpoint' : 'resource', targetUrl);
+  graph.link(graph.routeNode(route), targetUrl, capKey);
 
   if (settings.retainRaw && !metaOnlyBody) {
     const len = capped.length;
     if (len > settings.maxBodyBytes) {
-      diagOnce('body-maxsize', `body exceeds maxBodyBytes (${formatBytes(settings.maxBodyBytes)}) — kept metadata only`, url);
+      diagOnce('body-maxsize', `body exceeds maxBodyBytes (${formatBytes(settings.maxBodyBytes)}) — kept metadata only`, targetUrl);
       meta.error = `body exceeded maxBodyBytes (${formatBytes(settings.maxBodyBytes)})`;
     } else if (!storeCanRetain(len, 'raw-bodies')) {
-      diagOnce('body-budget', 'body-retention budget full — kept metadata only', url);
+      diagOnce('body-budget', 'body-retention budget full — kept metadata only', targetUrl);
       meta.error = 'body skipped: retention budget full';
     } else if (len > 64 * 1024) {
-      void retainOverflow(url, capped); // temp-disk overflow, RAM stays flat
+      void retainOverflow(targetUrl, capped); // temp-disk overflow, RAM stays flat
     } else {
-      rawBodies.set(url, capped);
-      rawOrder.push(url);
+      rawBodies.set(targetUrl, capped);
+      rawOrder.push(targetUrl);
       ledger.rawBytes += len;
       storeAdd('raw-bodies', len);
     }
@@ -490,29 +497,29 @@ async function ingestText(
   if (settings.analyzeSourceMaps && (kind === 'script' || kind === 'chunk')) {
     const sm = /\/\/#\s*sourceMappingURL\s*=\s*(\S+)/.exec(capped.slice(-6000));
     if (sm?.[1] && !sm[1].startsWith('data:')) {
-      const smUrl = resolveUrl(url, sm[1]);
+      const smUrl = resolveUrl(targetUrl, sm[1]);
       meta.hasSourceMap = true; meta.sourceMapUrl = smUrl;
       graph.addNode(smUrl, shortLabel(smUrl), 'resource', smUrl);
-      graph.link(url, smUrl, 'sourcemap-ref');
-      queueSourceMap(url, smUrl, route);
+      graph.link(targetUrl, smUrl, 'sourcemap-ref');
+      queueSourceMap(targetUrl, smUrl, route);
     }
   }
 
   // Directly-captured map bodies (devtools/CDP/deep-fetch landed the .map
   // itself): rebuild original sources inline, same shape as fetchSourceMap.
-  if (settings.analyzeSourceMaps && (kind === 'source-map' || /\.map(\?|$)/i.test(url))) {
+  if (settings.analyzeSourceMaps && (kind === 'source-map' || /\.map(\?|$)/i.test(targetUrl))) {
     // Recursion guard: rebuilt originals keep kind 'source-map' but live at
     // `mapUrl#srcPath` (always containing '#'). Only rebuild when the URL
     // itself ends in `.map` before any '#' fragment, so originals never
     // retrigger even though their kind matches.
-    const hashAt = url.indexOf('#');
-    const mapBase = hashAt >= 0 ? url.slice(0, hashAt) : url;
-    if (hashAt === -1 && (kind === 'source-map' || /\.map(\?|$)/i.test(mapBase)) && !smRebuilt.has(url)) {
+    const hashAt = targetUrl.indexOf('#');
+    const mapBase = hashAt >= 0 ? targetUrl.slice(0, hashAt) : targetUrl;
+    if (hashAt === -1 && (kind === 'source-map' || /\.map(\?|$)/i.test(mapBase)) && !smRebuilt.has(targetUrl)) {
       let direct: { files: Array<{ path: string; content: string }> } | null = null;
       try { direct = parseSourceMap(capped); } catch { direct = null; }
       const directFiles = direct?.files ?? [];
       if (directFiles.length) {
-        smRebuilt.add(url);
+        smRebuilt.add(targetUrl);
         let rn = 0;
         for (const f of directFiles) {
           if (rn >= 400) break;
@@ -520,15 +527,15 @@ async function ingestText(
           const content = f.content;
           if (typeof content !== 'string' || content.length <= 10) continue;
           reconstructedSourceFiles.set(srcName, f);
-          void resolveSourceUrl(url, srcName);
-          await ingestText(`${url}#${srcName}`, content.slice(0, 200000), {
+          void resolveSourceUrl(targetUrl, srcName);
+          await ingestText(`${targetUrl}#${srcName}`, content.slice(0, 200000), {
             kind: 'source-map', mime: 'x-sourcemap', route, method: 'sourcemap-ref',
-            parentUrl: url, detail: `original source ${srcName} (compiled: ${shortLabel(url)})`,
+            parentUrl: targetUrl, detail: `original source ${srcName} (compiled: ${shortLabel(targetUrl)})`,
           });
           rn++;
         }
-        smOriginals.set(url, rn);
-        diag(`source map: ${rn} original sources indexed from ${shortLabel(url)}`);
+        smOriginals.set(targetUrl, rn);
+        diag(`source map: ${rn} original sources indexed from ${shortLabel(targetUrl)}`);
       }
     }
   }
@@ -656,10 +663,33 @@ function upsertResource(url: string, m: ResourceMeta): void {
   ledger.resources = resources.size;
 }
 
+function normalizeRoute(r: string): string {
+  if (!r) return '/';
+  let clean = r.trim();
+  if (sessionOrigin && clean.startsWith(sessionOrigin)) {
+    clean = clean.slice(sessionOrigin.length) || '/';
+  } else if (/^https?:\/\/[^/]+/i.test(clean)) {
+    try {
+      const u = new URL(clean);
+      if (sessionOrigin && u.origin === sessionOrigin) {
+        clean = u.pathname + u.search;
+      }
+    } catch { /* keep raw */ }
+  }
+  if (!clean.startsWith('/') && !clean.startsWith('#') && !/^https?:\/\//i.test(clean)) {
+    clean = '/' + clean;
+  }
+  if (clean.length > 1 && clean.endsWith('/')) {
+    clean = clean.slice(0, -1);
+  }
+  return clean;
+}
+
 function touchRoute(route: string, method: DiscoveryMethod): void {
-  const r = routes.get(route);
+  const norm = normalizeRoute(route);
+  const r = routes.get(norm);
   if (r) r.count++;
-  else { routes.set(route, { method, count: 1 }); ledger.routes = routes.size; }
+  else { routes.set(norm, { method, count: 1 }); ledger.routes = routes.size; }
 }
 
 function captureAllowed(kind: ResourceKind): boolean {
@@ -673,6 +703,7 @@ function captureAllowed(kind: ResourceKind): boolean {
 
 // Discovered-URL queue (feeds Deep Scan; in passive mode only indexes the string).
 const discoveredUrls: Array<{ from: string; url: string; route: string; kind: string }> = [];
+const discoveredUrlSet = new Set<string>();
 function considerDiscoveredUrl(from: string, raw: string, route: string, kind: string): void {
   // Route/endpoint facets are bare paths ("/api/models"); register them as
   // first-class routes immediately so the Routes tab + graph show them even
@@ -685,7 +716,10 @@ function considerDiscoveredUrl(from: string, raw: string, route: string, kind: s
   let abs: string;
   try { abs = new URL(raw, from).toString(); } catch { return; }
   if (!/^https?:/.test(abs) || abs.length > 500) return;
-  if (discoveredUrls.length < 2000) discoveredUrls.push({ from, url: abs, route, kind });
+  if (!discoveredUrlSet.has(abs) && discoveredUrls.length < 2000) {
+    discoveredUrlSet.add(abs);
+    discoveredUrls.push({ from, url: abs, route, kind });
+  }
   // Graph edge for provenance
   const isEndpoint = abs.includes('/api/') || kind === 'endpoint' || kind === 'fetch-target';
   graph.addNode(abs, shortLabel(abs), isEndpoint ? 'endpoint' : 'resource', abs);
@@ -846,6 +880,24 @@ function workerKindFor(targetId?: string): WorkerKind {
 
 /** Insert with index fix-up (netEntries is newest-first) + trim + map prune. */
 function unshiftNet(e: NetEntry, cap = 800): void {
+  // Deduplicate rapid identical captures (e.g. HAR snapshot + onRequestFinished or CDP overlap)
+  if (netEntries.length > 0) {
+    const recent = netEntries.slice(0, 25);
+    const dup = recent.find((existing) =>
+      existing.url === e.url &&
+      existing.method === e.method &&
+      (existing.reqId === e.reqId || Math.abs(existing.ts - e.ts) < 1500)
+    );
+    if (dup) {
+      if (e.status !== undefined && (dup.status === undefined || dup.status === 0)) dup.status = e.status;
+      if (e.mime && !dup.mime) dup.mime = e.mime;
+      if (e.bodyKept && !dup.bodyKept) { dup.bodyKept = true; dup.bodyChars = e.bodyChars; }
+      if (e.reqHeaders && !dup.reqHeaders) dup.reqHeaders = e.reqHeaders;
+      if (e.resHeaders && !dup.resHeaders) dup.resHeaders = e.resHeaders;
+      if (e.reqBody && !dup.reqBody) dup.reqBody = e.reqBody;
+      return;
+    }
+  }
   netEntries.unshift(e);
   for (const [k, v] of reqIdMap) reqIdMap.set(k, v + 1);
   if (e.reqId) reqIdMap.set(e.reqId, 0);
@@ -1927,9 +1979,14 @@ function filteredRoutes(): Array<[string, { method: DiscoveryMethod; count: numb
   const input = (document.getElementById('routeFilter') as HTMLInputElement | null)?.value ?? '';
   const terms = parseFilterDsl(input);
   const out: Array<[string, { method: DiscoveryMethod; count: number }]> = [];
+  const seenUrls = new Set<string>();
   for (const [r, v] of routes) {
-    if (input && !matchDslAll(terms, { method: v.method, route: r, url: routeFullUrl(r), seen: v.count }, r)) continue;
-    if (globalUrlQ && !matchGlobalUrl(routeFullUrl(r))) continue;
+    const full = routeFullUrl(r);
+    const normKey = full.replace(/\/$/, '');
+    if (seenUrls.has(normKey)) continue;
+    seenUrls.add(normKey);
+    if (input && !matchDslAll(terms, { method: v.method, route: r, url: full, seen: v.count }, r)) continue;
+    if (globalUrlQ && !matchGlobalUrl(full)) continue;
     out.push([r, v]);
     if (out.length >= 1200) break;
   }
@@ -1977,8 +2034,12 @@ function filteredResources(): ResourceMeta[] {
   const input = ($('resFilter') as HTMLInputElement).value ?? '';
   const terms = parseFilterDsl(input);
   const out: ResourceMeta[] = [];
+  const seenUrls = new Set<string>();
   // Single pass over live values — no intermediate arrays until the cap.
   for (const r of resources.values()) {
+    const canonical = (r.url.startsWith('/') && sessionOrigin) ? sessionOrigin + r.url : r.url;
+    if (seenUrls.has(canonical)) continue;
+    seenUrls.add(canonical);
     if (resType !== 'ALL' && r.kind !== resType) continue;
     if (input && !matchDslAll(terms, dslResRec(r), `${r.url} ${r.kind}`)) continue;
     if (globalUrlQ && !matchGlobalUrl(r.url)) continue;
@@ -3288,7 +3349,9 @@ function apiLike(url: string, mime?: string, method?: string, hasReqBody?: boole
 function buildApiRows(): ApiRow[] {
   const rows: ApiRow[] = [];
   // (1) CALLED: observed network entries that look API-like (cap 500).
+  // Deduplicate by method + canonical url so polling/repeated calls show as ONE row with call count!
   const called = new Set<string>();
+  const calledMap = new Map<string, { entry: NetEntry; count: number }>();
   let sniffed = 0;
   for (const n of netEntries) {
     const hasReq = !!(n.reqBody && n.reqBody.length);
@@ -3301,23 +3364,50 @@ function buildApiRows(): ApiRow[] {
       sniff = resLooksJson(n.url);
     }
     if (!apiLike(n.url, n.mime, n.method, hasReq, sniff)) continue;
-    called.add(n.url);
+
+    const key = `${n.method ?? 'GET'} ${n.url}`;
+    const existing = calledMap.get(key);
+    if (existing) {
+      existing.count++;
+      if (n.bodyKept && !existing.entry.bodyKept) existing.entry = n;
+      if (n.status && (!existing.entry.status || existing.entry.status === 0)) existing.entry.status = n.status;
+    } else {
+      calledMap.set(key, { entry: n, count: 1 });
+      called.add(n.url);
+      try {
+        const u = new URL(n.url);
+        called.add(u.pathname + u.search);
+        called.add(u.pathname);
+      } catch { /* ignore */ }
+    }
   }
+
   let nCalled = 0;
-  for (const n of netEntries) {
+  for (const [, { entry: n, count }] of calledMap) {
     if (nCalled >= 500) break;
-    if (!called.has(n.url)) continue;
-    rows.push({ method: n.method, url: n.url, kind: classifyApiKind(n.url, n.mime ?? ''), detail: `${n.status ?? '—'}${n.mime ? ` · ${n.mime}` : ''}`, entry: n });
+    const callSuffix = count > 1 ? ` (${count} calls)` : '';
+    rows.push({
+      method: n.method,
+      url: n.url,
+      kind: classifyApiKind(n.url, n.mime ?? ''),
+      detail: `${n.status ?? '—'}${n.mime ? ` · ${n.mime}` : ''}${callSuffix}`,
+      entry: n,
+    });
     nCalled++;
   }
+
   // (2) UNCALLED: API-like routes seen in code but never requested (cap 200).
   const apiRouteRe = /\/api(\/|$|[?#])|\/graphql|\/trpc|\/rest\/|v\d+\/|\/ajax\/|\/rpc\b|\/query\b|\/gateway\/|graphql/i;
   let nUncalled = 0;
+  const uncalledSeen = new Set<string>();
   for (const [route, v] of routes) {
     if (nUncalled >= 200) break;
     if (!(apiRouteRe.test(route) || v.method === 'fetch-target')) continue;
     const full = routeFullUrl(route);
-    if (called.has(full)) continue;
+    const baseFull = full.replace(/\/$/, '');
+    if (called.has(full) || called.has(baseFull) || called.has(baseFull + '/') || called.has(route)) continue;
+    if (uncalledSeen.has(baseFull)) continue;
+    uncalledSeen.add(baseFull);
     rows.push({ method: '—', url: full, kind: classifyApiKind(full, ''), detail: 'in code, not called' });
     nUncalled++;
   }
@@ -4678,7 +4768,7 @@ function clearSession(prompt = true): boolean {
   reconstructedSourceFiles.clear(); discoveredGraphQLOps.clear(); discoveredApiSchemas.clear();
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   secShowAll = false; routeShowAll = false; anaKind = 'ALL';
-  scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0;
+  scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0; discoveredUrlSet.clear();
   lastResults = []; lastResultsById.clear();
   resType = 'ALL'; netMethod = 'ALL'; netKind = 'ALL';
   globalUrlQ = '';
