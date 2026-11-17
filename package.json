@@ -10,6 +10,7 @@
     "check": "node scripts/check-manifest.mjs",
     "build:icons": "node scripts/gen-icons.mjs",
     "package": "node scripts/package.mjs",
+    "demo": "node scripts/start-demo.mjs",
     "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
   },
   "devDependencies": {

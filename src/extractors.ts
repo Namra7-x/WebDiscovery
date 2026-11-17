@@ -1092,6 +1092,9 @@ export interface BuildManifestResult {
 
 /**
  * Extracts routes and lazy chunk URLs from Next.js, Webpack, Nuxt, and Remix manifests.
+ * Supports Next.js Pages router (__BUILD_MANIFEST, __SSG_MANIFEST, sortedPages),
+ * Next.js App Router (RSC __next_f flight stream and app chunk patterns),
+ * and HTML __NEXT_DATA__ blocks.
  * Zero-dependency, tolerant parser.
  */
 export function parseBuildManifest(src: string): BuildManifestResult {
@@ -1099,10 +1102,11 @@ export function parseBuildManifest(src: string): BuildManifestResult {
   const chunks = new Set<string>();
   if (typeof src !== 'string' || src.length < 10) return { routes: [], chunks: [] };
 
-  // Next.js __BUILD_MANIFEST: self.__BUILD_MANIFEST = { ... } or __BUILD_MANIFEST_CB(...)
+  // 1. Next.js Pages Router: self.__BUILD_MANIFEST = { ... } or __BUILD_MANIFEST_CB(...)
   const bmIdx = src.indexOf('__BUILD_MANIFEST');
   if (bmIdx !== -1) {
-    const ROUTE_ENTRY_RE = /["'](\/[A-Za-z0-9_\-.~/:?#]*?)["']\s*:\s*\[([\s\S]*?)\]/g;
+    // Dynamic routes support brackets [slug], [...catchAll], [[...optional]]
+    const ROUTE_ENTRY_RE = /["'](\/[A-Za-z0-9_\-.~/:?#\[\]]*?)["']\s*:\s*\[([\s\S]*?)\]/g;
     ROUTE_ENTRY_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     let count = 0;
@@ -1119,12 +1123,28 @@ export function parseBuildManifest(src: string): BuildManifestResult {
         if (chunks.size < 500) chunks.add(cm[1]);
       }
     }
+
+    // Also parse sortedPages: ["/", "/about", "/users/[id]"]
+    const spIdx = src.indexOf('sortedPages');
+    if (spIdx !== -1) {
+      const SP_RE = /["'](\/[A-Za-z0-9_\-.~/:?#\[\]]*?)["']/g;
+      SP_RE.lastIndex = spIdx;
+      let spMatch: RegExpExecArray | null;
+      let spCount = 0;
+      while ((spMatch = SP_RE.exec(src)) && spCount < 300) {
+        spCount++;
+        const route = spMatch[1];
+        if (route && !route.startsWith('/_next') && !route.startsWith('/static')) {
+          routes.add(route);
+        }
+      }
+    }
   }
 
-  // Next.js __SSG_MANIFEST: new Set(["/page1", "/page2", ...])
+  // 2. Next.js __SSG_MANIFEST: new Set(["/page1", "/page2", ...])
   const ssgIdx = src.indexOf('__SSG_MANIFEST');
   if (ssgIdx !== -1) {
-    const SSG_RE = /["'](\/[A-Za-z0-9_\-.~/:?#]*)["']/g;
+    const SSG_RE = /["'](\/[A-Za-z0-9_\-.~/:?#\[\]]*)["']/g;
     SSG_RE.lastIndex = ssgIdx;
     let sm: RegExpExecArray | null;
     let count = 0;
@@ -1135,7 +1155,43 @@ export function parseBuildManifest(src: string): BuildManifestResult {
     }
   }
 
-  // Remix manifest routes
+  // 3. Next.js Pages Router HTML __NEXT_DATA__
+  const ndIdx = src.indexOf('__NEXT_DATA__');
+  if (ndIdx !== -1) {
+    const PAGE_RE = /["']page["']\s*:\s*["'](\/[A-Za-z0-9_\-.~/:?#\[\]]*?)["']/g;
+    let pm: RegExpExecArray | null;
+    while ((pm = PAGE_RE.exec(src))) {
+      if (pm[1] && !pm[1].startsWith('/_next')) routes.add(pm[1]);
+    }
+    const BID_RE = /["']buildId["']\s*:\s*["']([A-Za-z0-9_\-]+)["']/i.exec(src);
+    if (BID_RE && BID_RE[1]) {
+      const bid = BID_RE[1];
+      chunks.add(`/_next/static/${bid}/_buildManifest.js`);
+      chunks.add(`/_next/static/${bid}/_ssgManifest.js`);
+    }
+  }
+
+  // 4. Next.js App Router (RSC __next_f and app chunk patterns)
+  if (src.indexOf('__next_f') !== -1 || src.indexOf('static/chunks/app/') !== -1 || src.indexOf('/_next/static/chunks/app/') !== -1) {
+    const APP_CHUNK_RE = /(?:(?:\/_next\/)?static\/chunks\/)?app\/([A-Za-z0-9_\-\/\[\]]+?)\/(?:page|route|layout)(?:-[a-f0-9]+)?\.js/g;
+    let acm: RegExpExecArray | null;
+    let acCount = 0;
+    while ((acm = APP_CHUNK_RE.exec(src)) && acCount < 200) {
+      acCount++;
+      const cleanPath = '/' + acm[1].replace(/^\/+/, '');
+      if (!cleanPath.startsWith('/_')) routes.add(cleanPath);
+    }
+    const SEG_RE = /segmentPath["'\\]*\s*:\s*\[[\s"'\\]*children[\s"'\\]*,[\s"'\\]*([a-zA-Z0-9_\-]+)["'\\]/g;
+    let segm: RegExpExecArray | null;
+    while ((segm = SEG_RE.exec(src)) && routes.size < 500) {
+      const r = segm[1];
+      if (r && !r.startsWith('(') && !r.startsWith('_') && !r.startsWith('$')) {
+        routes.add('/' + r);
+      }
+    }
+  }
+
+  // 5. Remix manifest routes
   const remixIdx = src.indexOf('__remixContext');
   if (remixIdx !== -1) {
     const REMIX_ROUTE_RE = /["']path["']\s*:\s*["']([^"']+)["']/g;

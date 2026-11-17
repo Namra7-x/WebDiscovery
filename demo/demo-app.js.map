@@ -1,0 +1,14 @@
+{
+  "version": 3,
+  "file": "demo-app.js",
+  "sources": [
+    "webpack://_N_E/src/components/SecretAdmin.tsx",
+    "webpack://_N_E/src/api/auth.ts"
+  ],
+  "sourcesContent": [
+    "export const SecretAdmin = () => <h1>Top Secret Admin Vault</h1>;\n// Staging credentials: user=admin pass=SuperSecretStaging123\n",
+    "export async function login(username: string, pass: string) {\n  return fetch('/api/auth/login');\n}\n"
+  ],
+  "names": [],
+  "mappings": "AAAA;ACAA"
+}

@@ -765,7 +765,9 @@ ok('Reverse Engineering: Framework Manifest Mining', () => {
       __rewrites: { beforeFiles: [], afterFiles: [], fallback: [] },
       "/": ["static/chunks/pages/index-abc.js"],
       "/admin/dashboard": ["static/chunks/pages/admin/dashboard-123.js", "static/chunks/684-xyz.js"],
-      "/api/auth/login": ["static/chunks/pages/api/auth-456.js"]
+      "/api/auth/login": ["static/chunks/pages/api/auth-456.js"],
+      "/blog/[slug]": ["static/chunks/pages/blog/[slug]-789.js"],
+      sortedPages: ["/", "/admin/dashboard", "/api/auth/login", "/blog/[slug]", "/billing/invoices"]
     };
     self.__SSG_MANIFEST = new Set(["/about", "/pricing", "/features"]);
   `;
@@ -773,9 +775,22 @@ ok('Reverse Engineering: Framework Manifest Mining', () => {
   assert.ok(parsed.routes.includes('/'), 'includes root route');
   assert.ok(parsed.routes.includes('/admin/dashboard'), 'includes hidden admin route');
   assert.ok(parsed.routes.includes('/api/auth/login'), 'includes api auth route');
+  assert.ok(parsed.routes.includes('/blog/[slug]'), 'includes dynamic bracket route');
+  assert.ok(parsed.routes.includes('/billing/invoices'), 'includes route from sortedPages');
   assert.ok(parsed.routes.includes('/about'), 'includes SSG route');
   assert.ok(parsed.chunks.some((c) => c.includes('admin/dashboard')), 'includes admin chunk');
   assert.ok(parsed.chunks.some((c) => c.includes('684-xyz.js')), 'includes shared chunk');
+
+  // Next.js App Router (RSC & app chunk patterns)
+  const appRouterHtml = `
+    <script src="/_next/static/chunks/app/account/page-999.js" async=""></script>
+    <script src="/_next/static/chunks/app/api/webhook/route-888.js" async=""></script>
+    <script>self.__next_f.push([1, "1:{\\"segmentPath\\":[\\"children\\",\\"secret-vault\\",\\"children\\"]}"])</script>
+  `;
+  const parsedApp = parseBuildManifest(appRouterHtml);
+  assert.ok(parsedApp.routes.includes('/account'), 'mines App Router /account page');
+  assert.ok(parsedApp.routes.includes('/api/webhook'), 'mines App Router /api/webhook route');
+  assert.ok(parsedApp.routes.includes('/secret-vault'), 'mines App Router flight segment');
 
   // Webpack runtime chunk mapping
   const webpackRuntime = `

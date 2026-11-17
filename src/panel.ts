@@ -534,9 +534,9 @@ async function ingestText(
   }
 
   // Reverse Engineering Extensions (v3.12.0)
-  if (kind === 'script' || kind === 'chunk') {
-    // 1. Framework Manifest Mining
-    if (capped.indexOf('__BUILD_MANIFEST') !== -1 || capped.indexOf('__SSG_MANIFEST') !== -1 || capped.indexOf('__remixContext') !== -1 || url.indexOf('buildmanifest') !== -1 || url.indexOf('ssgmanifest') !== -1) {
+  if (kind === 'script' || kind === 'chunk' || kind === 'document') {
+    // 1. Framework Manifest Mining (Next.js Pages Router, App Router, Webpack, Remix)
+    if (capped.indexOf('__BUILD_MANIFEST') !== -1 || capped.indexOf('__SSG_MANIFEST') !== -1 || capped.indexOf('__remixContext') !== -1 || capped.indexOf('__NEXT_DATA__') !== -1 || capped.indexOf('__next_f') !== -1 || url.indexOf('buildmanifest') !== -1 || url.indexOf('ssgmanifest') !== -1) {
       const mf = parseBuildManifest(capped);
       if (mf.routes.length || mf.chunks.length) {
         for (const r of mf.routes) touchRoute(r, 'manifest-ref');
@@ -546,6 +546,10 @@ async function ingestText(
             discoveredUrls.push({ from: url, url: abs, route, kind: 'chunk' });
             graph.addNode(abs, shortLabel(abs), 'chunk', abs);
             graph.link(url, abs, 'manifest-ref');
+            // If discovered a manifest script URL from HTML buildId, auto-fetch it!
+            if (abs.includes('_buildManifest.js') || abs.includes('_ssgManifest.js')) {
+              void fetchViaPage(abs, sessionRoute, 'manifest-ref');
+            }
           } catch { /* ignore */ }
         }
         diag(`manifest mining: ${mf.routes.length} routes, ${mf.chunks.length} chunks extracted from ${shortLabel(url)}`);
@@ -4167,6 +4171,128 @@ const HARVEST_INLINE_SCRIPT = `(()=>{
     }
   } catch(e) {}
   try {
+    const bm = window.__BUILD_MANIFEST;
+    if (bm && typeof bm === 'object') {
+      const bRoutes = [];
+      for (const k of Object.keys(bm)) {
+        if (k.startsWith('/') && !k.startsWith('/_next') && !k.startsWith('/static')) {
+          bRoutes.push(k);
+          addEndpoint(k, 'build-manifest');
+        }
+      }
+      if (Array.isArray(bm.sortedPages)) {
+        for (const p of bm.sortedPages) {
+          if (typeof p === 'string' && p.startsWith('/') && !p.startsWith('/_next')) {
+            if (!bRoutes.includes(p)) bRoutes.push(p);
+            addEndpoint(p, 'build-manifest');
+          }
+        }
+      }
+      if (bRoutes.length) stores.push({ name: 'Next.js Build Manifest', keys: bRoutes.slice(0, 40) });
+    }
+  } catch(e) {}
+  try {
+    const ssg = window.__SSG_MANIFEST;
+    if (ssg) {
+      const ssgRoutes = [];
+      if (ssg instanceof Set) {
+        ssg.forEach((r) => { if (typeof r === 'string' && r.startsWith('/')) { ssgRoutes.push(r); addEndpoint(r, 'ssg-manifest'); } });
+      }
+      if (ssgRoutes.length) stores.push({ name: 'Next.js SSG Manifest', keys: ssgRoutes.slice(0, 30) });
+    }
+  } catch(e) {}
+  try {
+    const nf = window.__next_f;
+    if (Array.isArray(nf)) {
+      const appRoutes = [];
+      const serverActions = [];
+      for (const entry of nf) {
+        if (Array.isArray(entry) && typeof entry[1] === 'string') {
+          const raw = entry[1];
+          const SEG_RE = /["'](?:app\/)?([a-zA-Z0-9_\-\/\[\]]+?)\/(?:page|route|layout)["']/g;
+          let sm;
+          while ((sm = SEG_RE.exec(raw))) {
+            const seg = '/' + sm[1].replace(/^\/+/, '');
+            if (!seg.startsWith('/_') && !seg.startsWith('/api/') && !appRoutes.includes(seg)) {
+              appRoutes.push(seg);
+              addEndpoint(seg, 'next-app-router');
+            }
+          }
+          const ACT_RE = /\$ACTION_ID_([a-zA-Z0-9_$]+)/g;
+          let am;
+          while ((am = ACT_RE.exec(raw))) {
+            if (!serverActions.includes(am[1])) serverActions.push(am[1]);
+          }
+          const USER_RE = /["'](?:user|userId|email|username|role)["']\s*:\s*["']([^"']{1,80})["']/g;
+          let um;
+          while ((um = USER_RE.exec(raw))) {
+            addId('rsc_prop', um[1], 'next-rsc');
+          }
+        }
+      }
+      const stKeys = appRoutes.slice(0, 25);
+      if (serverActions.length) stKeys.push('Server Actions: ' + serverActions.length);
+      stores.push({ name: 'Next.js App Router (RSC)', keys: stKeys.length ? stKeys : ['Flight Chunks: ' + nf.length] });
+    }
+  } catch(e) {}
+  try {
+    const scripts = document.querySelectorAll('script[src]');
+    const nextChunks = [];
+    for (const sc of scripts) {
+      const src = sc.getAttribute('src') || '';
+      if (src.includes('/_next/static/')) {
+        const file = src.split('/').pop() || src;
+        if (!nextChunks.includes(file)) nextChunks.push(file);
+        const appMatch = /\/_next\/static\/chunks\/app\/(.+?)\/(?:page|route)-/i.exec(src);
+        if (appMatch) {
+          const r = '/' + appMatch[1].replace(/^\/+/, '');
+          if (!r.startsWith('/_')) addEndpoint(r, 'next-chunk-dom');
+        }
+      }
+    }
+    if (nextChunks.length) stores.push({ name: 'Next.js Chunks in DOM', keys: nextChunks.slice(0, 20) });
+  } catch(e) {}
+  try {
+    const swr = window.__SWR$cache;
+    if (swr && typeof swr.keys === 'function') {
+      const swrKeys = [];
+      for (const k of swr.keys()) {
+        const sk = String(k).slice(0, 80);
+        swrKeys.push(sk);
+        if (typeof k === 'string' && (k.startsWith('/') || k.startsWith('http'))) addEndpoint(k, 'swr-cache');
+      }
+      if (swrKeys.length) stores.push({ name: 'SWR Cache', keys: swrKeys.slice(0, 30) });
+    }
+  } catch(e) {}
+  try {
+    const z = window.__zustand || window.useStore;
+    if (z && typeof z.getState === 'function') {
+      const st = z.getState();
+      if (st && typeof st === 'object') {
+        stores.push({ name: 'Zustand Store', keys: Object.keys(st).slice(0, 30) });
+      }
+    }
+  } catch(e) {}
+  try {
+    if (document.cookie) {
+      const cKeys = [];
+      const parts = document.cookie.split(';');
+      for (const part of parts) {
+        const eq = part.indexOf('=');
+        const k = (eq >= 0 ? part.slice(0, eq) : part).trim();
+        const v = (eq >= 0 ? part.slice(eq + 1) : '').trim();
+        if (k) {
+          cKeys.push(k);
+          const lk = k.toLowerCase();
+          if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1 || lk.indexOf('jwt') !== -1 || lk.indexOf('session') !== -1) {
+            addToken(k, v, 'cookie');
+          }
+        }
+      }
+      if (cKeys.length) stores.push({ name: 'Cookies', keys: cKeys.slice(0, 30) });
+    }
+  } catch(e) {}
+  try {
     const nx = window.__NUXT__;
     if (nx && typeof nx === 'object') {
       stores.push({ name: 'Nuxt Data', keys: Object.keys(nx).slice(0, 30) });
@@ -4191,12 +4317,15 @@ async function runStateHarvest(): Promise<void> {
     const epCount = res?.endpoints?.length ?? 0;
     const storeCount = res?.stores?.length ?? 0;
 
-    if (res?.endpoints) {
+    if (res?.endpoints?.length) {
       for (const ep of res.endpoints) {
         touchRoute(ep.url, 'live-fetch');
         graph.addNode(ep.url, shortLabel(ep.url), 'endpoint', ep.url);
         graph.link(sessionOrigin, ep.url, 'live-fetch');
       }
+      scheduleRender('routes');
+      scheduleRender('overview');
+      scheduleRender('apis');
     }
 
     if (res?.tokens) {
