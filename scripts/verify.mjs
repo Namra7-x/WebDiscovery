@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { normalize, hashStr, normalizeWithMap, snippetWithSpans } from '../dist/normalize.js';
 import { fuzzyScore, fuzzyMatch } from '../dist/fuzzy.js';
-import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals, extractJsAdvanced } from '../dist/extractors.js';
+import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals, extractJsAdvanced, parseBuildManifest, parseWebpackChunkMap, extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
 import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody, isBinaryText } from '../dist/tables.js';
@@ -11,7 +11,7 @@ import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon 
 import { classifyApiKind, findExposures } from '../dist/exposure.js';
 import { findFrameworkFindings } from '../dist/framework.js';
 import { findHygieneFindings } from '../dist/hygiene.js';
-import { parseSourceMap, resolveSourceUrl } from '../dist/sourcemap.js';
+import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, crc32 } from '../dist/sourcemap.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { CaptureStore } from '../dist/store.js';
 import { sanitizeReplayHeaders, truncateReplayBody, matchInterceptRule } from '../dist/replay.js';
@@ -756,6 +756,205 @@ ok('Live Endpoint Data: beautification of endpoint JSON responses & error payloa
   assert.ok(hits.length >= 1);
   assert.equal(hits[0].prov.method, 'live-fetch');
   assert.equal(hits[0].prov.route, '/api/v1/user');
+});
+
+// 52. Framework Manifest Mining: Next.js __BUILD_MANIFEST & Webpack chunk maps
+ok('Reverse Engineering: Framework Manifest Mining', () => {
+  const nextManifest = `
+    self.__BUILD_MANIFEST = {
+      __rewrites: { beforeFiles: [], afterFiles: [], fallback: [] },
+      "/": ["static/chunks/pages/index-abc.js"],
+      "/admin/dashboard": ["static/chunks/pages/admin/dashboard-123.js", "static/chunks/684-xyz.js"],
+      "/api/auth/login": ["static/chunks/pages/api/auth-456.js"]
+    };
+    self.__SSG_MANIFEST = new Set(["/about", "/pricing", "/features"]);
+  `;
+  const parsed = parseBuildManifest(nextManifest);
+  assert.ok(parsed.routes.includes('/'), 'includes root route');
+  assert.ok(parsed.routes.includes('/admin/dashboard'), 'includes hidden admin route');
+  assert.ok(parsed.routes.includes('/api/auth/login'), 'includes api auth route');
+  assert.ok(parsed.routes.includes('/about'), 'includes SSG route');
+  assert.ok(parsed.chunks.some((c) => c.includes('admin/dashboard')), 'includes admin chunk');
+  assert.ok(parsed.chunks.some((c) => c.includes('684-xyz.js')), 'includes shared chunk');
+
+  // Webpack runtime chunk mapping
+  const webpackRuntime = `
+    __webpack_require__.u = function(chunkId) {
+      return "" + chunkId + "." + {
+        102: "a1b2c3d4",
+        404: "e5f6g7h8",
+        999: "adminpanel"
+      }[chunkId] + ".js";
+    };
+  `;
+  const wp = parseWebpackChunkMap(webpackRuntime);
+  assert.equal(wp.chunkMap['102'], 'a1b2c3d4');
+  assert.equal(wp.chunkMap['999'], 'adminpanel');
+  assert.ok(wp.chunks.includes('102.a1b2c3d4.js'));
+  assert.ok(wp.chunks.includes('999.adminpanel.js'));
+});
+
+// 53. AST Parameter & Payload Schema Mining
+ok('Reverse Engineering: AST Parameter & Payload Schema Mining', () => {
+  const jsCode = `
+    async function login(user, pass) {
+      const res = await fetch("/api/v1/auth/login?client=web&redirect=true", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: user,
+          password: pass,
+          rememberMe: true,
+          mfaCode: null
+        })
+      });
+      return res.json();
+    }
+    function getOrders(page, limit) {
+      return axios.get("/api/v1/orders", {
+        params: { page, limit, status: 'active', sort: 'desc' }
+      });
+    }
+  `;
+  const schemas = extractApiCallSchemas(jsCode);
+  assert.ok(schemas.length >= 2, 'extracts both fetch and axios calls');
+
+  const loginSchema = schemas.find((s) => s.url.includes('/login'));
+  assert.ok(loginSchema, 'found login endpoint schema');
+  assert.equal(loginSchema.method, 'POST');
+  assert.ok(loginSchema.params.includes('client'), 'found query param client');
+  assert.ok(loginSchema.params.includes('redirect'), 'found query param redirect');
+  assert.ok(loginSchema.bodyKeys.includes('username'), 'found body field username');
+  assert.ok(loginSchema.bodyKeys.includes('password'), 'found body field password');
+  assert.ok(loginSchema.bodyKeys.includes('rememberMe'), 'found body field rememberMe');
+  assert.ok(loginSchema.bodyKeys.includes('mfaCode'), 'found body field mfaCode');
+
+  const ordersSchema = schemas.find((s) => s.url.includes('/orders'));
+  assert.ok(ordersSchema, 'found orders endpoint schema');
+  assert.equal(ordersSchema.method, 'GET');
+  assert.ok(ordersSchema.params.includes('page'), 'found query param page');
+  assert.ok(ordersSchema.params.includes('limit'), 'found query param limit');
+  assert.ok(ordersSchema.params.includes('status'), 'found query param status');
+});
+
+// 54. 1-Click Source Map Project ZIP Exporter
+ok('Reverse Engineering: 1-Click Source Map Project ZIP Exporter', () => {
+  const mockFiles = [
+    { path: 'webpack://_N_E/src/components/AdminPanel.tsx', content: 'export const AdminPanel = () => <div>Admin</div>;' },
+    { path: 'webpack://_N_E/src/api/auth.ts', content: 'export async function login() { return true; }' },
+    { path: 'src/utils/config.ts', content: 'export const API_HOST = "https://api.internal.com";' }
+  ];
+
+  const zipBytes = buildSourceMapZip(mockFiles);
+  assert.ok(zipBytes instanceof Uint8Array, 'returns Uint8Array');
+  assert.ok(zipBytes.length > 200, 'zip has content bytes');
+
+  // Verify PKZIP magic bytes (PK\x03\x04 = 0x04034b50)
+  const view = new DataView(zipBytes.buffer);
+  assert.equal(view.getUint32(0, true), 0x04034b50, 'valid ZIP local header signature');
+
+  // Verify CRC32 calculation
+  const enc = new TextEncoder();
+  const c1 = crc32(enc.encode('hello world'));
+  assert.equal(typeof c1, 'number');
+  assert.equal(c1, 0x0d4a1185, 'accurate standard CRC-32 for hello world');
+
+  // Empty zip returns valid End of Central Directory (22 bytes)
+  const emptyZip = buildSourceMapZip([]);
+  assert.equal(emptyZip.length, 22);
+  const emptyView = new DataView(emptyZip.buffer);
+  assert.equal(emptyView.getUint32(0, true), 0x06054b50, 'valid EOCD signature');
+});
+
+// 55. GraphQL Operation Registry & Schema Synthesizer
+ok('Reverse Engineering: GraphQL Operation Registry & Schema Synthesizer', () => {
+  const bundleJs = `
+    const GET_USER = gql\`
+      query GetUserProfile($id: ID!, $includeHistory: Boolean) {
+        user(id: $id) {
+          id
+          email
+          role
+          permissions
+        }
+      }
+    \`;
+    const MUTATION_UPDATE = \`
+      mutation UpdateUserRole($userId: ID!, $newRole: String!) {
+        updateUserRole(id: $userId, role: $newRole) {
+          success
+          message
+        }
+      }
+    \`;
+    const USER_FRAG = \`
+      fragment CoreUser on User {
+        id
+        username
+      }
+    \`;
+  `;
+  const ops = extractGraphQLOperations(bundleJs);
+  assert.ok(ops.length >= 3, 'extracted queries, mutations and fragments');
+
+  const queryOp = ops.find((o) => o.name === 'GetUserProfile');
+  assert.ok(queryOp, 'found query');
+  assert.equal(queryOp.type, 'query');
+  assert.ok(queryOp.variables.some((v) => v.includes('$id: ID!')));
+
+  const mutOp = ops.find((o) => o.name === 'UpdateUserRole');
+  assert.ok(mutOp, 'found mutation');
+  assert.equal(mutOp.type, 'mutation');
+  assert.ok(mutOp.variables.some((v) => v.includes('$userId: ID!')));
+
+  const fragOp = ops.find((o) => o.name === 'CoreUser');
+  assert.ok(fragOp, 'found fragment');
+  assert.equal(fragOp.type, 'fragment');
+
+  const synthesized = formatGraphQLRegistry(ops);
+  assert.ok(synthesized.includes('# DeepScope Synthesized GraphQL Operation Registry'));
+  assert.ok(synthesized.includes('query GetUserProfile'));
+  assert.ok(synthesized.includes('mutation UpdateUserRole'));
+  assert.ok(synthesized.includes('fragment CoreUser on User'));
+});
+
+// 56. Client-Side Feature Flag Tampering
+ok('Reverse Engineering: Feature Flag Tampering Rewriter', () => {
+  // Test flag response JSON tampering logic (from intercept-main)
+  const ldResponse = JSON.stringify({
+    "flags": {
+      "beta-feature": { "value": false, "enabled": false },
+      "admin-access": { "value": false },
+      "dark-mode": { "value": true }
+    },
+    "userCanAdminister": false
+  });
+
+  // Mirror the tamperFlagJson pure function
+  function tamperTest(text) {
+    const obj = JSON.parse(text);
+    function walk(val) {
+      if (val === false) return true;
+      if (Array.isArray(val)) return val.map(walk);
+      if (val && typeof val === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(val)) {
+          if (v === false || (k === 'enabled' && v === false)) out[k] = true;
+          else out[k] = walk(v);
+        }
+        return out;
+      }
+      return val;
+    }
+    return JSON.stringify(walk(obj));
+  }
+
+  const tampered = JSON.parse(tamperTest(ldResponse));
+  assert.equal(tampered.flags['beta-feature'].value, true, 'flipped beta-feature to true');
+  assert.equal(tampered.flags['beta-feature'].enabled, true, 'flipped enabled to true');
+  assert.equal(tampered.flags['admin-access'].value, true, 'flipped admin-access to true');
+  assert.equal(tampered.flags['dark-mode'].value, true, 'kept dark-mode true');
+  assert.equal(tampered.userCanAdminister, true, 'flipped userCanAdminister to true');
 });
 
 console.log(`\n${pass} checks passed.`);

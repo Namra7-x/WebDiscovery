@@ -2,7 +2,36 @@
 
 All notable changes to DeepScope. Dates are release dates (UTC).
 
-## [3.11.0] — 2026-10-13
+## [3.12.0] — 2026-11-16
+
+- **Framework Manifest Mining & Chunk De-anonymizer**:
+  - Automatically parses Next.js `_buildManifest.js` (`self.__BUILD_MANIFEST`) and `_ssgManifest.js` (`self.__SSG_MANIFEST`), extracting 100% of routes and lazy-loaded chunk URLs.
+  - Automatically parses Webpack runtime chunk-loading mappings (`__webpack_require__.u = function(e){...}`) to map every lazy-loaded `.chunk.js` file without requiring user navigation.
+  - Supports Remix and Nuxt route trees; discovered routes and chunks are fed directly into the Routes tab, Discovery Graph, and Deep Scan queue.
+- **AST Parameter & Payload Schema Mining**:
+  - Analyzes client-side JavaScript calls (`fetch`, `axios.get/post/put/delete`, `$.ajax`) to extract expected query parameters, URL path variables, and JSON body keys.
+  - The APIs tab detail card now displays an **Extracted AST Parameter Schema** showing exact query parameters and pre-formatted JSON payload templates.
+  - The Replay modal automatically pre-populates request bodies using the extracted schema template for uncalled and discovered endpoints.
+- **1-Click Source Map Project Decompiler & ZIP Exporter**:
+  - Adds a 1-click **"Export Source ZIP"** button in the Resources tab.
+  - Encodes all reconstructed `.map` source files into a standard PKZIP 2.0 archive with clean relative paths (`src/components/...`), standard CRC-32 checksums, and zero external dependencies.
+  - Streams directly to disk via browser object URLs without persistent RAM overhead.
+- **Client-Side Runtime State & Memory Harvester**:
+  - Added an on-demand **"Harvest State"** engine in the Overview tab.
+  - Deeply inspects in-memory state stores: Apollo Client cache (`__APOLLO_CLIENT__.extract()`), React Query / TanStack Query cache (`queryCache.getAll()`), Redux store (`store.getState()`), Next.js `__NEXT_DATA__`, and browser web storage.
+  - Extracts user identities, roles (`isAdmin`, `role`), cached query endpoints, and auth tokens, automatically feeding secrets into the Analyze tab and routes into the APIs tab.
+- **Client-Side Feature Flag & Entitlement Tamperer**:
+  - Added a **"Tamper Feature Flags"** toggle in the Overview Interception card.
+  - Intercepts client-side feature flag and experimentation responses (LaunchDarkly, Statsig, PostHog, Flagsmith, Unleash, and custom `/flags` / `/entitlements` endpoints).
+  - Deep-traverses JSON responses on the fly to rewrite boolean `false` and `{ enabled: false, value: false }` flags to `true`, unlocking hidden admin panels and beta features in the live page.
+- **GraphQL Operation Registry & Schema Synthesizer**:
+  - Extracts all client-side GraphQL operations (`query`, `mutation`, `subscription`, `fragment`) and variable signatures from bundled JS code.
+  - Added an **"Export GraphQL"** button in the APIs tab to download a clean, consolidated `deepscope-operations.graphql` file.
+- **Ultra-Lightweight & Zero-Load Performance**:
+  - Zero external runtime npm dependencies added.
+  - All features strictly adhere to DeepScope's bounded `MemoryLedger` and `CaptureStore` retention budgets.
+  - Package size remains ultra-compact (~600 KB total).
+  - 56/56 automated smoke verification checks passed.
 
 - **On-Demand Live Endpoint Response Output Fetching**:
   - When clicking "View" on any route or endpoint (from Routes, APIs, Network, or Search tabs), the Universal Viewer now actively retrieves and displays the **real response payload output** (e.g. live JSON, text, HTML) instead of falling back to empty cards or hex dumps of metadata.

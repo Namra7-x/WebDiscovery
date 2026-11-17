@@ -206,7 +206,7 @@ if (!sentInitial) {
     } catch { /* ignore */ }
   });
   // Next/Nuxt-style router hints
-  document.querySelectorAll('[data-route, [href^="/"]').forEach((el) => {
+  document.querySelectorAll('[data-route], [href^="/"]').forEach((el) => {
     const r = el.getAttribute('data-route');
     if (r) found.add(r);
   });
@@ -216,6 +216,142 @@ if (!sentInitial) {
     if (nd?.page) found.add(nd.page);
   } catch { /* ignore */ }
   return [...found].slice(0, 200);
+};
+
+// State-harvest helper: panel evals `window.__deepscope_harvest_state()` on demand.
+export interface StateHarvestSummary {
+  identities: Array<{ key: string; val: string; source: string }>;
+  tokens: Array<{ key: string; val: string; source: string }>;
+  endpoints: Array<{ url: string; source: string }>;
+  stores: Array<{ name: string; keys: string[] }>;
+}
+
+(window as unknown as { __deepscope_harvest_state?: () => StateHarvestSummary }).__deepscope_harvest_state = () => {
+  const identities: Array<{ key: string; val: string; source: string }> = [];
+  const tokens: Array<{ key: string; val: string; source: string }> = [];
+  const endpoints: Array<{ url: string; source: string }> = [];
+  const stores: Array<{ name: string; keys: string[] }> = [];
+
+  const seenVals = new Set<string>();
+  const addId = (key: string, val: unknown, source: string): void => {
+    if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+      const s = String(val).slice(0, 120);
+      if (!seenVals.has(key + s) && identities.length < 50) {
+        seenVals.add(key + s);
+        identities.push({ key, val: s, source });
+      }
+    }
+  };
+  const addToken = (key: string, val: unknown, source: string): void => {
+    if (typeof val === 'string' && val.length >= 10 && val.length <= 1000) {
+      if (!seenVals.has(val) && tokens.length < 50) {
+        seenVals.add(val);
+        tokens.push({ key, val, source });
+      }
+    }
+  };
+  const addEndpoint = (url: unknown, source: string): void => {
+    if (typeof url === 'string' && url.length >= 2 && url.length <= 250) {
+      if (!seenVals.has(url) && endpoints.length < 100) {
+        seenVals.add(url);
+        endpoints.push({ url, source });
+      }
+    }
+  };
+
+  // 1. Apollo Client Cache
+  try {
+    const apollo = (window as unknown as { __APOLLO_CLIENT__?: { extract?: () => Record<string, unknown> } }).__APOLLO_CLIENT__;
+    if (apollo && typeof apollo.extract === 'function') {
+      const data = apollo.extract();
+      const keys = Object.keys(data || {}).slice(0, 100);
+      stores.push({ name: 'Apollo Client', keys: keys.slice(0, 30) });
+      for (const [, v] of Object.entries(data || {})) {
+        if (!v || typeof v !== 'object') continue;
+        const rec = v as Record<string, unknown>;
+        for (const [f, fv] of Object.entries(rec)) {
+          const lf = f.toLowerCase();
+          if (lf === 'id' || lf === 'email' || lf === 'username' || lf === 'role' || lf.indexOf('admin') !== -1) addId(f, fv, 'apollo');
+          if (lf.indexOf('token') !== -1 || lf.indexOf('auth') !== -1 || lf.indexOf('key') !== -1) addToken(f, fv, 'apollo');
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 2. React Query / TanStack Query
+  try {
+    const rq = (window as unknown as { queryClient?: { getQueryCache?: () => { getAll?: () => Array<{ queryKey: unknown; state: { data: unknown } }> } } }).queryClient;
+    if (rq && typeof rq.getQueryCache === 'function') {
+      const queries = rq.getQueryCache()?.getAll?.() || [];
+      const keys: string[] = [];
+      for (const q of queries.slice(0, 50)) {
+        const qk = JSON.stringify(q.queryKey || '');
+        keys.push(qk.slice(0, 80));
+        if (typeof q.queryKey === 'string' && q.queryKey.startsWith('/')) addEndpoint(q.queryKey, 'react-query');
+        else if (Array.isArray(q.queryKey)) {
+          for (const item of q.queryKey) {
+            if (typeof item === 'string' && (item.startsWith('/') || item.startsWith('http'))) addEndpoint(item, 'react-query');
+          }
+        }
+      }
+      stores.push({ name: 'React Query', keys: keys.slice(0, 30) });
+    }
+  } catch { /* ignore */ }
+
+  // 3. Redux Store
+  try {
+    const store = (window as unknown as { store?: { getState?: () => unknown } }).store;
+    if (store && typeof store.getState === 'function') {
+      const state = store.getState();
+      if (state && typeof state === 'object') {
+        const rootKeys = Object.keys(state as Record<string, unknown>).slice(0, 50);
+        stores.push({ name: 'Redux Store', keys: rootKeys });
+        for (const [, v] of Object.entries(state as Record<string, unknown>)) {
+          if (!v || typeof v !== 'object') continue;
+          for (const [sk, sv] of Object.entries(v as Record<string, unknown>)) {
+            const lsk = sk.toLowerCase();
+            if (lsk === 'id' || lsk === 'role' || lsk === 'email' || lsk.indexOf('admin') !== -1) addId(sk, sv, 'redux');
+            if (lsk.indexOf('token') !== -1 || lsk.indexOf('auth') !== -1 || lsk.indexOf('secret') !== -1) addToken(sk, sv, 'redux');
+          }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 4. LocalStorage & SessionStorage
+  try {
+    const lsKeys: string[] = [];
+    for (let i = 0; i < localStorage.length && i < 100; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      lsKeys.push(k);
+      const v = localStorage.getItem(k) || '';
+      const lk = k.toLowerCase();
+      if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1 || lk.indexOf('jwt') !== -1 || lk.indexOf('session') !== -1) addToken(k, v, 'localStorage');
+      if (lk.indexOf('user') !== -1 || lk.indexOf('role') !== -1) addId(k, v, 'localStorage');
+    }
+    if (lsKeys.length) stores.push({ name: 'localStorage', keys: lsKeys.slice(0, 30) });
+  } catch { /* ignore */ }
+
+  // 5. Next.js __NEXT_DATA__
+  try {
+    const nd = (window as unknown as { __NEXT_DATA__?: { page?: string; buildId?: string; props?: { pageProps?: Record<string, unknown> } } }).__NEXT_DATA__;
+    if (nd) {
+      if (nd.page) addEndpoint(nd.page, 'next-data');
+      if (nd.buildId) addId('buildId', nd.buildId, 'next-data');
+      const pp = nd.props?.pageProps;
+      if (pp && typeof pp === 'object') {
+        for (const [k, v] of Object.entries(pp)) {
+          const lk = k.toLowerCase();
+          if (lk === 'user' || lk === 'role' || lk === 'id') addId(k, JSON.stringify(v), 'next-data');
+          if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1) addToken(k, String(v), 'next-data');
+        }
+      }
+      stores.push({ name: 'Next.js Data', keys: ['page: ' + (nd.page || ''), 'buildId: ' + (nd.buildId || '')] });
+    }
+  } catch { /* ignore */ }
+
+  return { identities, tokens, endpoints, stores };
 };
 
 // ----- Opt-in runtime hook (armed by the panel, never automatic) -----
@@ -363,12 +499,13 @@ function pushInterceptRules(): void {
   try {
     const storage = chrome.storage?.session;
     if (!storage) return;
-    storage.get('deepscope-rules').then((got) => {
+    storage.get(['deepscope-rules', 'deepscope-tamper-flags']).then((got) => {
       try {
         const rules = Array.isArray((got as Record<string, unknown>)['deepscope-rules'])
           ? ((got as Record<string, unknown>)['deepscope-rules'] as unknown[])
           : [];
-        window.postMessage({ source: 'deepscope-rules', rules }, '*');
+        const tamperFlags = (got as Record<string, unknown>)['deepscope-tamper-flags'] === true;
+        window.postMessage({ source: 'deepscope-rules', rules, tamperFlags }, '*');
       } catch { /* ignore */ }
     }).catch(() => undefined);
   } catch { /* storage unavailable — interceptor stays rule-free */ }
@@ -377,7 +514,7 @@ try {
   pushInterceptRules();
   chrome.storage?.onChanged?.addListener((changes, area) => {
     try {
-      if (area === 'session' && changes && 'deepscope-rules' in changes) pushInterceptRules();
+      if (area === 'session' && changes && ('deepscope-rules' in changes || 'deepscope-tamper-flags' in changes)) pushInterceptRules();
     } catch { /* ignore */ }
   });
 } catch { /* ignore */ }

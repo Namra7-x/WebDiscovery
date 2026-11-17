@@ -53,10 +53,11 @@
           <div id="sessionStrip" class="torn-strip" data-state="live" role="status" aria-label="Capture timeline"></div>
           <details id="storageDetails"><summary>Storage details</summary><div id="storageBody" class="mono small"></div></details>
           <div class="row"><button id="btnRecapture">Recapture / reload</button><button id="btnReindex">Reindex</button><button id="btnMemClean">Memory cleanup</button><button id="btnExport">Export JSON</button></div>
-          <div class="row"><button id="btnSaveSession" class="primary" title="Save this session to one .dsz file (explicit only)">Save session</button><button id="btnOpenSession" title="Open a saved .dsz session file">Open session</button><input id="fileOpenSession" type="file" accept=".dsz,.json,application/gzip,application/json" class="hidden" aria-label="Open session file" /></div>
+          <div class="row"><button id="btnSaveSession" class="primary" title="Save this session to one .dsz file (explicit only)">Save session</button><button id="btnOpenSession" title="Open a saved .dsz session file">Open session</button><input id="fileOpenSession" type="file" accept=".dsz,.json,application/gzip,application/json" class="hidden" aria-label="Open session file" /><button id="btnHarvestState" title="Harvest client-side memory, state stores, auth tokens, and cached queries">Harvest State</button></div>
           <p class="muted small">RAM-only: everything below lives in this panel's memory and is destroyed when DevTools closes. Export only happens when you click it.</p>
         </section>
         <section class="card" aria-labelledby="h-intercept"><h3 id="h-intercept">Interception (mock / block)</h3><div id="interceptList" class="mono small"></div>
+          <div class="row" style="margin-top:6px;"><label for="chkTamperFlags" class="small" title="Auto-rewrites false to true in LaunchDarkly, Statsig, and custom flag responses"><input id="chkTamperFlags" type="checkbox" /> <b>Tamper Feature Flags</b> (auto-enable client flags)</label></div>
           <div id="interceptHint" class="muted small"></div>
           <p class="muted small">Rules run in the page and vanish when the browser closes. Replay one-off requests from the Network or APIs tab.</p>
         </section>
@@ -101,6 +102,7 @@
       <div class="row">
         <button id="btnResCopyUrls" title="Copy filtered resource URLs (up to 1000 lines)">Copy URLs</button>
         <button id="btnResCopyAll" title="Copy filtered URLs + metadata + contents preview (bounded)">Copy with bodies</button>
+        <button id="btnResSourceZip" title="Download all reconstructed source files as a project ZIP">Export Source ZIP</button>
         <button data-wrap-table="resTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button>
         <span id="resCount" class="muted small" role="status" aria-live="polite"></span>
       </div>
@@ -140,6 +142,7 @@
         <label for="apiKind">Kind</label><select id="apiKind" title="Filter by API kind (built live from observed traffic)"><option value="ALL">all kinds</option></select>
         <button id="btnApisCopyAll" title="Copy filtered API URLs (up to 1000 lines)">Copy all APIs</button>
         <button id="btnApisOpenApi" title="Download observed endpoints as openapi.json">Export openapi.json</button>
+        <button id="btnApisGraphQL" title="Download discovered GraphQL operations as operations.graphql">Export GraphQL</button>
         <button data-wrap-table="apisTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button>
         <span id="apiCount" class="muted small" role="status" aria-live="polite"></span>
       </div>
@@ -239,6 +242,14 @@
       <label for="mockStatus">Status</label><input id="mockStatus" type="number" min="100" max="999" value="200" title="Status code" /></div>
       <div class="row"><label for="mockBody">Body</label><textarea id="mockBody" rows="6" placeholder='{"mock": true}' title="Mock body"></textarea></div>
       <div id="mockMeta" class="muted small mono" role="status"></div>
+    </div>
+  </div>
+  <div id="stateModal" class="viewer hidden" role="dialog" aria-modal="true" aria-labelledby="stateModalTitle" aria-label="Harvested runtime state">
+    <div class="viewer-card" style="max-width:850px;width:90%;">
+      <div class="viewer-head"><strong id="stateModalTitle" class="mono">Runtime Memory & State Harvest</strong>
+        <span class="viewer-actions"><button id="btnStateCopy" title="Copy harvested findings">Copy</button><button id="btnStateClose" title="Close">Close</button></span>
+      </div>
+      <div id="stateModalBody" class="mono small" style="padding:12px;overflow:auto;max-height:65vh;" tabindex="0"></div>
     </div>
   </div>
   <script type="module" src="./dist/panel.js"></script>

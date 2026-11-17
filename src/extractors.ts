@@ -1082,3 +1082,297 @@ export function extractJsAdvanced(src: string): Extracted[] {
   }
   return out;
 }
+
+// ---------- Reverse Engineering Extensions (v3.12.0) ----------
+
+export interface BuildManifestResult {
+  routes: string[];
+  chunks: string[];
+}
+
+/**
+ * Extracts routes and lazy chunk URLs from Next.js, Webpack, Nuxt, and Remix manifests.
+ * Zero-dependency, tolerant parser.
+ */
+export function parseBuildManifest(src: string): BuildManifestResult {
+  const routes = new Set<string>();
+  const chunks = new Set<string>();
+  if (typeof src !== 'string' || src.length < 10) return { routes: [], chunks: [] };
+
+  // Next.js __BUILD_MANIFEST: self.__BUILD_MANIFEST = { ... } or __BUILD_MANIFEST_CB(...)
+  const bmIdx = src.indexOf('__BUILD_MANIFEST');
+  if (bmIdx !== -1) {
+    const ROUTE_ENTRY_RE = /["'](\/[A-Za-z0-9_\-.~/:?#]*?)["']\s*:\s*\[([\s\S]*?)\]/g;
+    ROUTE_ENTRY_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let count = 0;
+    while ((m = ROUTE_ENTRY_RE.exec(src)) && count < 500) {
+      count++;
+      const route = m[1];
+      if (route && !route.startsWith('/_next') && !route.startsWith('/static')) {
+        routes.add(route);
+      }
+      const chunkBlock = m[2];
+      const CHUNK_STR_RE = /["']([^"']+\.js)["']/g;
+      let cm: RegExpExecArray | null;
+      while ((cm = CHUNK_STR_RE.exec(chunkBlock))) {
+        if (chunks.size < 500) chunks.add(cm[1]);
+      }
+    }
+  }
+
+  // Next.js __SSG_MANIFEST: new Set(["/page1", "/page2", ...])
+  const ssgIdx = src.indexOf('__SSG_MANIFEST');
+  if (ssgIdx !== -1) {
+    const SSG_RE = /["'](\/[A-Za-z0-9_\-.~/:?#]*)["']/g;
+    SSG_RE.lastIndex = ssgIdx;
+    let sm: RegExpExecArray | null;
+    let count = 0;
+    while ((sm = SSG_RE.exec(src)) && count < 200) {
+      count++;
+      const r = sm[1];
+      if (r && !r.startsWith('/_next')) routes.add(r);
+    }
+  }
+
+  // Remix manifest routes
+  const remixIdx = src.indexOf('__remixContext');
+  if (remixIdx !== -1) {
+    const REMIX_ROUTE_RE = /["']path["']\s*:\s*["']([^"']+)["']/g;
+    let rm: RegExpExecArray | null;
+    while ((rm = REMIX_ROUTE_RE.exec(src)) && routes.size < 500) {
+      const p = rm[1];
+      if (p) routes.add(p.startsWith('/') ? p : '/' + p);
+    }
+  }
+
+  return { routes: [...routes].slice(0, 500), chunks: [...chunks].slice(0, 500) };
+}
+
+/**
+ * Extracts chunk mapping from Webpack runtime: { 123: "chunkhash", ... }
+ */
+export function parseWebpackChunkMap(src: string): { chunkMap: Record<string, string>; chunks: string[] } {
+  const chunkMap: Record<string, string> = {};
+  const chunks: string[] = [];
+  if (typeof src !== 'string' || src.length < 20) return { chunkMap, chunks };
+
+  const U_RE = /\.u\s*=\s*function\s*\([^)]*\)\s*\{[\s\S]*?\{([\s\S]*?)\}\s*\[/g;
+  let m: RegExpExecArray | null;
+  while ((m = U_RE.exec(src))) {
+    const mapStr = m[1];
+    const PAIR_RE = /(?:(\d+)|["']([^"']+)["'])\s*:\s*["']([A-Za-z0-9_\-]+)["']/g;
+    let pm: RegExpExecArray | null;
+    while ((pm = PAIR_RE.exec(mapStr))) {
+      const id = pm[1] ?? pm[2];
+      const hash = pm[3];
+      if (id && hash && Object.keys(chunkMap).length < 500) {
+        chunkMap[id] = hash;
+        chunks.push(`${id}.${hash}.js`);
+      }
+    }
+  }
+
+  if (chunks.length === 0) {
+    const GEN_CHUNK_RE = /["']([a-zA-Z0-9_\-./]+?\.chunk\.js)["']/g;
+    let gm: RegExpExecArray | null;
+    while ((gm = GEN_CHUNK_RE.exec(src)) && chunks.length < 200) {
+      chunks.push(gm[1]);
+    }
+  }
+
+  return { chunkMap, chunks: chunks.slice(0, 500) };
+}
+
+export interface ApiCallSchema {
+  url: string;
+  method?: string;
+  params?: string[];
+  bodyKeys?: string[];
+  headers?: string[];
+}
+
+/**
+ * Extracts API call definitions, expected query parameters, and JSON body keys
+ * from client-side JS bundles. Bounded, zero-dep state scanner.
+ */
+export function extractApiCallSchemas(src: string): ApiCallSchema[] {
+  const out: ApiCallSchema[] = [];
+  if (typeof src !== 'string' || src.length < 10) return out;
+  const seen = new Set<string>();
+
+  // 1. fetch("...", { method: 'POST', body: JSON.stringify({ a, b, c }) })
+  const FETCH_CALL_RE = /\bfetch\s*\(\s*(['"`][^'"`]{2,200}['"`])\s*(?:,\s*(\{[\s\S]*?\}))?\s*\)/g;
+  FETCH_CALL_RE.lastIndex = 0;
+  let fm: RegExpExecArray | null;
+  let count = 0;
+
+  while ((fm = FETCH_CALL_RE.exec(src)) && count < 200) {
+    count++;
+    let rawUrl = (fm[1] || '').replace(/['"`]/g, '').trim();
+    if (!rawUrl || rawUrl.length < 2 || rawUrl.length > 200) continue;
+
+    const queryParams: string[] = [];
+    const qIdx = rawUrl.indexOf('?');
+    if (qIdx !== -1) {
+      const qs = rawUrl.slice(qIdx + 1);
+      const parts = qs.split('&');
+      for (const p of parts) {
+        const k = p.split('=')[0]?.trim();
+        if (k && /^[a-zA-Z0-9_\-.]+$/.test(k)) queryParams.push(k);
+      }
+      rawUrl = rawUrl.slice(0, qIdx);
+    }
+
+    const optBlock = fm[2] || '';
+    let method = 'GET';
+    const methodMatch = /method\s*:\s*['"`]([A-Z]{3,8})['"`]/i.exec(optBlock);
+    if (methodMatch) method = methodMatch[1].toUpperCase();
+
+    const bodyKeys: string[] = [];
+    const bodyMatch = /body\s*:\s*(?:JSON\.stringify\s*\(\s*)?\{([\s\S]*?)\}/i.exec(optBlock);
+    if (bodyMatch) {
+      const inner = bodyMatch[1];
+      const KEY_RE = /\b([a-zA-Z_$][a-zA-Z0-9_$]{1,60})\s*[:,\s}]/g;
+      let km: RegExpExecArray | null;
+      while ((km = KEY_RE.exec(inner)) && bodyKeys.length < 30) {
+        const key = km[1];
+        if (key && !['null', 'undefined', 'true', 'false'].includes(key) && !bodyKeys.includes(key)) {
+          bodyKeys.push(key);
+        }
+      }
+    }
+
+    const key = `${method}:${rawUrl}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({
+        url: rawUrl,
+        method,
+        params: queryParams.length ? queryParams : undefined,
+        bodyKeys: bodyKeys.length ? bodyKeys : undefined,
+      });
+    }
+  }
+
+  // 2. axios.post(url, { ... }) or axios.get(url, { params: { ... } })
+  const AXIOS_RE = /\baxios\.(get|post|put|delete|patch)\s*\(\s*(['"`][^'"`]{2,200}['"`])\s*(?:,\s*(\{[\s\S]*?\}))?\s*\)/g;
+  AXIOS_RE.lastIndex = 0;
+  let am: RegExpExecArray | null;
+  while ((am = AXIOS_RE.exec(src)) && out.length < 300) {
+    const method = (am[1] || 'get').toUpperCase();
+    const rawUrl = (am[2] || '').replace(/['"`]/g, '').trim();
+    if (!rawUrl || rawUrl.length < 2) continue;
+
+    const optBlock = am[3] || '';
+    const bodyKeys: string[] = [];
+    const queryParams: string[] = [];
+
+    if (method === 'GET') {
+      const paramsMatch = /params\s*:\s*\{([\s\S]*?)\}/i.exec(optBlock);
+      if (paramsMatch) {
+        const KEY_RE = /\b([a-zA-Z_$][a-zA-Z0-9_$]{1,60})\s*[:,\s}]/g;
+        let km: RegExpExecArray | null;
+        while ((km = KEY_RE.exec(paramsMatch[1])) && queryParams.length < 30) {
+          const k = km[1];
+          if (k && !queryParams.includes(k)) queryParams.push(k);
+        }
+      }
+    } else {
+      const KEY_RE = /\b([a-zA-Z_$][a-zA-Z0-9_$]{1,60})\s*[:,\s}]/g;
+      let km: RegExpExecArray | null;
+      while ((km = KEY_RE.exec(optBlock)) && bodyKeys.length < 30) {
+        const k = km[1];
+        if (k && !['null', 'undefined', 'true', 'false', 'headers'].includes(k) && !bodyKeys.includes(k)) {
+          bodyKeys.push(k);
+        }
+      }
+    }
+
+    const key = `${method}:${rawUrl}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({
+        url: rawUrl,
+        method,
+        params: queryParams.length ? queryParams : undefined,
+        bodyKeys: bodyKeys.length ? bodyKeys : undefined,
+      });
+    }
+  }
+
+  return out;
+}
+
+export interface GraphQLOperation {
+  name: string;
+  type: 'query' | 'mutation' | 'subscription' | 'fragment';
+  raw: string;
+  variables?: string[];
+}
+
+/**
+ * Extracts GraphQL queries, mutations, subscriptions, and fragments from JavaScript bundles.
+ * Bounded, zero-dep pattern recognizer.
+ */
+export function extractGraphQLOperations(src: string): GraphQLOperation[] {
+  const out: GraphQLOperation[] = [];
+  if (typeof src !== 'string' || src.length < 10) return out;
+  const seen = new Set<string>();
+
+  const GQL_OP_RE = /\b(query|mutation|subscription)\s+([A-Za-z0-9_]+)\s*(\([^)]*\))?\s*\{([\s\S]*?)\}/g;
+  GQL_OP_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  let count = 0;
+
+  while ((m = GQL_OP_RE.exec(src)) && count < 200) {
+    count++;
+    const type = m[1].toLowerCase() as 'query' | 'mutation' | 'subscription';
+    const name = m[2];
+    const varBlock = m[3] || '';
+    const body = m[4] || '';
+
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+
+    const variables: string[] = [];
+    if (varBlock) {
+      const VAR_RE = /\$([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_!\[\]]+)/g;
+      let vm: RegExpExecArray | null;
+      while ((vm = VAR_RE.exec(varBlock))) {
+        variables.push(`$${vm[1]}: ${vm[2]}`);
+      }
+    }
+
+    const raw = `${type} ${name}${varBlock ? `${varBlock} ` : ' '}{\n  ${body.trim().slice(0, 1500)}\n}`;
+    out.push({ name, type, raw, variables: variables.length ? variables : undefined });
+  }
+
+  const FRAG_RE = /\bfragment\s+([A-Za-z0-9_]+)\s+on\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g;
+  let fm: RegExpExecArray | null;
+  while ((fm = FRAG_RE.exec(src)) && out.length < 250) {
+    const name = fm[1];
+    const typeName = fm[2];
+    const body = fm[3] || '';
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+
+    const raw = `fragment ${name} on ${typeName} {\n  ${body.trim().slice(0, 1500)}\n}`;
+    out.push({ name, type: 'fragment', raw });
+  }
+
+  return out;
+}
+
+/**
+ * Synthesizes all discovered GraphQL operations into a single clean, downloadable .graphql file.
+ */
+export function formatGraphQLRegistry(ops: GraphQLOperation[]): string {
+  if (!Array.isArray(ops) || ops.length === 0) return '# No GraphQL operations discovered.\n';
+  const header = `# DeepScope Synthesized GraphQL Operation Registry\n# Operations discovered: ${ops.length}\n# Generated: ${new Date().toISOString()}\n\n`;
+  const formatted = ops.map((op) => {
+    const varComment = op.variables?.length ? `# Variables: ${op.variables.join(', ')}\n` : '';
+    return `${varComment}${op.raw.trim()}\n`;
+  }).join('\n');
+  return header + formatted;
+}

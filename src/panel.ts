@@ -5,7 +5,7 @@ import { DiscoveryGraph } from './graph.js';
 import { RamIndex } from './indexer.js';
 import { MemoryLedger, formatBytes } from './memory.js';
 import { displayNameFor, searchIndex } from './search.js';
-import { extractHtml, resolveUrl } from './extractors.js';
+import { extractHtml, resolveUrl, parseBuildManifest, parseWebpackChunkMap, extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry, type ApiCallSchema, type GraphQLOperation } from './extractors.js';
 import { scanTextForSecrets } from './rules.js';
 import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody, isBinaryText, BINARY_BODY_NOTE } from './tables.js';
 import { classifyApiKind, findExposures } from './exposure.js';
@@ -28,7 +28,7 @@ import { isSubdomainOf } from './types.js';
 import type { WorkerKind } from './types.js';
 import type { ApiKind } from './exposure.js';
 import type { SearchResult, Severity, TextRecord } from './types.js';
-import { parseSourceMap, resolveSourceUrl } from './sourcemap.js';
+import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, type SourceMapFile } from './sourcemap.js';
 import {
   DEFAULT_SETTINGS, defaultScope,
   type DiscoveryMethod, type NetEntry, type ResourceKind, type ResourceMeta,
@@ -58,6 +58,12 @@ const netEntries: NetEntry[] = [];
 const routes = new Map<string, { method: DiscoveryMethod; count: number }>();
 const reqMetaByUrl = new Map<string, { method: string; initiator?: string }>();
 const diags: Array<{ ts: number; note: string; url?: string }> = [];
+/** Reconstructed source map files across session (backs 1-click project ZIP export). */
+const reconstructedSourceFiles = new Map<string, SourceMapFile>();
+/** Discovered GraphQL operations across JS bundles (backs GraphQL export). */
+const discoveredGraphQLOps = new Map<string, GraphQLOperation>();
+/** Extracted AST parameter and payload schemas (backs APIs tab & Replay prefill). */
+const discoveredApiSchemas = new Map<string, ApiCallSchema>();
 // Secret findings (Analyze tab): snapshots of indexed units that arrived with
 // a worker/fallback `sec` hit attached. Bounded; drops counted + diag-once.
 interface SecFinding { text: string; prov: TextRecord['prov']; rule: string; sev: Severity; label: string }
@@ -513,6 +519,7 @@ async function ingestText(
           const srcName = f.path;
           const content = f.content;
           if (typeof content !== 'string' || content.length <= 10) continue;
+          reconstructedSourceFiles.set(srcName, f);
           void resolveSourceUrl(url, srcName);
           await ingestText(`${url}#${srcName}`, content.slice(0, 200000), {
             kind: 'source-map', mime: 'x-sourcemap', route, method: 'sourcemap-ref',
@@ -522,6 +529,60 @@ async function ingestText(
         }
         smOriginals.set(url, rn);
         diag(`source map: ${rn} original sources indexed from ${shortLabel(url)}`);
+      }
+    }
+  }
+
+  // Reverse Engineering Extensions (v3.12.0)
+  if (kind === 'script' || kind === 'chunk') {
+    // 1. Framework Manifest Mining
+    if (capped.indexOf('__BUILD_MANIFEST') !== -1 || capped.indexOf('__SSG_MANIFEST') !== -1 || capped.indexOf('__remixContext') !== -1 || url.indexOf('buildmanifest') !== -1 || url.indexOf('ssgmanifest') !== -1) {
+      const mf = parseBuildManifest(capped);
+      if (mf.routes.length || mf.chunks.length) {
+        for (const r of mf.routes) touchRoute(r, 'manifest-ref');
+        for (const c of mf.chunks) {
+          try {
+            const abs = resolveUrl(url, c);
+            discoveredUrls.push({ from: url, url: abs, route, kind: 'chunk' });
+            graph.addNode(abs, shortLabel(abs), 'chunk', abs);
+            graph.link(url, abs, 'manifest-ref');
+          } catch { /* ignore */ }
+        }
+        diag(`manifest mining: ${mf.routes.length} routes, ${mf.chunks.length} chunks extracted from ${shortLabel(url)}`);
+      }
+    }
+    if (capped.indexOf('.u=function') !== -1 || capped.indexOf('__webpack_require__.u') !== -1) {
+      const wp = parseWebpackChunkMap(capped);
+      if (wp.chunks.length) {
+        for (const c of wp.chunks) {
+          try {
+            const abs = resolveUrl(url, c);
+            discoveredUrls.push({ from: url, url: abs, route, kind: 'chunk' });
+            graph.addNode(abs, shortLabel(abs), 'chunk', abs);
+            graph.link(url, abs, 'manifest-ref');
+          } catch { /* ignore */ }
+        }
+        diag(`webpack chunk mining: ${wp.chunks.length} chunks mapped from ${shortLabel(url)}`);
+      }
+    }
+
+    // 2. AST / Token Parameter & Payload Schemas
+    const schemas = extractApiCallSchemas(capped);
+    if (schemas.length) {
+      for (const s of schemas) {
+        discoveredApiSchemas.set(s.url, s);
+        if (s.url.startsWith('/')) {
+          touchRoute(s.url, 'fetch-target');
+          if (s.method) reqMetaByUrl.set(s.url, { method: s.method, initiator: 'ast-schema' });
+        }
+      }
+    }
+
+    // 3. GraphQL Operation Registry
+    const gqlOps = extractGraphQLOperations(capped);
+    if (gqlOps.length) {
+      for (const op of gqlOps) {
+        discoveredGraphQLOps.set(op.name, op);
       }
     }
   }
@@ -652,6 +713,7 @@ async function fetchSourceMap(minUrl: string, smUrl: string, route: string, gen?
       const srcName = f.path;
       const content = f.content;
       if (typeof content !== 'string' || content.length <= 10) continue;
+      reconstructedSourceFiles.set(srcName, f);
       // Normalized reference (absolute / webpack:// passthrough); the ingest
       // URL stays `smUrl#srcName` so rebuilt originals never retrigger hooks.
       void resolveSourceUrl(smUrl, srcName);
@@ -2212,7 +2274,14 @@ function openReplay(url: string): void {
   renderRpHeaders(headersToText(n?.reqHeaders));
   const sentText = n?.reqBody ?? '';
   const sentBinary = isBinaryText(sentText);
-  (document.getElementById('replayBody') as HTMLTextAreaElement).value = sentBinary ? '' : sentText.slice(0, REPLAY_MAX_REQ_CHARS);
+  let initialBody = sentBinary ? '' : sentText.slice(0, REPLAY_MAX_REQ_CHARS);
+  if (!initialBody) {
+    const sc = discoveredApiSchemas.get(url) || [...discoveredApiSchemas.values()].find((s) => s.url && (url.indexOf(s.url) !== -1 || s.url.indexOf(url) !== -1));
+    if (sc?.bodyKeys?.length) {
+      initialBody = JSON.stringify(Object.fromEntries(sc.bodyKeys.map((k) => [k, ''])), null, 2);
+    }
+  }
+  (document.getElementById('replayBody') as HTMLTextAreaElement).value = initialBody;
   if (sentBinary) diag('replay: sent body is binary/compressed — add a body manually if needed', url);
   switchRpTab('params');
   (document.getElementById('replayMeta') as HTMLElement).textContent = n
@@ -3297,12 +3366,25 @@ function apiDetailHtml(url: string): string {
   const pre = (text: string, emptyNote: string) => text
     ? `<pre class="dt-pre">${esc(text)}</pre>`
     : `<div class="dt-empty">${emptyNote}</div>`;
+  const schema = discoveredApiSchemas.get(url) || [...discoveredApiSchemas.values()].find((s) => s.url && (url.indexOf(s.url) !== -1 || s.url.indexOf(url) !== -1));
+  let schemaSec = '';
+  if (schema) {
+    const parts: string[] = [];
+    if (schema.method) parts.push(`<div><b>Method:</b> ${esc(schema.method)}</div>`);
+    if (schema.params?.length) parts.push(`<div><b>Query Parameters:</b> <span class="mono">${esc(schema.params.join(', '))}</span></div>`);
+    if (schema.bodyKeys?.length) {
+      const template = JSON.stringify(Object.fromEntries(schema.bodyKeys.map((k) => [k, ''])), null, 2);
+      parts.push(`<div><b>Payload Schema Template:</b><pre class="dt-pre">${esc(template)}</pre></div>`);
+    }
+    schemaSec = `<section class="dt-sec"><h4 class="dt-h">Extracted AST Parameter Schema</h4>${parts.join('')}</section>`;
+  }
   return `<div class="dt"><div class="dt-url" title="Full URL — drag to select, double-click to select all">${esc(url)}</div><div class="dt-head"><div class="dt-badges">${badges}</div>`
     + `<div class="dt-actions"><button data-act="copysent" data-url="${esc(url)}" title="Copy sent body">Copy sent</button>`
     + (kept != null ? `<button data-act="copybody" data-url="${esc(url)}" title="Copy body preview">Copy body</button>` : '') + `</div></div>`
     + `<div class="dt-grid">`
     + `<section class="dt-sec"><h4 class="dt-h">Sent body</h4>${pre(sent, 'no sent body — GET requests rarely carry one')}</section>`
     + `<section class="dt-sec"><h4 class="dt-h">Body preview</h4>${pre(body, 'not retained — turn on “retain raw response bodies” in Settings, then recapture')}</section>`
+    + `${schemaSec}`
     + `<section class="dt-sec"><h4 class="dt-h">Request headers (${reqH.length})</h4>${kv(reqH)}</section>`
     + `<section class="dt-sec"><h4 class="dt-h">Response headers (${resH.length})</h4>${kv(resH)}</section>`
     + `</div></div>`;
@@ -3910,6 +3992,127 @@ async function discoverRoutesNow(): Promise<void> {
   scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis');
 }
 
+function exportSourceZip(): void {
+  const files = [...reconstructedSourceFiles.values()];
+  if (!files.length) {
+    diag('Export Source ZIP: no source-map files reconstructed yet. Browse or Deep Scan with source-map analysis on.');
+    return;
+  }
+  try {
+    const zipBytes = buildSourceMapZip(files);
+    const blob = new Blob([zipBytes.buffer as ArrayBuffer], { type: 'application/zip' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `deepscope-project-source.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    diag(`Exported ${files.length} reconstructed source files as deepscope-project-source.zip`);
+  } catch (e) {
+    diag(`Source ZIP export failed: ${String(e)}`);
+  }
+}
+
+function exportGraphQLRegistry(): void {
+  const ops = [...discoveredGraphQLOps.values()];
+  if (!ops.length) {
+    diag('Export GraphQL: no client-side GraphQL operations discovered yet. Browse or Deep Scan.');
+    return;
+  }
+  try {
+    const text = formatGraphQLRegistry(ops);
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `deepscope-operations.graphql`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    diag(`Exported ${ops.length} GraphQL operations to deepscope-operations.graphql`);
+  } catch (e) {
+    diag(`GraphQL export failed: ${String(e)}`);
+  }
+}
+
+let lastHarvestSummary = '';
+async function runStateHarvest(): Promise<void> {
+  diag('Harvesting client-side runtime state & memory...');
+  try {
+    const res = await evalInPage<{
+      identities?: Array<{ key: string; val: string; source: string }>;
+      tokens?: Array<{ key: string; val: string; source: string }>;
+      endpoints?: Array<{ url: string; source: string }>;
+      stores?: Array<{ name: string; keys: string[] }>;
+    }>('window.__deepscope_harvest_state ? window.__deepscope_harvest_state() : null');
+
+    if (!res) {
+      diag('State harvest: content helper not available on this origin (grant site access).');
+      return;
+    }
+
+    const idCount = res.identities?.length ?? 0;
+    const tokenCount = res.tokens?.length ?? 0;
+    const epCount = res.endpoints?.length ?? 0;
+    const storeCount = res.stores?.length ?? 0;
+
+    if (res.endpoints) {
+      for (const ep of res.endpoints) {
+        touchRoute(ep.url, 'live-fetch');
+        graph.addNode(ep.url, shortLabel(ep.url), 'endpoint', ep.url);
+        graph.link(sessionOrigin, ep.url, 'live-fetch');
+      }
+    }
+
+    if (res.tokens) {
+      for (const tok of res.tokens) {
+        const hits = scanTextForSecrets(tok.val);
+        for (const hit of hits) {
+          secFindings.push({
+            text: tok.val,
+            prov: { resourceUrl: `[state:${tok.source}]`, resourceKind: 'api-json', route: sessionRoute, method: 'live-fetch' },
+            rule: hit.rule,
+            sev: hit.sev,
+            label: `${tok.key} (${tok.source})`,
+          });
+        }
+      }
+    }
+
+    const modal = document.getElementById('stateModal');
+    const body = document.getElementById('stateModalBody');
+    if (!modal || !body) return;
+
+    let html = `<div class="row" style="margin-bottom:12px;"><span class="badge">Identities: ${idCount}</span> <span class="badge">Tokens/Secrets: ${tokenCount}</span> <span class="badge">Endpoints: ${epCount}</span> <span class="badge">Stores: ${storeCount}</span></div>`;
+
+    if (res.stores?.length) {
+      html += `<h4 style="margin:8px 0 4px;">Detected Memory Stores</h4><ul>` + res.stores.map((s) => `<li><b>${esc(s.name)}:</b> ${esc(s.keys.join(', '))}</li>`).join('') + `</ul>`;
+    }
+    if (res.identities?.length) {
+      html += `<h4 style="margin:8px 0 4px;">Identities & User Roles</h4><table class="mono small" style="width:100%;margin-bottom:8px;"><thead><tr><th>Key</th><th>Value</th><th>Source</th></tr></thead><tbody>`
+        + res.identities.map((id) => `<tr><td>${esc(id.key)}</td><td><b>${esc(id.val)}</b></td><td>${esc(id.source)}</td></tr>`).join('')
+        + `</tbody></table>`;
+    }
+    if (res.tokens?.length) {
+      html += `<h4 style="margin:8px 0 4px;">Tokens & Credentials</h4><table class="mono small" style="width:100%;margin-bottom:8px;"><thead><tr><th>Key</th><th>Token / Value</th><th>Source</th></tr></thead><tbody>`
+        + res.tokens.map((t) => `<tr><td>${esc(t.key)}</td><td style="word-break:break-all;">${esc(t.val)}</td><td>${esc(t.source)}</td></tr>`).join('')
+        + `</tbody></table>`;
+    }
+    if (res.endpoints?.length) {
+      html += `<h4 style="margin:8px 0 4px;">Cached Query Endpoints</h4><ul>` + res.endpoints.map((ep) => `<li><span class="mono">${esc(ep.url)}</span> <span class="muted small">(${esc(ep.source)})</span></li>`).join('') + `</ul>`;
+    }
+
+    body.innerHTML = html;
+    lastHarvestSummary = JSON.stringify(res, null, 2);
+    modal.classList.remove('hidden');
+    diag(`State harvested: ${idCount} identities, ${tokenCount} tokens, ${epCount} endpoints across ${storeCount} stores`);
+  } catch (e) {
+    diag(`State harvest failed: ${String(e)}`);
+  }
+}
+
 function applyTheme(): void {
   const light = settings.theme === 'light';
   document.body.dataset.theme = light ? 'light' : 'dark';
@@ -4076,6 +4279,7 @@ function wire(): void {
   try { document.getElementById('resTable')?.querySelector('tbody')?.addEventListener('click', (e) => tableClick(e, 'res')); } catch { /* ignore */ }
   on('btnResCopyUrls', 'click', () => void copyFilteredResUrls());
   on('btnResCopyAll', 'click', () => void copyFilteredResAll());
+  on('btnResSourceZip', 'click', exportSourceZip);
   on('netMethod', 'change', (e) => { netMethod = (e.target as HTMLSelectElement).value; renderNetwork(); });
   on('netKind', 'change', (e) => { netKind = (e.target as HTMLSelectElement).value; renderNetwork(); });
   on('netFilter', 'input', renderNetwork);
@@ -4093,6 +4297,26 @@ function wire(): void {
   on('apisBody', 'click', apiClick);
   on('btnApisCopyAll', 'click', () => void copyFilteredApiUrls());
   on('btnApisOpenApi', 'click', exportOpenApi);
+  on('btnApisGraphQL', 'click', exportGraphQLRegistry);
+  on('btnHarvestState', 'click', () => void runStateHarvest());
+  on('btnStateClose', 'click', () => document.getElementById('stateModal')?.classList.add('hidden'));
+  on('btnStateCopy', 'click', () => { if (lastHarvestSummary) void copyText(lastHarvestSummary, 'harvested state'); });
+
+  const chkFlags = document.getElementById('chkTamperFlags') as HTMLInputElement | null;
+  if (chkFlags) {
+    try {
+      chrome.storage?.session?.get?.('deepscope-tamper-flags').then((res) => {
+        if (res && (res as Record<string, unknown>)['deepscope-tamper-flags'] === true) chkFlags.checked = true;
+      }).catch(() => undefined);
+    } catch { /* ignore */ }
+    chkFlags.addEventListener('change', () => {
+      const val = chkFlags.checked;
+      try {
+        void chrome.storage?.session?.set?.({ 'deepscope-tamper-flags': val });
+        diag(`Feature flag tampering ${val ? 'ENABLED' : 'DISABLED'} — rules apply on next fetch`);
+      } catch { /* ignore */ }
+    });
+  }
   on('btnDiscoverRoutes', 'click', () => void discoverRoutesNow());
   on('routeFilter', 'input', () => renderRoutes());
   on('btnRoutesCopy', 'click', () => void copyFilteredRouteUrls());
@@ -4172,6 +4396,7 @@ function clearSession(prompt = true): boolean {
   index.clear(); graph.clear(); resources.clear(); rawBodies.clear(); rawOrder.length = 0;
   contentHash.clear(); netEntries.length = 0; routes.clear(); diags.length = 0;
   smOriginals.clear(); smRebuilt.clear();
+  reconstructedSourceFiles.clear(); discoveredGraphQLOps.clear(); discoveredApiSchemas.clear();
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   secShowAll = false; routeShowAll = false; anaKind = 'ALL';
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0;

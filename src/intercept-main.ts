@@ -9,7 +9,7 @@
 
 interface InterceptRule {
   id: string;
-  kind: 'mock' | 'block';
+  kind: 'mock' | 'block' | 'tamper-flags';
   match: string;
   useRegex?: boolean;
   method?: string;
@@ -23,6 +23,64 @@ interface InterceptRule {
   if (w.__deepscopeInstalled === true) return;
   w.__deepscopeInstalled = true;
   w.__deepscopeRules = [];
+  w.__deepscopeTamperFlags = false;
+
+  function isFlagUrl(url: string): boolean {
+    if (typeof url !== 'string') return false;
+    const u = url.toLowerCase();
+    return (
+      u.indexOf('launchdarkly') !== -1 ||
+      u.indexOf('featuregates') !== -1 ||
+      u.indexOf('statsig') !== -1 ||
+      u.indexOf('flagsmith') !== -1 ||
+      u.indexOf('unleash') !== -1 ||
+      u.indexOf('/decide') !== -1 ||
+      u.indexOf('/feature-flags') !== -1 ||
+      u.indexOf('/flags') !== -1 ||
+      u.indexOf('/entitlements') !== -1 ||
+      u.indexOf('/toggles') !== -1 ||
+      u.indexOf('/experiments') !== -1
+    );
+  }
+
+  function tamperFlagJson(text: string): string {
+    try {
+      if (!text || text.length < 2) return text;
+      const obj = JSON.parse(text) as unknown;
+      let mutated = false;
+
+      function walk(val: unknown): unknown {
+        if (val === false) {
+          mutated = true;
+          return true;
+        }
+        if (Array.isArray(val)) {
+          return val.map(walk);
+        }
+        if (val && typeof val === 'object') {
+          const out: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+            if (v === false) {
+              out[k] = true;
+              mutated = true;
+            } else if (k === 'enabled' && v === false) {
+              out[k] = true;
+              mutated = true;
+            } else {
+              out[k] = walk(v);
+            }
+          }
+          return out;
+        }
+        return val;
+      }
+
+      const res = walk(obj);
+      return mutated ? JSON.stringify(res) : text;
+    } catch {
+      return text;
+    }
+  }
 
   function activeRules(): InterceptRule[] {
     const all = w.__deepscopeRules as unknown;
@@ -68,6 +126,21 @@ interface InterceptRule {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url;
         const method = (init && init.method) || (typeof input !== 'string' && !(input instanceof URL) ? (input as Request).method : 'GET') || 'GET';
         const hit = firstMatch(String(url), String(method));
+        const shouldTamper = (hit && hit.kind === 'tamper-flags') || (w.__deepscopeTamperFlags === true && isFlagUrl(String(url)));
+        if (shouldTamper) {
+          return origFetch(input as RequestInfo, init).then((res) => {
+            return res.text().then((txt) => {
+              const tampered = tamperFlagJson(txt);
+              const hdrs = new Headers(res.headers);
+              hdrs.set('x-deepscope-tampered', 'flags');
+              return new Response(tampered, {
+                status: res.status,
+                statusText: res.statusText,
+                headers: hdrs,
+              });
+            }).catch(() => res);
+          }).catch(() => origFetch(input as RequestInfo, init));
+        }
         if (!hit) return origFetch(input as RequestInfo, init);
         if (hit.kind === 'block') {
           return Promise.reject(new TypeError('net::ERR_BLOCKED_BY_CLIENT (DeepScope rule)'));
@@ -98,10 +171,30 @@ interface InterceptRule {
     };
     (proto.send as unknown) = function (this: XMLHttpRequest, ...args: unknown[]): void {
       let hit: InterceptRule | null = null;
+      let reqUrl = '';
+      let reqMethod = 'GET';
       try {
         const rec = this as unknown as Record<string, unknown>;
-        hit = firstMatch(String(rec.__dsUrl ?? ''), String(rec.__dsMethod ?? 'GET'));
+        reqUrl = String(rec.__dsUrl ?? '');
+        reqMethod = String(rec.__dsMethod ?? 'GET');
+        hit = firstMatch(reqUrl, reqMethod);
       } catch { hit = null; }
+      const shouldTamper = (hit && hit.kind === 'tamper-flags') || (w.__deepscopeTamperFlags === true && isFlagUrl(reqUrl));
+      if (shouldTamper) {
+        const origOnReady = (this as XMLHttpRequest).onreadystatechange;
+        (this as XMLHttpRequest).onreadystatechange = function (this: XMLHttpRequest, ev: Event) {
+          if (this.readyState === 4 && this.responseText) {
+            try {
+              const tampered = tamperFlagJson(this.responseText);
+              Object.defineProperty(this, 'responseText', { value: tampered, configurable: true });
+              Object.defineProperty(this, 'response', { value: tampered, configurable: true });
+            } catch { /* ignore */ }
+          }
+          if (typeof origOnReady === 'function') origOnReady.call(this, ev);
+        };
+        (origSend as Function).apply(this, args as unknown as []);
+        return;
+      }
       if (!hit) {
         (origSend as Function).apply(this, args as unknown as []);
         return;
@@ -156,9 +249,14 @@ interface InterceptRule {
   window.addEventListener('message', (e) => {
     try {
       if (e.source !== window) return;
-      const d = e.data as { source?: string; rules?: unknown } | null;
-      if (!d || d.source !== 'deepscope-rules' || !Array.isArray(d.rules)) return;
-      w.__deepscopeRules = (d.rules as InterceptRule[]).slice(0, 200);
+      const d = e.data as { source?: string; rules?: unknown; tamperFlags?: boolean } | null;
+      if (!d || d.source !== 'deepscope-rules') return;
+      if (Array.isArray(d.rules)) {
+        w.__deepscopeRules = (d.rules as InterceptRule[]).slice(0, 200);
+      }
+      if (typeof d.tamperFlags === 'boolean') {
+        w.__deepscopeTamperFlags = d.tamperFlags;
+      }
     } catch { /* ignore malformed rule pushes */ }
   });
 })();

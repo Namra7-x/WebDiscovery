@@ -27,11 +27,11 @@ export interface ReplayResponse {
   error?: string;
 }
 
-/** Interception rule (mock/block). Stored in chrome.storage.session (cleared
+/** Interception rule (mock/block/tamper-flags). Stored in chrome.storage.session (cleared
  *  with the browser session — interception never survives a restart). */
 export interface InterceptRule {
   id: string;
-  kind: 'mock' | 'block';
+  kind: 'mock' | 'block' | 'tamper-flags';
   /** Substring match by default; regex when `useRegex` is true. */
   match: string;
   useRegex?: boolean;
