@@ -249,14 +249,120 @@ interface InterceptRule {
   window.addEventListener('message', (e) => {
     try {
       if (e.source !== window) return;
-      const d = e.data as { source?: string; rules?: unknown; tamperFlags?: boolean } | null;
-      if (!d || d.source !== 'deepscope-rules') return;
-      if (Array.isArray(d.rules)) {
-        w.__deepscopeRules = (d.rules as InterceptRule[]).slice(0, 200);
-      }
-      if (typeof d.tamperFlags === 'boolean') {
-        w.__deepscopeTamperFlags = d.tamperFlags;
+      const d = e.data as { source?: string; rules?: unknown; tamperFlags?: boolean; action?: string } | null;
+      if (!d) return;
+      if (d.source === 'deepscope-rules') {
+        if (Array.isArray(d.rules)) {
+          w.__deepscopeRules = (d.rules as InterceptRule[]).slice(0, 200);
+        }
+        if (typeof d.tamperFlags === 'boolean') {
+          w.__deepscopeTamperFlags = d.tamperFlags;
+        }
+      } else if (d.source === 'deepscope-query' && d.action === 'get-shadow-data') {
+        const sRoots = (w.__deepscope_shadowRoots as ShadowRoot[]) || [];
+        const shadowLinks: string[] = [];
+        const shadowForms: string[] = [];
+        for (const sr of sRoots.slice(0, 100)) {
+          try {
+            sr.querySelectorAll?.('a[href], link[href]').forEach((el) => {
+              const h = el.getAttribute('href');
+              if (h && !h.startsWith('javascript:') && shadowLinks.length < 200) shadowLinks.push(h);
+            });
+            sr.querySelectorAll?.('form').forEach((f) => {
+              const action = f.getAttribute('action') || '';
+              if (shadowForms.length < 50) shadowForms.push(`${action} [${f.method || 'get'}]`);
+            });
+          } catch { /* ignore */ }
+        }
+        window.postMessage({ source: 'deepscope-shadow-data', links: shadowLinks, forms: shadowForms }, '*');
       }
     } catch { /* ignore malformed rule pushes */ }
   });
+
+  // ---- Closed Shadow-DOM Piercing (tracks all attachShadow calls) ----
+  try {
+    const origAttach = Element.prototype.attachShadow;
+    const shadowRoots: ShadowRoot[] = [];
+    w.__deepscope_shadowRoots = shadowRoots;
+    Element.prototype.attachShadow = function (init: ShadowRootInit): ShadowRoot {
+      const root = origAttach.call(this, init);
+      try {
+        if (shadowRoots.length < 500) shadowRoots.push(root);
+      } catch { /* ignore */ }
+      return root;
+    };
+  } catch { /* ignore */ }
+
+  // ---- Client-Side Crypto Tap (crypto.subtle encrypt / decrypt / importKey) ----
+  try {
+    const c = window.crypto;
+    if (c && c.subtle) {
+      const subtle = c.subtle;
+      const origEncrypt = subtle.encrypt.bind(subtle);
+      const origDecrypt = subtle.decrypt.bind(subtle);
+      const origImportKey = subtle.importKey.bind(subtle);
+
+      subtle.encrypt = async function (algorithm: AlgorithmIdentifier | RsaOaepParams | AesCtrParams | AesCbcParams | AesGcmParams, key: CryptoKey, data: BufferSource) {
+        try {
+          const algoName = typeof algorithm === 'string' ? algorithm : (algorithm as { name?: string }).name || 'unknown';
+          let preview = '';
+          try {
+            const u8 = new Uint8Array(data as ArrayBuffer);
+            preview = new TextDecoder('utf-8', { fatal: false }).decode(u8.slice(0, 500));
+          } catch { /* ignore */ }
+          window.postMessage({
+            source: 'deepscope-crypto-event',
+            op: 'encrypt',
+            algo: algoName,
+            keyAlgo: key?.algorithm?.name || 'unknown',
+            preview: preview.slice(0, 200),
+            byteLength: (data as ArrayBuffer).byteLength || 0,
+            ts: Date.now(),
+          }, '*');
+        } catch { /* ignore */ }
+        return origEncrypt(algorithm, key, data);
+      };
+
+      subtle.decrypt = async function (algorithm: AlgorithmIdentifier | RsaOaepParams | AesCtrParams | AesCbcParams | AesGcmParams, key: CryptoKey, data: BufferSource) {
+        const result = await origDecrypt(algorithm, key, data);
+        try {
+          const algoName = typeof algorithm === 'string' ? algorithm : (algorithm as { name?: string }).name || 'unknown';
+          let preview = '';
+          try {
+            const u8 = new Uint8Array(result);
+            preview = new TextDecoder('utf-8', { fatal: false }).decode(u8.slice(0, 500));
+          } catch { /* ignore */ }
+          window.postMessage({
+            source: 'deepscope-crypto-event',
+            op: 'decrypt',
+            algo: algoName,
+            preview: preview.slice(0, 200),
+            byteLength: result.byteLength || 0,
+            ts: Date.now(),
+          }, '*');
+        } catch { /* ignore */ }
+        return result;
+      };
+
+      subtle.importKey = async function (format: KeyFormat, keyData: BufferSource | JsonWebKey, algorithm: AlgorithmIdentifier | RsaHashedImportParams | EcKeyImportParams | HmacImportParams | AesKeyGenParams, extractable: boolean, keyUsages: KeyUsage[]) {
+        try {
+          const algoName = typeof algorithm === 'string' ? algorithm : (algorithm as { name?: string }).name || 'unknown';
+          let jwkSample = '';
+          if (format === 'jwk' && typeof keyData === 'object') {
+            jwkSample = JSON.stringify(keyData).slice(0, 200);
+          }
+          window.postMessage({
+            source: 'deepscope-crypto-event',
+            op: 'importKey',
+            algo: algoName,
+            format,
+            jwk: jwkSample || undefined,
+            usages: keyUsages,
+            ts: Date.now(),
+          }, '*');
+        } catch { /* ignore */ }
+        return (origImportKey as Function)(format, keyData, algorithm, extractable, keyUsages);
+      };
+    }
+  } catch { /* ignore */ }
 })();

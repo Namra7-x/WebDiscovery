@@ -36,7 +36,8 @@ import { isSubdomainOf } from './types.js';
 import type { WorkerKind } from './types.js';
 import type { ApiKind } from './exposure.js';
 import type { SearchResult, Severity, TextRecord } from './types.js';
-import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, type SourceMapFile } from './sourcemap.js';
+import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, probeOrphanSourceMapCandidates, type SourceMapFile } from './sourcemap.js';
+import { dissectWasmBinary } from './wasm.js';
 import {
   DEFAULT_SETTINGS, defaultScope,
   type DiscoveryMethod, type NetEntry, type ResourceKind, type ResourceMeta,
@@ -1454,9 +1455,11 @@ interface ContentBatch {
   type: string; url: string; route: string; htmlLen: number;
   links: string[]; scripts: string[]; forms: string[]; iframes: Array<{ src: string }>;
   routes: string[]; manifest?: string | null; manifests?: string[]; chunks: string[]; apis: string[]; textSample: string;
-  /** Runtime-hook piggyback (content.ts drains its buffer here; background
-   *  forwards content-batch untouched, so zero background changes needed). */
   runtime?: Array<{ t: string; method: string; url: string; ts: number }>;
+  cryptoEvents?: Array<{ op: string; algo: string; preview: string; ts: number }>;
+  ephemeralTokens?: Array<{ param: string; token: string; url: string; ts: number }>;
+  shadowLinks?: string[];
+  shadowForms?: string[];
 }
 
 async function handleContentBatch(b: ContentBatch): Promise<void> {
@@ -1466,6 +1469,51 @@ async function handleContentBatch(b: ContentBatch): Promise<void> {
   touchRoute(sessionRoute, 'dom-link');
   graph.addNode(graph.routeNode(sessionRoute), sessionRoute, 'route', sessionRoute);
   for (const r of b.routes.slice(0, 200)) touchRoute(r, 'router');
+
+  // Ephemeral OAuth tokens captured before history.replaceState
+  if (b.ephemeralTokens && b.ephemeralTokens.length) {
+    for (const et of b.ephemeralTokens) {
+      diag(`ephemeral token captured in URL before wipe: ${et.param}=${et.token.slice(0, 15)}...`);
+      secFindings.push({
+        text: `${et.param}=${et.token}`,
+        prov: { resourceUrl: et.url, resourceKind: 'route', route: sessionRoute, method: 'history-api' },
+        rule: 'ephemeral-oauth-token',
+        sev: 'critical',
+        label: `Ephemeral OAuth Token (${et.param})`,
+      });
+    }
+    scheduleRender('analyze');
+  }
+
+  // Client-Side Crypto Tap (crypto.subtle events)
+  if (b.cryptoEvents && b.cryptoEvents.length) {
+    for (const ce of b.cryptoEvents) {
+      diag(`crypto tap [${ce.op}]: ${ce.algo}${ce.preview ? ` — "${ce.preview.slice(0, 60)}"` : ''}`);
+      if (ce.preview && ce.preview.length >= 8) {
+        secFindings.push({
+          text: `[${ce.op} ${ce.algo}] ${ce.preview}`,
+          prov: { resourceUrl: b.url, resourceKind: 'document', route: sessionRoute, method: 'live-fetch' },
+          rule: 'crypto-cleartext-or-key',
+          sev: 'high',
+          label: `Crypto Tap (${ce.op} ${ce.algo})`,
+        });
+      }
+    }
+    scheduleRender('analyze');
+  }
+
+  // Pierced Closed Shadow-DOM Links & Forms
+  if (b.shadowLinks && b.shadowLinks.length) {
+    for (const l of b.shadowLinks) {
+      try {
+        const abs = resolveUrl(b.url, l);
+        discoveredUrls.push({ from: b.url, url: abs, route: sessionRoute, kind: 'document' });
+        graph.addNode(abs, shortLabel(abs), 'resource', abs);
+        graph.link(b.url, abs, 'dom-link');
+      } catch { /* ignore */ }
+    }
+    diag(`closed shadow-DOM mined: ${b.shadowLinks.length} hidden links uncovered`);
+  }
   // Index visible text sample as DOM units
   if (b.textSample && settings.capture.dom) {
     const prov = { resourceUrl: b.url, resourceKind: 'dom' as ResourceKind, route: sessionRoute, method: 'dom-link' as DiscoveryMethod };
@@ -3151,6 +3199,14 @@ async function viewUrl(url: string, forceLive = false): Promise<void> {
           touchRoute(`/_next/action/${actId}`, 'server-action');
         }
       }
+    } else if (category === 'wasm') {
+      const wasm = dissectWasmBinary(rawText);
+      formatted = addLineNumbers(wasm.formatted);
+      if (wasm.endpoints.length) {
+        for (const ep of wasm.endpoints) {
+          touchRoute(ep, 'wasm-data');
+        }
+      }
     } else if (category === 'binary' || isBinaryText(rawText)) {
       formatted = formatHexDump(rawText);
     } else {
@@ -4184,6 +4240,36 @@ async function discoverRoutesNow(): Promise<void> {
   scheduleRender('routes'); scheduleRender('overview'); scheduleRender('apis');
 }
 
+async function probeUnlinkedSourceMaps(): Promise<void> {
+  const scripts = [...resources.values()].filter(
+    (r) => (r.kind === 'script' || r.kind === 'chunk') && !r.hasSourceMap && sameOriginOk(r.url)
+  );
+  if (!scripts.length) {
+    diag('probe unlinked maps: no unmapped same-origin scripts found in resources');
+    return;
+  }
+  diag(`probing unlinked source maps for ${scripts.length} script(s)...`);
+  const initialFiles = reconstructedSourceFiles.size;
+  for (const s of scripts.slice(0, 30)) {
+    const candidates = probeOrphanSourceMapCandidates(s.url);
+    for (const mapUrl of candidates) {
+      if (resources.has(mapUrl)) continue;
+      try {
+        await fetchViaPage(mapUrl, sessionRoute, 'sourcemap-ref');
+        if (resources.has(mapUrl)) {
+          s.hasSourceMap = true;
+          s.sourceMapUrl = mapUrl;
+          graph.link(s.url, mapUrl, 'sourcemap-ref');
+          break;
+        }
+      } catch { /* probe 404 or failed */ }
+    }
+  }
+  const diff = reconstructedSourceFiles.size - initialFiles;
+  diag(`source map probe complete: ${diff > 0 ? `${diff} new sources recovered` : '0 new maps found'}, ${reconstructedSourceFiles.size} total source files`);
+  renderResources();
+}
+
 function exportSourceZip(): void {
   const files = [...reconstructedSourceFiles.values()];
   if (!files.length) {
@@ -4606,6 +4692,61 @@ const HARVEST_INLINE_SCRIPT = `(()=>{
       stores.push({ name: 'Nuxt Data', keys: Object.keys(nx).slice(0, 30) });
     }
   } catch(e) {}
+  try {
+    const pinia = window.__pinia || (window.$nuxt && window.$nuxt.$pinia);
+    if (pinia && pinia.state && pinia.state.value) {
+      const pState = pinia.state.value;
+      stores.push({ name: 'Pinia Store', keys: Object.keys(pState).slice(0, 30) });
+      for (const [, val] of Object.entries(pState)) {
+        if (!val || typeof val !== 'object') continue;
+        for (const [k, v] of Object.entries(val)) {
+          const lk = k.toLowerCase();
+          if (lk === 'id' || lk === 'role' || lk === 'email' || lk.indexOf('user') !== -1) addId(k, v, 'pinia');
+          if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1 || lk.indexOf('jwt') !== -1) addToken(k, v, 'pinia');
+        }
+      }
+    }
+  } catch(e) {}
+  try {
+    const ax = window.axios;
+    if (ax && ax.defaults) {
+      if (ax.defaults.baseURL) addEndpoint(ax.defaults.baseURL, 'axios-baseurl');
+      const common = ax.defaults.headers?.common || ax.defaults.headers;
+      if (common && typeof common === 'object') {
+        const axKeys = [];
+        for (const [hk, hv] of Object.entries(common)) {
+          axKeys.push(hk);
+          const lhk = hk.toLowerCase();
+          if (lhk === 'authorization' || lhk.indexOf('token') !== -1 || lhk.indexOf('auth') !== -1 || lhk.indexOf('key') !== -1) {
+            addToken(hk, String(hv), 'axios-headers');
+          }
+        }
+        if (axKeys.length) stores.push({ name: 'Axios Client Defaults', keys: axKeys });
+      }
+    }
+  } catch(e) {}
+  try {
+    if (window.indexedDB && typeof window.indexedDB.databases === 'function') {
+      window.indexedDB.databases().then((dbs) => {
+        const idbSummary = [];
+        for (const db of (dbs || []).slice(0, 15)) {
+          if (db.name) idbSummary.push(db.name + (db.version ? ' (v' + db.version + ')' : ''));
+        }
+        if (idbSummary.length) window.__deepscope_idb = idbSummary;
+      }).catch(()=>{});
+    }
+    if (window.caches && typeof window.caches.keys === 'function') {
+      window.caches.keys().then((keys) => {
+        if (keys && keys.length) window.__deepscope_caches = keys.slice(0, 20);
+      }).catch(()=>{});
+    }
+    if (window.__deepscope_idb && window.__deepscope_idb.length) {
+      stores.push({ name: 'IndexedDB Databases', keys: window.__deepscope_idb });
+    }
+    if (window.__deepscope_caches && window.__deepscope_caches.length) {
+      stores.push({ name: 'CacheStorage Caches', keys: window.__deepscope_caches });
+    }
+  } catch(e) {}
   return { identities, tokens, endpoints, stores };
 })()`;
 
@@ -4853,6 +4994,7 @@ function wire(): void {
   try { document.getElementById('resTable')?.querySelector('tbody')?.addEventListener('click', (e) => tableClick(e, 'res')); } catch { /* ignore */ }
   on('btnResCopyUrls', 'click', () => void copyFilteredResUrls());
   on('btnResCopyAll', 'click', () => void copyFilteredResAll());
+  on('btnResProbeMaps', 'click', () => void probeUnlinkedSourceMaps());
   on('btnResSourceZip', 'click', exportSourceZip);
   on('netMethod', 'change', (e) => { netMethod = (e.target as HTMLSelectElement).value; renderNetwork(); });
   on('netKind', 'change', (e) => { netKind = (e.target as HTMLSelectElement).value; renderNetwork(); });

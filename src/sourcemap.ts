@@ -267,3 +267,28 @@ export function buildSourceMapZip(files: SourceMapFile[]): Uint8Array {
 
   return out;
 }
+
+/**
+ * Generates potential unlinked source-map URLs for scripts that stripped //# sourceMappingURL.
+ * Checks <script>.js.map, <script>.map, and paths with query params handled.
+ */
+export function probeOrphanSourceMapCandidates(scriptUrl: string): string[] {
+  if (!scriptUrl || scriptUrl.length < 5 || scriptUrl.startsWith('data:') || scriptUrl.startsWith('blob:')) return [];
+  const candidates: string[] = [];
+  try {
+    const u = new URL(scriptUrl);
+    const path = u.pathname;
+    if (path.endsWith('.js') || path.endsWith('.mjs') || path.endsWith('.cjs')) {
+      const base = `${u.origin}${path}.map`;
+      candidates.push(base);
+      const dotJsMap = `${u.origin}${path.replace(/\.[cm]?js$/, '')}.js.map`;
+      if (!candidates.includes(dotJsMap)) candidates.push(dotJsMap);
+    } else {
+      candidates.push(`${u.origin}${path}.map`);
+    }
+  } catch {
+    const clean = scriptUrl.split('?')[0].split('#')[0];
+    candidates.push(`${clean}.map`);
+  }
+  return candidates;
+}

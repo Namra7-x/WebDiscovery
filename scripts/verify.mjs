@@ -17,7 +17,8 @@ import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon 
 import { classifyApiKind, findExposures } from '../dist/exposure.js';
 import { findFrameworkFindings } from '../dist/framework.js';
 import { findHygieneFindings } from '../dist/hygiene.js';
-import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, crc32 } from '../dist/sourcemap.js';
+import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, crc32, probeOrphanSourceMapCandidates } from '../dist/sourcemap.js';
+import { dissectWasmBinary } from '../dist/wasm.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { CaptureStore } from '../dist/store.js';
 import { sanitizeReplayHeaders, truncateReplayBody, matchInterceptRule } from '../dist/replay.js';
@@ -656,7 +657,7 @@ ok('Universal Viewer: category detection', () => {
   // PNG magic bytes 89 50 4e 47
   assert.equal(detectContentCategory('test', '', '', new Uint8Array([0x89, 0x50, 0x4e, 0x47])).category, 'image');
   // WASM magic bytes 00 61 73 6d
-  assert.equal(detectContentCategory('module', '', '', new Uint8Array([0x00, 0x61, 0x73, 0x6d])).category, 'binary');
+  assert.equal(detectContentCategory('module', '', '', new Uint8Array([0x00, 0x61, 0x73, 0x6d])).category, 'wasm');
   // Extensions & MIME
   assert.equal(detectContentCategory('https://example.com/audio.mp3', 'audio/mpeg').category, 'audio');
   assert.equal(detectContentCategory('https://example.com/video.mp4', 'video/mp4').category, 'video');
@@ -1091,6 +1092,52 @@ ok('Reverse Engineering: Modern Bundlers & String De-obfuscation', () => {
   assert.equal(pqs.length, 1);
   assert.equal(pqs[0].id, '839201928374659102938475');
   assert.equal(pqs[0].name, 'UserBillingQuery');
+});
+
+// 63. WebAssembly Binary Dissector
+ok('Reverse Engineering: WebAssembly Binary Dissector', () => {
+  // Construct minimal valid WASM with Export section and Data strings
+  // Magic: \0asm (0x00, 0x61, 0x73, 0x6d), Version: 1 (0x01, 0x00, 0x00, 0x00)
+  // Section 7 (Export): id=7, size=10
+  // count=1, name="authFunc" (len=8), kind=0 (func), index=0
+  const exportName = Buffer.from('authFunc');
+  const exportPayload = [1, exportName.length, ...exportName, 0, 0];
+  const sec7 = [7, exportPayload.length, ...exportPayload];
+
+  // Embedded data string: "/api/v2/secure"
+  const dataStr = Buffer.from('/api/v2/secure');
+  const wasmHeader = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+  const testWasm = new Uint8Array([...wasmHeader, ...sec7, ...dataStr]);
+
+  const dis = dissectWasmBinary(testWasm);
+  assert.equal(dis.version, 1);
+  assert.equal(dis.exports.length, 1);
+  assert.equal(dis.exports[0].name, 'authFunc');
+  assert.ok(dis.endpoints.includes('/api/v2/secure'));
+  assert.ok(dis.formatted.includes('(export "authFunc" (func #0))'));
+  assert.ok(dis.formatted.includes('/api/v2/secure'));
+});
+
+// 64. Orphan Source-Map Resolver Candidate Generator
+ok('Reverse Engineering: Orphan Source-Map Resolver Candidates', () => {
+  const url = 'https://app.target.com/assets/chunks/main.a8f92b.js?v=2';
+  const candidates = probeOrphanSourceMapCandidates(url);
+  assert.ok(candidates.length >= 1);
+  assert.ok(candidates.some((c) => c === 'https://app.target.com/assets/chunks/main.a8f92b.js.map'));
+});
+
+// 65. Ephemeral Token & OAuth URL Capture
+ok('Storage & Memory: Ephemeral OAuth Token Capture', () => {
+  const oauthRedirect = 'https://app.target.com/callback#access_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c&token_type=Bearer&state=xyz123';
+  const TOKEN_PARAM_RE = /(?:code|access_token|id_token|session_token|token|api_key|auth_token|refresh_token)=([a-zA-Z0-9_\-\.]{8,})/gi;
+  const captured = [];
+  let m;
+  while ((m = TOKEN_PARAM_RE.exec(oauthRedirect))) {
+    captured.push({ param: m[0].split('=')[0], val: m[1] });
+  }
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].param, 'access_token');
+  assert.ok(captured[0].val.startsWith('eyJhbGci'));
 });
 
 console.log(`\n${pass} checks passed.`);

@@ -23,6 +23,10 @@ interface DomBatch {
    *  background already forwards content-batch untouched, so piggybacking
    *  here needs zero new plumbing. */
   runtime?: RuntimeHit[];
+  cryptoEvents?: Array<{ op: string; algo: string; preview: string; ts: number }>;
+  ephemeralTokens?: Array<{ param: string; token: string; url: string; ts: number }>;
+  shadowLinks?: string[];
+  shadowForms?: string[];
 }
 
 interface RuntimeHit { t: string; method: string; url: string; ts: number }
@@ -30,6 +34,45 @@ interface RuntimeHit { t: string; method: string; url: string; ts: number }
 let sentInitial = false;
 let batchTimer = 0;
 const seen = new Set<string>();
+const cryptoBuffer: Array<{ op: string; algo: string; preview: string; ts: number }> = [];
+const ephemeralTokens: Array<{ param: string; token: string; url: string; ts: number }> = [];
+let shadowBuffer = { links: [] as string[], forms: [] as string[] };
+
+function checkEphemeralTokens(href: string): void {
+  try {
+    const TOKEN_PARAM_RE = /(?:code|access_token|id_token|session_token|token|api_key|auth_token|refresh_token)=([a-zA-Z0-9_\-\.]{8,})/gi;
+    let m: RegExpExecArray | null;
+    while ((m = TOKEN_PARAM_RE.exec(href))) {
+      const full = m[0];
+      const param = full.split('=')[0];
+      const val = m[1];
+      if (!ephemeralTokens.some((t) => t.token === val)) {
+        ephemeralTokens.push({ param, token: val, url: href, ts: Date.now() });
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+window.addEventListener('message', (e) => {
+  try {
+    if (e.source !== window || !e.data) return;
+    const d = e.data as Record<string, unknown>;
+    if (d.source === 'deepscope-crypto-event') {
+      if (cryptoBuffer.length < 50) {
+        cryptoBuffer.push({
+          op: String(d.op || ''),
+          algo: String(d.algo || ''),
+          preview: String(d.preview || ''),
+          ts: Number(d.ts || Date.now()),
+        });
+      }
+    } else if (d.source === 'deepscope-shadow-data') {
+      const l = Array.isArray(d.links) ? (d.links as string[]) : [];
+      const f = Array.isArray(d.forms) ? (d.forms as string[]) : [];
+      shadowBuffer = { links: l, forms: f };
+    }
+  } catch { /* ignore */ }
+});
 
 function routeOf(): string {
   try { return location.pathname + location.search; } catch { return '/'; }
@@ -149,16 +192,22 @@ function snapshot(reason: string): void {
     const manifests = collectManifests();
     const importmapLinks = collectImportmapLinks();
     const textSample = (document.body?.innerText ?? '').slice(0, 4000);
+    try { window.postMessage({ source: 'deepscope-query', action: 'get-shadow-data' }, '*'); } catch { /* ignore */ }
     const batch: DomBatch = {
       type: 'content-batch', url: location.href, route: routeOf(),
       htmlLen: document.documentElement?.outerHTML?.length ?? 0,
-      links: [...new Set([...out.links, ...importmapLinks])].slice(0, 300),
+      links: [...new Set([...out.links, ...importmapLinks, ...shadowBuffer.links])].slice(0, 300),
       scripts: [...new Set(out.scripts)].slice(0, 120),
-      forms, iframes: out.iframes.slice(0, 40),
+      forms: [...new Set([...forms, ...shadowBuffer.forms])].slice(0, 50),
+      iframes: out.iframes.slice(0, 40),
       routes: [...new Set(out.routes)].slice(0, 200),
       manifest, manifests, chunks: [...new Set(chunks)], apis: [...new Set(apis)],
       textSample, ts: Date.now(),
+      shadowLinks: shadowBuffer.links.slice(0, 100),
+      shadowForms: shadowBuffer.forms.slice(0, 40),
     };
+    if (cryptoBuffer.length) batch.cryptoEvents = cryptoBuffer.splice(0, 50);
+    if (ephemeralTokens.length) batch.ephemeralTokens = ephemeralTokens.splice(0, 50);
     const rt = drainRuntime(200);
     if (rt.length) batch.runtime = rt;
     try {
@@ -175,6 +224,7 @@ function schedule(): void {
 // Passive hooks
 if (!sentInitial) {
   sentInitial = true;
+  checkEphemeralTokens(location.href);
   snapshot('init');
   try {
     new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true, attributes: false });
@@ -182,11 +232,21 @@ if (!sentInitial) {
   // SPA transition monitoring: history API + hash + performance lazy chunks
   try {
     const push = history.pushState.bind(history);
-    history.pushState = (...a: Parameters<typeof push>) => { const r = push(...a); try { rtPush('history', 'GET', location.href); } catch { /* ignore */ } schedule(); return r; };
+    history.pushState = (...a: Parameters<typeof push>) => {
+      const r = push(...a);
+      try { rtPush('history', 'GET', location.href); checkEphemeralTokens(location.href); } catch { /* ignore */ }
+      schedule();
+      return r;
+    };
     const repl = history.replaceState.bind(history);
-    history.replaceState = (...a: Parameters<typeof repl>) => { const r = repl(...a); try { rtPush('history', 'GET', location.href); } catch { /* ignore */ } schedule(); return r; };
-    window.addEventListener('popstate', schedule);
-    window.addEventListener('hashchange', schedule);
+    history.replaceState = (...a: Parameters<typeof repl>) => {
+      const r = repl(...a);
+      try { rtPush('history', 'GET', location.href); checkEphemeralTokens(location.href); } catch { /* ignore */ }
+      schedule();
+      return r;
+    };
+    window.addEventListener('popstate', () => { checkEphemeralTokens(location.href); schedule(); });
+    window.addEventListener('hashchange', () => { checkEphemeralTokens(location.href); schedule(); });
   } catch { /* ignore */ }
   // Lazy-load observation
   try {

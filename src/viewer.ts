@@ -17,6 +17,7 @@ export type ContentCategory =
   | 'protobuf'
   | 'msgpack'
   | 'rsc'
+  | 'wasm'
   | 'binary'
   | 'text';
 
@@ -83,8 +84,8 @@ export function detectContentCategory(
   if (hasMagic(bytes, [0x47, 0x49, 0x46, 0x38])) {
     return { category: 'image', mime: mime || 'image/gif', isMedia: true, isBinary: true, canDecompress: false, canBeautify: false, label: 'GIF image' };
   }
-  if (hasMagic(bytes, [0x00, 0x61, 0x73, 0x6d])) {
-    return { category: 'binary', mime: mime || 'application/wasm', isMedia: false, isBinary: true, canDecompress: false, canBeautify: false, label: 'WebAssembly binary' };
+  if (hasMagic(bytes, [0x00, 0x61, 0x73, 0x6d]) || mime.includes('wasm') || u.endsWith('.wasm')) {
+    return { category: 'wasm', mime: 'application/wasm', isMedia: false, isBinary: true, canDecompress: false, canBeautify: true, label: 'WebAssembly binary' };
   }
 
   // 2. MIME type & extension matching
