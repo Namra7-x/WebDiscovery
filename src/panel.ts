@@ -1998,6 +1998,8 @@ function syncResTypeOptions(): void {
 
 function renderResources(): void {
   syncResTypeOptions();
+  const btnZip = document.getElementById('btnResSourceZip');
+  if (btnZip) btnZip.textContent = `Export Source ZIP (${reconstructedSourceFiles.size})`;
   const all = filteredResources();
   const fp = fpHost();
   let groups: Array<{ host: string; items: ResourceMeta[] }> = [];
@@ -3508,6 +3510,8 @@ function exportOpenApi(): void {
 }
 
 function renderApis(): void {
+  const btnGql = document.getElementById('btnApisGraphQL');
+  if (btnGql) btnGql.textContent = `Export GraphQL (${discoveredGraphQLOps.size})`;
   const all = buildApiRows();
   lastApiCount = all.length;
   syncApiKindOptions(all);
@@ -3995,7 +3999,8 @@ async function discoverRoutesNow(): Promise<void> {
 function exportSourceZip(): void {
   const files = [...reconstructedSourceFiles.values()];
   if (!files.length) {
-    diag('Export Source ZIP: no source-map files reconstructed yet. Browse or Deep Scan with source-map analysis on.');
+    alert('No source-map files (.map) have been captured yet for this site.\n\nHow to get source files:\n1. Ensure "analyze source maps" is checked in Settings.\n2. Browse the page or click "Deep Scan" to let DeepScope fetch JS bundles and .map files.');
+    diag('Export Source ZIP: 0 source files captured yet.');
     return;
   }
   try {
@@ -4018,7 +4023,8 @@ function exportSourceZip(): void {
 function exportGraphQLRegistry(): void {
   const ops = [...discoveredGraphQLOps.values()];
   if (!ops.length) {
-    diag('Export GraphQL: no client-side GraphQL operations discovered yet. Browse or Deep Scan.');
+    alert('No client-side GraphQL operations have been discovered yet.\n\nHow to discover GraphQL:\n1. Browse or Deep Scan a web app that uses GraphQL.\n2. DeepScope scans all JS bundles for query, mutation, and gql tags.');
+    diag('Export GraphQL: 0 operations discovered yet.');
     return;
   }
   try {
@@ -4037,6 +4043,138 @@ function exportGraphQLRegistry(): void {
   }
 }
 
+const HARVEST_INLINE_SCRIPT = `(()=>{
+  const identities = [];
+  const tokens = [];
+  const endpoints = [];
+  const stores = [];
+  const seenVals = new Set();
+  const addId = (key, val, source) => {
+    if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+      const s = String(val).slice(0, 120);
+      if (!seenVals.has(key + s) && identities.length < 50) {
+        seenVals.add(key + s);
+        identities.push({ key, val: s, source });
+      }
+    }
+  };
+  const addToken = (key, val, source) => {
+    if (typeof val === 'string' && val.length >= 10 && val.length <= 1000) {
+      if (!seenVals.has(val) && tokens.length < 50) {
+        seenVals.add(val);
+        tokens.push({ key, val, source });
+      }
+    }
+  };
+  const addEndpoint = (url, source) => {
+    if (typeof url === 'string' && url.length >= 2 && url.length <= 250) {
+      if (!seenVals.has(url) && endpoints.length < 100) {
+        seenVals.add(url);
+        endpoints.push({ url, source });
+      }
+    }
+  };
+  try {
+    const apollo = window.__APOLLO_CLIENT__;
+    if (apollo && typeof apollo.extract === 'function') {
+      const data = apollo.extract();
+      stores.push({ name: 'Apollo Client', keys: Object.keys(data || {}).slice(0, 30) });
+      for (const [, v] of Object.entries(data || {})) {
+        if (!v || typeof v !== 'object') continue;
+        for (const [f, fv] of Object.entries(v)) {
+          const lf = f.toLowerCase();
+          if (lf === 'id' || lf === 'email' || lf === 'username' || lf === 'role' || lf.indexOf('admin') !== -1) addId(f, fv, 'apollo');
+          if (lf.indexOf('token') !== -1 || lf.indexOf('auth') !== -1 || lf.indexOf('key') !== -1) addToken(f, fv, 'apollo');
+        }
+      }
+    }
+  } catch(e) {}
+  try {
+    const rq = window.queryClient || window.__REACT_QUERY_GLOBAL_CLIENT__;
+    if (rq && typeof rq.getQueryCache === 'function') {
+      const queries = rq.getQueryCache()?.getAll?.() || [];
+      const keys = [];
+      for (const q of queries.slice(0, 50)) {
+        const qk = JSON.stringify(q.queryKey || '');
+        keys.push(qk.slice(0, 80));
+        if (typeof q.queryKey === 'string' && q.queryKey.startsWith('/')) addEndpoint(q.queryKey, 'react-query');
+        else if (Array.isArray(q.queryKey)) {
+          for (const item of q.queryKey) {
+            if (typeof item === 'string' && (item.startsWith('/') || item.startsWith('http'))) addEndpoint(item, 'react-query');
+          }
+        }
+      }
+      stores.push({ name: 'React Query', keys: keys.slice(0, 30) });
+    }
+  } catch(e) {}
+  try {
+    const store = window.store || window.__REDUX_STORE__;
+    if (store && typeof store.getState === 'function') {
+      const state = store.getState();
+      if (state && typeof state === 'object') {
+        stores.push({ name: 'Redux Store', keys: Object.keys(state).slice(0, 50) });
+        for (const [, v] of Object.entries(state)) {
+          if (!v || typeof v !== 'object') continue;
+          for (const [sk, sv] of Object.entries(v)) {
+            const lsk = sk.toLowerCase();
+            if (lsk === 'id' || lsk === 'role' || lsk === 'email' || lsk.indexOf('admin') !== -1) addId(sk, sv, 'redux');
+            if (lsk.indexOf('token') !== -1 || lsk.indexOf('auth') !== -1 || lsk.indexOf('secret') !== -1) addToken(sk, sv, 'redux');
+          }
+        }
+      }
+    }
+  } catch(e) {}
+  try {
+    const lsKeys = [];
+    for (let i = 0; i < localStorage.length && i < 100; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      lsKeys.push(k);
+      const v = localStorage.getItem(k) || '';
+      const lk = k.toLowerCase();
+      if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1 || lk.indexOf('jwt') !== -1 || lk.indexOf('session') !== -1) addToken(k, v, 'localStorage');
+      if (lk.indexOf('user') !== -1 || lk.indexOf('role') !== -1) addId(k, v, 'localStorage');
+    }
+    if (lsKeys.length) stores.push({ name: 'localStorage', keys: lsKeys.slice(0, 30) });
+  } catch(e) {}
+  try {
+    const ssKeys = [];
+    for (let i = 0; i < sessionStorage.length && i < 100; i++) {
+      const k = sessionStorage.key(i);
+      if (!k) continue;
+      ssKeys.push(k);
+      const v = sessionStorage.getItem(k) || '';
+      const lk = k.toLowerCase();
+      if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1 || lk.indexOf('jwt') !== -1 || lk.indexOf('session') !== -1) addToken(k, v, 'sessionStorage');
+      if (lk.indexOf('user') !== -1 || lk.indexOf('role') !== -1) addId(k, v, 'sessionStorage');
+    }
+    if (ssKeys.length) stores.push({ name: 'sessionStorage', keys: ssKeys.slice(0, 30) });
+  } catch(e) {}
+  try {
+    const nd = window.__NEXT_DATA__;
+    if (nd) {
+      if (nd.page) addEndpoint(nd.page, 'next-data');
+      if (nd.buildId) addId('buildId', nd.buildId, 'next-data');
+      const pp = nd.props?.pageProps;
+      if (pp && typeof pp === 'object') {
+        for (const [k, v] of Object.entries(pp)) {
+          const lk = k.toLowerCase();
+          if (lk === 'user' || lk === 'role' || lk === 'id') addId(k, JSON.stringify(v), 'next-data');
+          if (lk.indexOf('token') !== -1 || lk.indexOf('auth') !== -1) addToken(k, String(v), 'next-data');
+        }
+      }
+      stores.push({ name: 'Next.js Data', keys: ['page: ' + (nd.page || ''), 'buildId: ' + (nd.buildId || '')] });
+    }
+  } catch(e) {}
+  try {
+    const nx = window.__NUXT__;
+    if (nx && typeof nx === 'object') {
+      stores.push({ name: 'Nuxt Data', keys: Object.keys(nx).slice(0, 30) });
+    }
+  } catch(e) {}
+  return { identities, tokens, endpoints, stores };
+})()`;
+
 let lastHarvestSummary = '';
 async function runStateHarvest(): Promise<void> {
   diag('Harvesting client-side runtime state & memory...');
@@ -4046,19 +4184,14 @@ async function runStateHarvest(): Promise<void> {
       tokens?: Array<{ key: string; val: string; source: string }>;
       endpoints?: Array<{ url: string; source: string }>;
       stores?: Array<{ name: string; keys: string[] }>;
-    }>('window.__deepscope_harvest_state ? window.__deepscope_harvest_state() : null');
+    }>(HARVEST_INLINE_SCRIPT);
 
-    if (!res) {
-      diag('State harvest: content helper not available on this origin (grant site access).');
-      return;
-    }
+    const idCount = res?.identities?.length ?? 0;
+    const tokenCount = res?.tokens?.length ?? 0;
+    const epCount = res?.endpoints?.length ?? 0;
+    const storeCount = res?.stores?.length ?? 0;
 
-    const idCount = res.identities?.length ?? 0;
-    const tokenCount = res.tokens?.length ?? 0;
-    const epCount = res.endpoints?.length ?? 0;
-    const storeCount = res.stores?.length ?? 0;
-
-    if (res.endpoints) {
+    if (res?.endpoints) {
       for (const ep of res.endpoints) {
         touchRoute(ep.url, 'live-fetch');
         graph.addNode(ep.url, shortLabel(ep.url), 'endpoint', ep.url);
@@ -4066,7 +4199,7 @@ async function runStateHarvest(): Promise<void> {
       }
     }
 
-    if (res.tokens) {
+    if (res?.tokens) {
       for (const tok of res.tokens) {
         const hits = scanTextForSecrets(tok.val);
         for (const hit of hits) {
@@ -4087,25 +4220,29 @@ async function runStateHarvest(): Promise<void> {
 
     let html = `<div class="row" style="margin-bottom:12px;"><span class="badge">Identities: ${idCount}</span> <span class="badge">Tokens/Secrets: ${tokenCount}</span> <span class="badge">Endpoints: ${epCount}</span> <span class="badge">Stores: ${storeCount}</span></div>`;
 
-    if (res.stores?.length) {
+    if (res?.stores?.length) {
       html += `<h4 style="margin:8px 0 4px;">Detected Memory Stores</h4><ul>` + res.stores.map((s) => `<li><b>${esc(s.name)}:</b> ${esc(s.keys.join(', '))}</li>`).join('') + `</ul>`;
     }
-    if (res.identities?.length) {
+    if (res?.identities?.length) {
       html += `<h4 style="margin:8px 0 4px;">Identities & User Roles</h4><table class="mono small" style="width:100%;margin-bottom:8px;"><thead><tr><th>Key</th><th>Value</th><th>Source</th></tr></thead><tbody>`
         + res.identities.map((id) => `<tr><td>${esc(id.key)}</td><td><b>${esc(id.val)}</b></td><td>${esc(id.source)}</td></tr>`).join('')
         + `</tbody></table>`;
     }
-    if (res.tokens?.length) {
+    if (res?.tokens?.length) {
       html += `<h4 style="margin:8px 0 4px;">Tokens & Credentials</h4><table class="mono small" style="width:100%;margin-bottom:8px;"><thead><tr><th>Key</th><th>Token / Value</th><th>Source</th></tr></thead><tbody>`
         + res.tokens.map((t) => `<tr><td>${esc(t.key)}</td><td style="word-break:break-all;">${esc(t.val)}</td><td>${esc(t.source)}</td></tr>`).join('')
         + `</tbody></table>`;
     }
-    if (res.endpoints?.length) {
+    if (res?.endpoints?.length) {
       html += `<h4 style="margin:8px 0 4px;">Cached Query Endpoints</h4><ul>` + res.endpoints.map((ep) => `<li><span class="mono">${esc(ep.url)}</span> <span class="muted small">(${esc(ep.source)})</span></li>`).join('') + `</ul>`;
     }
 
+    if (!idCount && !tokenCount && !epCount && !storeCount) {
+      html += `<p class="muted" style="margin-top:12px;">No active Redux/Apollo/React Query stores or storage tokens found in this page's memory.<br/>Probe checked: Apollo Client, React Query, Redux, LocalStorage, SessionStorage, Next.js, and Nuxt data.</p>`;
+    }
+
     body.innerHTML = html;
-    lastHarvestSummary = JSON.stringify(res, null, 2);
+    lastHarvestSummary = JSON.stringify(res || {}, null, 2);
     modal.classList.remove('hidden');
     diag(`State harvested: ${idCount} identities, ${tokenCount} tokens, ${epCount} endpoints across ${storeCount} stores`);
   } catch (e) {
@@ -4303,14 +4440,27 @@ function wire(): void {
   on('btnStateCopy', 'click', () => { if (lastHarvestSummary) void copyText(lastHarvestSummary, 'harvested state'); });
 
   const chkFlags = document.getElementById('chkTamperFlags') as HTMLInputElement | null;
+  const flagStatus = document.getElementById('flagTamperStatus');
   if (chkFlags) {
+    const updateFlagStatus = (on: boolean): void => {
+      if (flagStatus) {
+        flagStatus.textContent = on ? '● ACTIVE (refresh page to apply)' : '○ inactive';
+        flagStatus.style.color = on ? '#4caf50' : '';
+      }
+    };
     try {
       chrome.storage?.session?.get?.('deepscope-tamper-flags').then((res) => {
-        if (res && (res as Record<string, unknown>)['deepscope-tamper-flags'] === true) chkFlags.checked = true;
+        if (res && (res as Record<string, unknown>)['deepscope-tamper-flags'] === true) {
+          chkFlags.checked = true;
+          updateFlagStatus(true);
+        } else {
+          updateFlagStatus(false);
+        }
       }).catch(() => undefined);
     } catch { /* ignore */ }
     chkFlags.addEventListener('change', () => {
       const val = chkFlags.checked;
+      updateFlagStatus(val);
       try {
         void chrome.storage?.session?.set?.({ 'deepscope-tamper-flags': val });
         diag(`Feature flag tampering ${val ? 'ENABLED' : 'DISABLED'} — rules apply on next fetch`);

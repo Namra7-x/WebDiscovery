@@ -57,7 +57,7 @@
           <p class="muted small">RAM-only: everything below lives in this panel's memory and is destroyed when DevTools closes. Export only happens when you click it.</p>
         </section>
         <section class="card" aria-labelledby="h-intercept"><h3 id="h-intercept">Interception (mock / block)</h3><div id="interceptList" class="mono small"></div>
-          <div class="row" style="margin-top:6px;"><label for="chkTamperFlags" class="small" title="Auto-rewrites false to true in LaunchDarkly, Statsig, and custom flag responses"><input id="chkTamperFlags" type="checkbox" /> <b>Tamper Feature Flags</b> (auto-enable client flags)</label></div>
+          <div class="row" style="margin-top:6px;"><label for="chkTamperFlags" class="small" title="Auto-rewrites false to true in LaunchDarkly, Statsig, and custom flag responses"><input id="chkTamperFlags" type="checkbox" /> <b>Tamper Feature Flags</b> (auto-enable client flags)</label><span id="flagTamperStatus" class="muted small" style="margin-left:6px;"></span></div>
           <div id="interceptHint" class="muted small"></div>
           <p class="muted small">Rules run in the page and vanish when the browser closes. Replay one-off requests from the Network or APIs tab.</p>
         </section>
