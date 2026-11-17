@@ -10,9 +10,10 @@ import {
   extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry,
   extractServerActions, extractValidationSchemas, extractPersistedQueries,
   extractModernBundlerManifests, deobfuscateJsStrings, extractCloudConfigs,
+  parseCspDomains, diffEndpointFields, normalizeDynamicPath,
   type ApiCallSchema, type GraphQLOperation, type ServerActionDef,
   type ValidationSchema, type PersistedQueryDef, type ModernBundlerManifest,
-  type CloudConfigFinding,
+  type CloudConfigFinding, type CspDomainReport, type SchemaFieldDiff,
 } from './extractors.js';
 import { scanTextForSecrets } from './rules.js';
 import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody, isBinaryText, BINARY_BODY_NOTE } from './tables.js';
@@ -46,8 +47,8 @@ import {
 import {
   detectContentCategory, beautifyJs, beautifyJson, beautifyCss, beautifyHtml,
   formatHexDump, decompressPayload, parseZipListing, toUint8Array, addLineNumbers,
-  decodeRawProtobuf, decodeMsgPack, decodeRscStream, decodeWsFrame,
-  type ContentCategory, type DetectResult,
+  decodeRawProtobuf, decodeMsgPack, decodeRscStream, decodeWsFrame, decodeAiStream,
+  type ContentCategory, type DetectResult, type AiStreamResult,
 } from './viewer.js';
 
 const tabId = chrome.devtools.inspectedWindow.tabId;
@@ -80,6 +81,12 @@ const discoveredServerActions = new Map<string, ServerActionDef>();
 const discoveredPersistedQueries = new Map<string, PersistedQueryDef>();
 /** Discovered client validation schemas (Zod, Yup). */
 const discoveredValidationSchemas: ValidationSchema[] = [];
+/** Discovered Cloud BaaS configuration blocks (Firebase, Supabase, Sentry). */
+const discoveredCloudConfigs: CloudConfigFinding[] = [];
+/** Discovered Content-Security-Policy domains & infrastructure. */
+const discoveredCspDomains = new Set<string>();
+const discoveredInternalDomains = new Set<string>();
+const discoveredCloudBuckets = new Set<string>();
 // Secret findings (Analyze tab): snapshots of indexed units that arrived with
 // a worker/fallback `sec` hit attached. Bounded; drops counted + diag-once.
 interface SecFinding { text: string; prov: TextRecord['prov']; rule: string; sev: Severity; label: string }
@@ -665,6 +672,24 @@ async function ingestText(
         graph.link(url, abs, 'manifest-ref');
         diag(`module federation remote: ${rem.name} -> ${shortLabel(abs)}`);
       } catch { /* ignore */ }
+    }
+
+    // 8. Cloud BaaS Configuration Blocks (Firebase, Supabase, Sentry)
+    const cloudConfigs = extractCloudConfigs(cleanJs);
+    if (cloudConfigs.length) {
+      for (const cc of cloudConfigs) {
+        discoveredCloudConfigs.push(cc);
+        const detailStr = Object.entries(cc.details).map(([k, v]) => `${k}=${v}`).join(', ');
+        diag(`cloud config mined [${cc.provider}]: ${detailStr}`, url);
+        secFindings.push({
+          text: `[${cc.provider}] ${detailStr}`,
+          prov: { resourceUrl: url, resourceKind: 'script', route, method: opts.method ?? 'devtools-network' },
+          rule: `cloud-config-${cc.provider}`,
+          sev: 'medium',
+          label: `Cloud BaaS Config (${cc.provider.toUpperCase()})`,
+        });
+      }
+      scheduleRender('analyze');
     }
   }
 
@@ -1460,6 +1485,8 @@ interface ContentBatch {
   ephemeralTokens?: Array<{ param: string; token: string; url: string; ts: number }>;
   shadowLinks?: string[];
   shadowForms?: string[];
+  postMessageAudits?: Array<{ hasOriginCheck: boolean; preview: string; ts: number }>;
+  postMessagePackets?: Array<{ origin: string; sample: string; ts: number }>;
 }
 
 async function handleContentBatch(b: ContentBatch): Promise<void> {
@@ -1514,6 +1541,39 @@ async function handleContentBatch(b: ContentBatch): Promise<void> {
     }
     diag(`closed shadow-DOM mined: ${b.shadowLinks.length} hidden links uncovered`);
   }
+
+  // postMessage Listener Audit & Incoming Message Packets
+  if (b.postMessageAudits && b.postMessageAudits.length) {
+    for (const pma of b.postMessageAudits) {
+      if (!pma.hasOriginCheck) {
+        diag(`postMessage listener registered without origin validation`, b.url);
+        secFindings.push({
+          text: pma.preview,
+          prov: { resourceUrl: b.url, resourceKind: 'document', route: sessionRoute, method: 'live-fetch' },
+          rule: 'postmessage-no-origin-check',
+          sev: 'medium',
+          label: 'postMessage Listener Missing Origin Check',
+        });
+      }
+    }
+    scheduleRender('analyze');
+  }
+
+  if (b.postMessagePackets && b.postMessagePackets.length) {
+    for (const pmp of b.postMessagePackets) {
+      diag(`postMessage packet from [${pmp.origin || 'null'}]: ${pmp.sample.slice(0, 60)}`);
+      if (settings.capture.dom || settings.capture.json) {
+        index.add(`postMessage [${pmp.origin}]: ${pmp.sample}`, {
+          resourceUrl: b.url,
+          resourceKind: 'dom',
+          route: sessionRoute,
+          method: 'dom-link',
+          detail: 'postmessage-packet',
+        });
+      }
+    }
+  }
+
   // Index visible text sample as DOM units
   if (b.textSample && settings.capture.dom) {
     const prov = { resourceUrl: b.url, resourceKind: 'dom' as ResourceKind, route: sessionRoute, method: 'dom-link' as DiscoveryMethod };
@@ -1668,7 +1728,44 @@ function indexUrlAndHeaders(url: string, entry: NetEntry): void {
     }
   };
   for (const [k, v] of Object.entries(entry.reqHeaders ?? {})) pushH(k, v, false);
-  for (const [k, v] of Object.entries(entry.resHeaders ?? {})) pushH(k, v, true);
+  for (const [k, v] of Object.entries(entry.resHeaders ?? {})) {
+    pushH(k, v, true);
+    const lk = k.toLowerCase();
+    if (lk === 'content-security-policy' || lk === 'content-security-policy-report-only') {
+      const csp = parseCspDomains(v);
+      for (const d of csp.domains) discoveredCspDomains.add(d);
+      for (const id of csp.internalDomains) {
+        if (!discoveredInternalDomains.has(id)) {
+          discoveredInternalDomains.add(id);
+          diag(`internal domain in CSP: ${id}`, entry.url);
+          touchRoute(`https://${id}`, 'csp-domain');
+          secFindings.push({
+            text: id,
+            prov: { resourceUrl: entry.url, resourceKind: 'header', route: entry.route, method: 'devtools-network' },
+            rule: 'csp-internal-domain',
+            sev: 'medium',
+            label: `CSP Internal Domain (${id})`,
+          });
+          scheduleRender('analyze');
+        }
+      }
+      for (const b of csp.cloudBuckets) {
+        if (!discoveredCloudBuckets.has(b)) {
+          discoveredCloudBuckets.add(b);
+          diag(`cloud bucket in CSP: ${b}`, entry.url);
+          touchRoute(`https://${b}`, 'csp-domain');
+          secFindings.push({
+            text: b,
+            prov: { resourceUrl: entry.url, resourceKind: 'header', route: entry.route, method: 'devtools-network' },
+            rule: 'csp-cloud-bucket',
+            sev: 'info',
+            label: `CSP Cloud Bucket (${b})`,
+          });
+          scheduleRender('analyze');
+        }
+      }
+    }
+  }
   ledger.records = index.size;
   ledger.indexedChars = index.indexedChars;
   ledger.indexBytes = Math.round(index.indexBytes);
@@ -2637,10 +2734,26 @@ function openMock(url: string): void {
   (document.getElementById('mockStatus') as HTMLInputElement).value = '200';
   const kept = rawBodies.get(url);
   const keptBinary = kept != null && isBinaryText(kept);
-  (document.getElementById('mockBody') as HTMLTextAreaElement).value = kept != null && !keptBinary ? kept.slice(0, 20_000) : '';
-  (document.getElementById('mockMeta') as HTMLElement).textContent = kept == null
+  let mockBody = kept != null && !keptBinary ? kept.slice(0, 20_000) : '';
+  let metaNote = kept == null
     ? 'no retained body — write the canned response manually'
     : keptBinary ? 'retained body is binary/compressed — write the canned response manually' : 'prefilled from retained body — edit freely';
+
+  if (!mockBody && /(?:\/me|\/user|\/users\/me|\/profile|\/account|\/session|\/auth\/user|\/whoami)(?:$|[?#\/])/i.test(url)) {
+    mockBody = JSON.stringify({
+      id: 1,
+      name: "Dev Admin",
+      email: "dev.admin@company.local",
+      role: "admin",
+      permissions: ["*"],
+      is_admin: true,
+      tier: "enterprise"
+    }, null, 2);
+    metaNote = 'prefilled with developer identity template — edit roles/permissions freely';
+  }
+
+  (document.getElementById('mockBody') as HTMLTextAreaElement).value = mockBody;
+  (document.getElementById('mockMeta') as HTMLElement).textContent = metaNote;
   document.getElementById('mockModal')?.classList.remove('hidden');
   modalTakeFocus('mockMatch');
 }
@@ -3207,6 +3320,9 @@ async function viewUrl(url: string, forceLive = false): Promise<void> {
           touchRoute(ep, 'wasm-data');
         }
       }
+    } else if (category === 'ai-stream') {
+      const stream = decodeAiStream(rawText);
+      formatted = stream.formatted;
     } else if (category === 'binary' || isBinaryText(rawText)) {
       formatted = formatHexDump(rawText);
     } else {
@@ -3597,6 +3713,11 @@ function apiDetailHtml(url: string): string {
     const hasTokenParam = /[?&#](token|api[-_]?key|access_token|auth|bearer|key)=/i.test(url);
     badges = (hasAuth ? '<span class="badge kind">auth-header ✓</span>' : '<span class="badge">no auth header</span>')
       + ' ' + (hasTokenParam ? '<span class="badge kind">token in URL ⚠</span>' : '');
+    const u = new URL(url);
+    const norm = normalizeDynamicPath(u.pathname);
+    if (norm !== u.pathname) {
+      badges += ` <span class="badge" title="Normalized dynamic route pattern">path: ${esc(norm)}</span>`;
+    }
   } catch { badges = '<span class="badge">auth unknown</span>'; }
   const sentRaw = (n as unknown as { reqBody?: string } | undefined)?.reqBody;
   const sent = safeSnippetBody(sentRaw, 1500);
@@ -3622,6 +3743,27 @@ function apiDetailHtml(url: string): string {
     }
     schemaSec = `<section class="dt-sec"><h4 class="dt-h">Extracted AST Parameter Schema</h4>${parts.join('')}</section>`;
   }
+
+  let diffSec = '';
+  if (sentRaw && kept && !isBinaryText(kept)) {
+    try {
+      const diff = diffEndpointFields(kept, sentRaw);
+      if (diff.responseOnlyFields.length || diff.requestOnlyFields.length) {
+        const parts: string[] = [];
+        if (diff.responseOnlyFields.length) {
+          parts.push(`<div><b>Response-Only Fields:</b> <span class="mono">${esc(diff.responseOnlyFields.join(', '))}</span></div>`);
+        }
+        if (diff.requestOnlyFields.length) {
+          parts.push(`<div><b>Request-Only Fields:</b> <span class="mono">${esc(diff.requestOnlyFields.join(', '))}</span></div>`);
+        }
+        if (diff.sharedFields.length) {
+          parts.push(`<div><b>Shared Fields:</b> <span class="mono">${esc(diff.sharedFields.join(', '))}</span></div>`);
+        }
+        diffSec = `<section class="dt-sec"><h4 class="dt-h">Payload Schema Diff (Req vs Res)</h4>${parts.join('')}</section>`;
+      }
+    } catch { /* ignore diff error */ }
+  }
+
   return `<div class="dt"><div class="dt-url" title="Full URL — drag to select, double-click to select all">${esc(url)}</div><div class="dt-head"><div class="dt-badges">${badges}</div>`
     + `<div class="dt-actions"><button data-act="copysent" data-url="${esc(url)}" title="Copy sent body">Copy sent</button>`
     + (kept != null ? `<button data-act="copybody" data-url="${esc(url)}" title="Copy body preview">Copy body</button>` : '') + `</div></div>`
@@ -3629,6 +3771,7 @@ function apiDetailHtml(url: string): string {
     + `<section class="dt-sec"><h4 class="dt-h">Sent body</h4>${pre(sent, 'no sent body — GET requests rarely carry one')}</section>`
     + `<section class="dt-sec"><h4 class="dt-h">Body preview</h4>${pre(body, 'not retained — turn on “retain raw response bodies” in Settings, then recapture')}</section>`
     + `${schemaSec}`
+    + `${diffSec}`
     + `<section class="dt-sec"><h4 class="dt-h">Request headers (${reqH.length})</h4>${kv(reqH)}</section>`
     + `<section class="dt-sec"><h4 class="dt-h">Response headers (${resH.length})</h4>${kv(resH)}</section>`
     + `</div></div>`;
@@ -4387,6 +4530,29 @@ function exportTargetWordlist(): void {
       if (act.name) wordSet.add(act.name);
     }
 
+    // 7. Gather discovered Cloud BaaS & CSP endpoints
+    for (const cc of discoveredCloudConfigs) {
+      for (const [k, v] of Object.entries(cc.details)) {
+        paramSet.add(k);
+        wordSet.add(k);
+        if (typeof v === 'string' && (v.startsWith('http') || v.includes('.'))) {
+          endpointSet.add(v);
+        }
+      }
+    }
+    for (const d of discoveredCspDomains) {
+      endpointSet.add(`https://${d}`);
+    }
+
+    // 8. Add normalized dynamic path patterns
+    for (const ep of [...endpointSet]) {
+      try {
+        const u = ep.startsWith('http') ? new URL(ep).pathname : ep.split('?')[0];
+        const norm = normalizeDynamicPath(u);
+        if (norm && norm !== u) endpointSet.add(norm);
+      } catch { /* ignore */ }
+    }
+
     // Format output
     const sortedEndpoints = [...endpointSet].sort();
     const sortedParams = [...paramSet].sort();
@@ -5128,6 +5294,7 @@ function clearSession(prompt = true): boolean {
   smOriginals.clear(); smRebuilt.clear();
   reconstructedSourceFiles.clear(); discoveredGraphQLOps.clear(); discoveredApiSchemas.clear();
   discoveredServerActions.clear(); discoveredPersistedQueries.clear(); discoveredValidationSchemas.length = 0;
+  discoveredCloudConfigs.length = 0; discoveredCspDomains.clear(); discoveredInternalDomains.clear(); discoveredCloudBuckets.clear();
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   secShowAll = false; routeShowAll = false; anaKind = 'ALL';
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0; discoveredUrlSet.clear();

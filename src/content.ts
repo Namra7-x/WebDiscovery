@@ -27,6 +27,8 @@ interface DomBatch {
   ephemeralTokens?: Array<{ param: string; token: string; url: string; ts: number }>;
   shadowLinks?: string[];
   shadowForms?: string[];
+  postMessageAudits?: Array<{ hasOriginCheck: boolean; preview: string; ts: number }>;
+  postMessagePackets?: Array<{ origin: string; sample: string; ts: number }>;
 }
 
 interface RuntimeHit { t: string; method: string; url: string; ts: number }
@@ -36,6 +38,8 @@ let batchTimer = 0;
 const seen = new Set<string>();
 const cryptoBuffer: Array<{ op: string; algo: string; preview: string; ts: number }> = [];
 const ephemeralTokens: Array<{ param: string; token: string; url: string; ts: number }> = [];
+const postMessageAudits: Array<{ hasOriginCheck: boolean; preview: string; ts: number }> = [];
+const postMessagePackets: Array<{ origin: string; sample: string; ts: number }> = [];
 let shadowBuffer = { links: [] as string[], forms: [] as string[] };
 
 function checkEphemeralTokens(href: string): void {
@@ -70,6 +74,22 @@ window.addEventListener('message', (e) => {
       const l = Array.isArray(d.links) ? (d.links as string[]) : [];
       const f = Array.isArray(d.forms) ? (d.forms as string[]) : [];
       shadowBuffer = { links: l, forms: f };
+    } else if (d.source === 'deepscope-listener-audit') {
+      if (postMessageAudits.length < 50) {
+        postMessageAudits.push({
+          hasOriginCheck: Boolean(d.hasOriginCheck),
+          preview: String(d.preview || ''),
+          ts: Number(d.ts || Date.now()),
+        });
+      }
+    } else if (d.source === 'deepscope-postmessage-packet') {
+      if (postMessagePackets.length < 50) {
+        postMessagePackets.push({
+          origin: String(d.origin || ''),
+          sample: String(d.sample || ''),
+          ts: Number(d.ts || Date.now()),
+        });
+      }
     }
   } catch { /* ignore */ }
 });
@@ -208,6 +228,8 @@ function snapshot(reason: string): void {
     };
     if (cryptoBuffer.length) batch.cryptoEvents = cryptoBuffer.splice(0, 50);
     if (ephemeralTokens.length) batch.ephemeralTokens = ephemeralTokens.splice(0, 50);
+    if (postMessageAudits.length) batch.postMessageAudits = postMessageAudits.splice(0, 50);
+    if (postMessagePackets.length) batch.postMessagePackets = postMessagePackets.splice(0, 50);
     const rt = drainRuntime(200);
     if (rt.length) batch.runtime = rt;
     try {

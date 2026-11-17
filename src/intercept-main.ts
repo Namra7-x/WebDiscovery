@@ -365,4 +365,40 @@ interface InterceptRule {
       };
     }
   } catch { /* ignore */ }
+
+  // ---- postMessage Listener Auditor & Packet Tap ----
+  try {
+    const origAddEventListener = window.addEventListener;
+    window.addEventListener = function (type: string, listener: any, options?: any) {
+      if (type === 'message' && typeof listener === 'function') {
+        try {
+          const fnStr = Function.prototype.toString.call(listener);
+          const hasOriginCheck = /(?:origin\s*===|\.origin\s*!==|origin\.indexOf|===?\s*e(?:vent)?\.origin|\.match\(|origin\s*==|\.includes\()/.test(fnStr);
+          window.postMessage({
+            source: 'deepscope-listener-audit',
+            hasOriginCheck,
+            preview: fnStr.slice(0, 300),
+            ts: Date.now(),
+          }, '*');
+        } catch { /* ignore */ }
+      }
+      return origAddEventListener.call(this, type, listener, options);
+    };
+
+    origAddEventListener.call(window, 'message', (ev: any) => {
+      try {
+        if (!ev || !ev.data) return;
+        if (typeof ev.data === 'object' && ev.data && (ev.data as Record<string, unknown>).source && String((ev.data as Record<string, unknown>).source).startsWith('deepscope-')) return;
+        let sample = '';
+        if (typeof ev.data === 'string') sample = ev.data.slice(0, 300);
+        else sample = JSON.stringify(ev.data).slice(0, 300);
+        window.postMessage({
+          source: 'deepscope-postmessage-packet',
+          origin: ev.origin || '',
+          sample,
+          ts: Date.now(),
+        }, '*');
+      } catch { /* ignore */ }
+    }, true);
+  } catch { /* ignore */ }
 })();

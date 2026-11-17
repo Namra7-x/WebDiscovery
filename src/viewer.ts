@@ -18,6 +18,7 @@ export type ContentCategory =
   | 'msgpack'
   | 'rsc'
   | 'wasm'
+  | 'ai-stream'
   | 'binary'
   | 'text';
 
@@ -130,6 +131,9 @@ export function detectContentCategory(
   }
   if (mime.includes('text/x-component') || mime.includes('text/x-rsc') || u.includes('_rsc=') || u.endsWith('.rsc')) {
     return { category: 'rsc', mime: mime || 'text/x-component', isMedia: false, isBinary: false, canDecompress: false, canBeautify: true, label: 'Next.js RSC Wire Stream' };
+  }
+  if (mime.includes('text/event-stream') || sampleText.includes('data: {"choices"') || sampleText.includes('data: {"delta"') || (sampleText.includes('data: {') && sampleText.includes('[DONE]'))) {
+    return { category: 'ai-stream', mime: 'text/event-stream', isMedia: false, isBinary: false, canDecompress: false, canBeautify: true, label: 'AI LLM Event Stream' };
   }
 
   // 3. Content Sniff (for responses with missing or generic text/plain headers)
@@ -910,4 +914,100 @@ export function decodeWsFrame(payload: string): { protocol: string; event?: stri
   }
 
   return { protocol: 'raw', data: s, formatted: addLineNumbers(s) };
+}
+
+export interface AiStreamResult {
+  fullText: string;
+  toolCalls: Array<{ name: string; args: string }>;
+  systemPrompts: string[];
+  chunksCount: number;
+  formatted: string;
+}
+
+/**
+ * Unchunks streaming SSE LLM responses (OpenAI, Anthropic, Ollama, LangChain).
+ * Reconstructs complete conversation responses, tool invocations, and system messages.
+ */
+export function decodeAiStream(text: string): AiStreamResult {
+  if (typeof text !== 'string' || !text.trim()) {
+    return { fullText: '', toolCalls: [], systemPrompts: [], chunksCount: 0, formatted: '' };
+  }
+
+  const lines = text.split('\n');
+  let fullText = '';
+  const toolMap = new Map<string, { name: string; args: string }>();
+  const systemPrompts: string[] = [];
+  let chunksCount = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const raw = trimmed.slice(5).trim();
+    if (raw === '[DONE]' || !raw.startsWith('{')) continue;
+
+    try {
+      const obj = JSON.parse(raw);
+      chunksCount++;
+
+      // 1. OpenAI / generic chat completion choices
+      if (Array.isArray(obj.choices)) {
+        for (const ch of obj.choices) {
+          const delta = ch.delta || ch.message;
+          if (delta) {
+            if (delta.role === 'system' && typeof delta.content === 'string') {
+              if (!systemPrompts.includes(delta.content)) systemPrompts.push(delta.content);
+            } else if (typeof delta.content === 'string') {
+              fullText += delta.content;
+            }
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                const id = String(tc.id || tc.index || 'default');
+                const fn = tc.function || {};
+                const existing = toolMap.get(id) || { name: '', args: '' };
+                if (fn.name) existing.name = fn.name;
+                if (fn.arguments) existing.args += fn.arguments;
+                toolMap.set(id, existing);
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Anthropic style stream
+      if (obj.type === 'content_block_delta' && obj.delta?.text) {
+        fullText += obj.delta.text;
+      }
+
+      // 3. Ollama style stream
+      if (typeof obj.response === 'string') {
+        fullText += obj.response;
+      }
+    } catch { /* skip malformed line */ }
+  }
+
+  const toolCalls = [...toolMap.values()];
+
+  let formatted = `// DeepScope AI / LLM Stream Inspector\n// Chunks Unpacked: ${chunksCount} · Reconstructed Length: ${fullText.length} chars · Tool Calls: ${toolCalls.length}\n`;
+  if (systemPrompts.length) {
+    formatted += `\n// --- DETECTED SYSTEM PROMPTS (${systemPrompts.length}) ---\n`;
+    for (const sp of systemPrompts) {
+      formatted += `/* ${sp} */\n`;
+    }
+  }
+  if (toolCalls.length) {
+    formatted += `\n// --- DETECTED AGENT TOOL INVOCATIONS (${toolCalls.length}) ---\n`;
+    for (const tc of toolCalls) {
+      formatted += `tool: ${tc.name || 'unnamed'}(${tc.args})\n`;
+    }
+  }
+  formatted += '\n' + '='.repeat(70) + '\n\n';
+  formatted += fullText ? fullText : '(No text payload reconstructed)';
+
+  return {
+    fullText,
+    toolCalls,
+    systemPrompts,
+    chunksCount,
+    formatted: addLineNumbers(formatted),
+  };
 }

@@ -1739,7 +1739,7 @@ export function extractCloudConfigs(src: string): CloudConfigFinding[] {
   if (typeof src !== 'string' || src.length < 30) return out;
 
   // 1. Firebase config
-  const FB_KEY = /apiKey\s*:\s*['"](AIza[0-9A-Za-z_-]{35})['"]/;
+  const FB_KEY = /apiKey\s*:\s*['"](AIza[0-9A-Za-z_-]{30,40})['"]/;
   const fbMatch = FB_KEY.exec(src);
   if (fbMatch) {
     const details: Record<string, string> = { apiKey: fbMatch[1] };
@@ -1753,21 +1753,123 @@ export function extractCloudConfigs(src: string): CloudConfigFinding[] {
   }
 
   // 2. Supabase config
-  const SUPA_RE = /supabaseUrl\s*:\s*['"](https:\/\/[a-z0-9-]+\.supabase\.co)['"]/i;
+  const SUPA_RE = /['"](https:\/\/[a-z0-9-]+\.supabase\.co)['"]/i;
   const supaMatch = SUPA_RE.exec(src);
   if (supaMatch) {
     const details: Record<string, string> = { url: supaMatch[1] };
-    const keyM = /supabase(?:AnonKey|Key)\s*:\s*['"](eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)['"]/.exec(src);
+    const keyM = /(?:supabase(?:AnonKey|Key)|createClient\s*\([^,]+,\s*)['"](eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)['"]/i.exec(src);
     if (keyM) details.anonKey = keyM[1];
     out.push({ provider: 'supabase', details });
   }
 
   // 3. Sentry DSN
-  const SENTRY_RE = /dsn\s*:\s*['"](https:\/\/[a-f0-9]+@[a-z0-9.]+\/\d+)['"]/;
+  const SENTRY_RE = /['"](https:\/\/[a-zA-Z0-9_-]+@[a-z0-9.]+\.sentry\.io\/\d+)['"]|dsn\s*:\s*['"](https:\/\/[^'"]+@[^'"]+\/\d+)['"]/i;
   const sentryMatch = SENTRY_RE.exec(src);
   if (sentryMatch) {
-    out.push({ provider: 'sentry', details: { dsn: sentryMatch[1] } });
+    out.push({ provider: 'sentry', details: { dsn: sentryMatch[1] || sentryMatch[2] } });
   }
 
   return out;
+}
+
+export interface CspDomainReport {
+  domains: string[];
+  internalDomains: string[];
+  cloudBuckets: string[];
+  directives: Record<string, string[]>;
+}
+
+/**
+ * Parses Content-Security-Policy header strings to extract declared external domains,
+ * internal company endpoints (*.internal, *.corp, localhost), and cloud storage buckets (*.s3.*).
+ */
+export function parseCspDomains(csp: string): CspDomainReport {
+  const domains = new Set<string>();
+  const internalDomains = new Set<string>();
+  const cloudBuckets = new Set<string>();
+  const directives: Record<string, string[]> = {};
+
+  if (!csp || typeof csp !== 'string') return { domains: [], internalDomains: [], cloudBuckets: [], directives };
+
+  const parts = csp.split(';');
+  for (const part of parts) {
+    const tokens = part.trim().split(/\s+/);
+    const dirName = tokens[0]?.toLowerCase();
+    if (!dirName) continue;
+    const values = tokens.slice(1);
+    directives[dirName] = values;
+
+    for (const val of values) {
+      let clean = val.replace(/^['"]|['"]$/g, '');
+      if (!clean || clean === '*' || clean === "'self'" || clean === "'unsafe-inline'" || clean === "'none'" || clean.startsWith('nonce-') || clean.startsWith('sha256-')) continue;
+      try {
+        if (!clean.includes('://') && clean.includes('.')) clean = 'https://' + clean;
+        const u = new URL(clean);
+        const host = u.hostname.toLowerCase();
+        if (host && (host.includes('.') || host === 'localhost')) {
+          domains.add(host);
+          if (host.endsWith('.internal') || host.endsWith('.local') || host.endsWith('.corp') || host === 'localhost' || host.startsWith('10.') || host.startsWith('192.168.')) {
+            internalDomains.add(host);
+          }
+          if (host.includes('.s3.') || host.includes('.amazonaws.com') || host.includes('.blob.core.windows.net') || host.includes('.storage.googleapis.com')) {
+            cloudBuckets.add(host);
+          }
+        }
+      } catch { /* ignore non-url tokens */ }
+    }
+  }
+
+  return {
+    domains: [...domains].sort(),
+    internalDomains: [...internalDomains].sort(),
+    cloudBuckets: [...cloudBuckets].sort(),
+    directives,
+  };
+}
+
+export interface SchemaFieldDiff {
+  responseOnlyFields: string[];
+  sharedFields: string[];
+  requestOnlyFields: string[];
+}
+
+/**
+ * Compares keys between GET/response JSON and POST/PATCH/request JSON.
+ * Identifies unmapped response keys to highlight internal database fields not present in client templates.
+ */
+export function diffEndpointFields(resJson: string, reqJson: string): SchemaFieldDiff {
+  const resKeys = new Set<string>();
+  const reqKeys = new Set<string>();
+
+  const collectKeys = (obj: any, target: Set<string>, depth = 0): void => {
+    if (depth > 4 || !obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) {
+      for (const item of obj.slice(0, 5)) collectKeys(item, target, depth + 1);
+      return;
+    }
+    for (const [k, v] of Object.entries(obj)) {
+      target.add(k);
+      if (v && typeof v === 'object') collectKeys(v, target, depth + 1);
+    }
+  };
+
+  try { collectKeys(JSON.parse(resJson), resKeys); } catch { /* ignore */ }
+  try { collectKeys(JSON.parse(reqJson), reqKeys); } catch { /* ignore */ }
+
+  const sharedFields = [...resKeys].filter((k) => reqKeys.has(k)).sort();
+  const responseOnlyFields = [...resKeys].filter((k) => !reqKeys.has(k)).sort();
+  const requestOnlyFields = [...reqKeys].filter((k) => !resKeys.has(k)).sort();
+
+  return { responseOnlyFields, sharedFields, requestOnlyFields };
+}
+
+/**
+ * Normalizes dynamic path parameters (UUIDs, object IDs, and numeric slugs).
+ */
+export function normalizeDynamicPath(path: string): string {
+  if (!path || typeof path !== 'string') return '';
+  return path
+    .replace(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, '{uuid}')
+    .replace(/\/[0-9a-fA-F]{24,64}(\/|$)/g, '/{hash}$1')
+    .replace(/\/\d+(\/|$)/g, '/{id}$1');
 }

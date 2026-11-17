@@ -8,7 +8,8 @@ import {
   collectLiterals, extractJsAdvanced, parseBuildManifest, parseWebpackChunkMap,
   extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry,
   extractServerActions, extractValidationSchemas, extractPersistedQueries,
-  extractModernBundlerManifests, deobfuscateJsStrings
+  extractModernBundlerManifests, deobfuscateJsStrings,
+  parseCspDomains, diffEndpointFields, normalizeDynamicPath, extractCloudConfigs
 } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
@@ -32,7 +33,7 @@ import { defaultScope } from '../dist/types.js';
 import {
   detectContentCategory, beautifyJs, beautifyJson, beautifyCss, beautifyHtml,
   formatHexDump, parseZipListing, isNonPrintableBinary, addLineNumbers,
-  decodeRawProtobuf, decodeMsgPack, decodeRscStream, decodeWsFrame
+  decodeRawProtobuf, decodeMsgPack, decodeRscStream, decodeWsFrame, decodeAiStream
 } from '../dist/viewer.js';
 
 let pass = 0;
@@ -1138,6 +1139,88 @@ ok('Storage & Memory: Ephemeral OAuth Token Capture', () => {
   assert.equal(captured.length, 1);
   assert.equal(captured[0].param, 'access_token');
   assert.ok(captured[0].val.startsWith('eyJhbGci'));
+});
+
+// 66. Streaming LLM SSE Unchunker
+ok('Modern Protocols: Streaming LLM SSE Unchunker', () => {
+  const ssePayload = [
+    'data: {"choices":[{"delta":{"role":"system","content":"You are an internal admin agent."}}]}',
+    'data: {"choices":[{"delta":{"content":"Hello "}}]}',
+    'data: {"choices":[{"delta":{"content":"world! "}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"queryDatabase","arguments":"{\\"id\\": 42}"}}]}}]}',
+    'data: [DONE]'
+  ].join('\n\n');
+
+  const decoded = decodeAiStream(ssePayload);
+  assert.equal(decoded.chunksCount, 4);
+  assert.equal(decoded.fullText, 'Hello world! ');
+  assert.equal(decoded.systemPrompts.length, 1);
+  assert.equal(decoded.systemPrompts[0], 'You are an internal admin agent.');
+  assert.equal(decoded.toolCalls.length, 1);
+  assert.equal(decoded.toolCalls[0].name, 'queryDatabase');
+  assert.ok(decoded.toolCalls[0].args.includes('42'));
+  assert.ok(decoded.formatted.includes('queryDatabase'));
+});
+
+// 67. Infrastructure & CSP Domain Parser
+ok('Access & Infrastructure: CSP Domain & Bucket Parser', () => {
+  const csp = "default-src 'self'; connect-src https://api.target.com https://backend.internal https://vault.corp http://localhost:8080 https://my-bucket.s3.amazonaws.com; script-src 'self' 'unsafe-inline'";
+  const rep = parseCspDomains(csp);
+  assert.ok(rep.domains.includes('api.target.com'));
+  assert.ok(rep.domains.includes('backend.internal'));
+  assert.ok(rep.internalDomains.includes('backend.internal'));
+  assert.ok(rep.internalDomains.includes('vault.corp'));
+  assert.ok(rep.internalDomains.includes('localhost'));
+  assert.ok(rep.cloudBuckets.includes('my-bucket.s3.amazonaws.com'));
+  assert.ok(rep.directives['connect-src'].length >= 5);
+});
+
+// 68. API Payload Schema Diff
+ok('Reverse Engineering: API Payload Schema Diff', () => {
+  const reqJson = JSON.stringify({ email: 'user@example.com', name: 'Alice' });
+  const resJson = JSON.stringify({ id: 101, email: 'user@example.com', name: 'Alice', is_admin: true, password_hash: 'abc', role: 'user' });
+  const diff = diffEndpointFields(resJson, reqJson);
+
+  assert.deepEqual(diff.sharedFields, ['email', 'name']);
+  assert.ok(diff.responseOnlyFields.includes('is_admin'));
+  assert.ok(diff.responseOnlyFields.includes('password_hash'));
+  assert.ok(diff.responseOnlyFields.includes('role'));
+  assert.equal(diff.requestOnlyFields.length, 0);
+});
+
+// 69. Path Parameter Normalizer
+ok('Access & Routing: Path Parameter Normalizer', () => {
+  assert.equal(normalizeDynamicPath('/users/12345/profile'), '/users/{id}/profile');
+  assert.equal(normalizeDynamicPath('/orders/550e8400-e29b-41d4-a716-446655440000/items'), '/orders/{uuid}/items');
+  assert.equal(normalizeDynamicPath('/posts/64a7f2e5c8e1a2b3c4d5e6f7/comments'), '/posts/{hash}/comments');
+  assert.equal(normalizeDynamicPath('/static/path'), '/static/path');
+});
+
+// 70. Cloud BaaS Configuration Extractor
+ok('Cloud BaaS: Extract Firebase, Supabase, and Sentry Configs', () => {
+  const jsSrc = `
+    const firebaseConfig = {
+      apiKey: "AIzaSyD-TEST1234567890abcdefghijklmnop",
+      authDomain: "target-prod.firebaseapp.com",
+      projectId: "target-prod",
+      storageBucket: "target-prod.appspot.com"
+    };
+    const client = createClient("https://xyzcompany.supabase.co", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.abcdef");
+    Sentry.init({ dsn: "https://abc1234@o123456.ingest.sentry.io/456789" });
+  `;
+  const configs = extractCloudConfigs(jsSrc);
+  assert.equal(configs.length, 3);
+  const fb = configs.find(c => c.provider === 'firebase');
+  const supa = configs.find(c => c.provider === 'supabase');
+  const sentry = configs.find(c => c.provider === 'sentry');
+
+  assert.ok(fb);
+  assert.equal(fb.details.apiKey, 'AIzaSyD-TEST1234567890abcdefghijklmnop');
+  assert.equal(fb.details.projectId, 'target-prod');
+  assert.ok(supa);
+  assert.equal(supa.details.url, 'https://xyzcompany.supabase.co');
+  assert.ok(sentry);
+  assert.ok(sentry.details.dsn.includes('sentry.io'));
 });
 
 console.log(`\n${pass} checks passed.`);
