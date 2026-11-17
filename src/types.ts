@@ -10,7 +10,7 @@ export type DiscoveryMethod =
   | 'router' | 'history-api' | 'js-string' | 'dynamic-import' | 'static-import'
   | 'fetch-target' | 'css-reference' | 'css-import' | 'sourcemap-ref'
   | 'manifest-ref' | 'iframe' | 'sitemap' | 'deep-scan' | 'manual' | 'unknown'
-  | 'cdp-body' | 'live-fetch'; // response body pulled via Deep Capture or live on-demand fetch
+  | 'cdp-body' | 'live-fetch' | 'server-action'; // response body pulled via Deep Capture or live on-demand fetch, or Next.js server-action
 
 export interface Provenance {
   resourceUrl: string;

@@ -5,7 +5,15 @@ import { DiscoveryGraph } from './graph.js';
 import { RamIndex } from './indexer.js';
 import { MemoryLedger, formatBytes } from './memory.js';
 import { displayNameFor, searchIndex } from './search.js';
-import { extractHtml, resolveUrl, parseBuildManifest, parseWebpackChunkMap, extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry, type ApiCallSchema, type GraphQLOperation } from './extractors.js';
+import {
+  extractHtml, resolveUrl, parseBuildManifest, parseWebpackChunkMap,
+  extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry,
+  extractServerActions, extractValidationSchemas, extractPersistedQueries,
+  extractModernBundlerManifests, deobfuscateJsStrings, extractCloudConfigs,
+  type ApiCallSchema, type GraphQLOperation, type ServerActionDef,
+  type ValidationSchema, type PersistedQueryDef, type ModernBundlerManifest,
+  type CloudConfigFinding,
+} from './extractors.js';
 import { scanTextForSecrets } from './rules.js';
 import { buildCurl, groupByHost, groupMime, hostOf, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, snippetBody, isBinaryText, BINARY_BODY_NOTE } from './tables.js';
 import { classifyApiKind, findExposures } from './exposure.js';
@@ -37,6 +45,7 @@ import {
 import {
   detectContentCategory, beautifyJs, beautifyJson, beautifyCss, beautifyHtml,
   formatHexDump, decompressPayload, parseZipListing, toUint8Array, addLineNumbers,
+  decodeRawProtobuf, decodeMsgPack, decodeRscStream, decodeWsFrame,
   type ContentCategory, type DetectResult,
 } from './viewer.js';
 
@@ -64,6 +73,12 @@ const reconstructedSourceFiles = new Map<string, SourceMapFile>();
 const discoveredGraphQLOps = new Map<string, GraphQLOperation>();
 /** Extracted AST parameter and payload schemas (backs APIs tab & Replay prefill). */
 const discoveredApiSchemas = new Map<string, ApiCallSchema>();
+/** Discovered Next.js Server Actions (Next-Action IDs). */
+const discoveredServerActions = new Map<string, ServerActionDef>();
+/** Discovered GraphQL Relay & Apollo Persisted Queries. */
+const discoveredPersistedQueries = new Map<string, PersistedQueryDef>();
+/** Discovered client validation schemas (Zod, Yup). */
+const discoveredValidationSchemas: ValidationSchema[] = [];
 // Secret findings (Analyze tab): snapshots of indexed units that arrived with
 // a worker/fallback `sec` hit attached. Bounded; drops counted + diag-once.
 interface SecFinding { text: string; prov: TextRecord['prov']; rule: string; sev: Severity; label: string }
@@ -577,8 +592,10 @@ async function ingestText(
       }
     }
 
+    const cleanJs = deobfuscateJsStrings(capped);
+
     // 2. AST / Token Parameter & Payload Schemas
-    const schemas = extractApiCallSchemas(capped);
+    const schemas = extractApiCallSchemas(cleanJs);
     if (schemas.length) {
       for (const s of schemas) {
         discoveredApiSchemas.set(s.url, s);
@@ -590,11 +607,63 @@ async function ingestText(
     }
 
     // 3. GraphQL Operation Registry
-    const gqlOps = extractGraphQLOperations(capped);
+    const gqlOps = extractGraphQLOperations(cleanJs);
     if (gqlOps.length) {
       for (const op of gqlOps) {
         discoveredGraphQLOps.set(op.name, op);
       }
+    }
+
+    // 4. Next.js Server Actions (Next-Action IDs)
+    const serverActions = extractServerActions(cleanJs);
+    if (serverActions.length) {
+      for (const act of serverActions) {
+        discoveredServerActions.set(act.id, act);
+        const actionUrl = `/_next/action/${act.id}`;
+        touchRoute(actionUrl, 'server-action');
+        reqMetaByUrl.set(actionUrl, {
+          method: 'POST',
+          initiator: `server-action${act.name ? `:${act.name}` : ''}`,
+        });
+      }
+      diag(`server action mining: ${serverActions.length} action IDs mapped from ${shortLabel(url)}`);
+    }
+
+    // 5. Client Validation Schemas (Zod / Yup)
+    const valSchemas = extractValidationSchemas(cleanJs);
+    if (valSchemas.length) {
+      for (const vs of valSchemas) {
+        discoveredValidationSchemas.push(vs);
+      }
+    }
+
+    // 6. GraphQL Relay Persisted Queries & Apollo APQ
+    const pqs = extractPersistedQueries(cleanJs);
+    if (pqs.length) {
+      for (const pq of pqs) {
+        discoveredPersistedQueries.set(pq.id, pq);
+      }
+    }
+
+    // 7. Turbopack, Module Federation, Vite, and Workbox Manifests
+    const bmf = extractModernBundlerManifests(cleanJs);
+    const modernChunks = [...bmf.turbopackChunks, ...bmf.vitePreloads, ...bmf.workboxPrecache];
+    for (const c of modernChunks) {
+      try {
+        const abs = resolveUrl(url, c);
+        discoveredUrls.push({ from: url, url: abs, route, kind: 'chunk' });
+        graph.addNode(abs, shortLabel(abs), 'chunk', abs);
+        graph.link(url, abs, 'manifest-ref');
+      } catch { /* ignore */ }
+    }
+    for (const rem of bmf.federationRemotes) {
+      try {
+        const abs = resolveUrl(url, rem.url);
+        discoveredUrls.push({ from: url, url: abs, route, kind: 'chunk' });
+        graph.addNode(abs, shortLabel(abs), 'chunk', abs);
+        graph.link(url, abs, 'manifest-ref');
+        diag(`module federation remote: ${rem.name} -> ${shortLabel(abs)}`);
+      } catch { /* ignore */ }
     }
   }
 
@@ -2348,6 +2417,13 @@ function openReplay(url: string): void {
       initialBody = JSON.stringify(Object.fromEntries(sc.bodyKeys.map((k) => [k, ''])), null, 2);
     }
   }
+  const isServerAction = url.includes('/_next/action/') || discoveredServerActions.has(url.replace(/^.*\/_next\/action\//, ''));
+  if (isServerAction) {
+    const actionId = url.replace(/^.*\/_next\/action\//, '');
+    (document.getElementById('replayMethod') as HTMLSelectElement).value = 'POST';
+    renderRpHeaders(`Next-Action: ${actionId}\nAccept: text/x-component\nContent-Type: text/plain;charset=UTF-8`);
+    if (!initialBody) initialBody = '["$ACTION_REF_1"]';
+  }
   (document.getElementById('replayBody') as HTMLTextAreaElement).value = initialBody;
   if (sentBinary) diag('replay: sent body is binary/compressed — add a body manually if needed', url);
   switchRpTab('params');
@@ -3060,10 +3136,26 @@ async function viewUrl(url: string, forceLive = false): Promise<void> {
       formatted = beautifyCss(rawText);
     } else if (category === 'html' || category === 'xml' || category === 'svg') {
       formatted = beautifyHtml(rawText);
+    } else if (category === 'protobuf') {
+      const pb = decodeRawProtobuf(rawText);
+      formatted = pb.formatted;
+    } else if (category === 'msgpack') {
+      const mp = decodeMsgPack(rawText);
+      formatted = mp.formatted;
+    } else if (category === 'rsc') {
+      const rsc = decodeRscStream(rawText);
+      formatted = rsc.formatted;
+      if (rsc.serverActions.length) {
+        for (const actId of rsc.serverActions) {
+          discoveredServerActions.set(actId, { id: actId, source: 'rsc-stream' });
+          touchRoute(`/_next/action/${actId}`, 'server-action');
+        }
+      }
     } else if (category === 'binary' || isBinaryText(rawText)) {
       formatted = formatHexDump(rawText);
     } else {
-      formatted = addLineNumbers(rawText);
+      const ws = decodeWsFrame(rawText);
+      formatted = ws.protocol !== 'raw' ? ws.formatted : addLineNumbers(rawText);
     }
   }
 
@@ -3606,6 +3698,8 @@ function exportOpenApi(): void {
 function renderApis(): void {
   const btnGql = document.getElementById('btnApisGraphQL');
   if (btnGql) btnGql.textContent = `Export GraphQL (${discoveredGraphQLOps.size})`;
+  const btnWord = document.getElementById('btnApisWordlist');
+  if (btnWord) btnWord.textContent = `Export Wordlist (${routes.size + discoveredServerActions.size})`;
   const all = buildApiRows();
   lastApiCount = all.length;
   syncApiKindOptions(all);
@@ -4137,6 +4231,130 @@ function exportGraphQLRegistry(): void {
   }
 }
 
+function exportTargetWordlist(): void {
+  try {
+    const wordSet = new Set<string>();
+    const endpointSet = new Set<string>();
+    const paramSet = new Set<string>();
+    const headerSet = new Set<string>();
+
+    // 1. Gather all routes
+    for (const [r] of routes) {
+      if (r && r.startsWith('/')) {
+        endpointSet.add(r);
+        const parts = r.split('?')[0].split('/');
+        for (const p of parts) {
+          const clean = p.replace(/[\[\]{}:]/g, '').trim();
+          if (clean && clean.length >= 2 && !/^\d+$/.test(clean)) wordSet.add(clean.toLowerCase());
+        }
+      }
+    }
+
+    // 2. Gather all called and uncalled APIs
+    const apiRows = buildApiRows();
+    for (const a of apiRows) {
+      if (a.url) {
+        endpointSet.add(a.url);
+        try {
+          const u = new URL(a.url, sessionOrigin || 'https://target.local');
+          const parts = u.pathname.split('/');
+          for (const p of parts) {
+            const clean = p.replace(/[\[\]{}:]/g, '').trim();
+            if (clean && clean.length >= 2 && !/^\d+$/.test(clean)) wordSet.add(clean.toLowerCase());
+          }
+          u.searchParams.forEach((_, k) => {
+            if (k) { paramSet.add(k); wordSet.add(k); }
+          });
+        } catch { /* relative */ }
+      }
+    }
+
+    // 3. Gather parameters and body keys from AST schemas
+    for (const s of discoveredApiSchemas.values()) {
+      if (s.params) {
+        for (const p of s.params) { paramSet.add(p); wordSet.add(p); }
+      }
+      if (s.bodyKeys) {
+        for (const b of s.bodyKeys) { paramSet.add(b); wordSet.add(b); }
+      }
+    }
+
+    // 4. Gather parameters from validation schemas (Zod/Yup)
+    for (const vs of discoveredValidationSchemas) {
+      for (const f of vs.fields) {
+        if (f.field) { paramSet.add(f.field); wordSet.add(f.field); }
+      }
+    }
+
+    // 5. Gather request headers
+    for (const n of netEntries.slice(0, 500)) {
+      if (n.reqHeaders) {
+        for (const h of Object.keys(n.reqHeaders)) {
+          if (h && !h.startsWith(':')) headerSet.add(h);
+        }
+      }
+    }
+
+    // 6. Gather discovered server actions
+    for (const act of discoveredServerActions.values()) {
+      endpointSet.add(`/_next/action/${act.id}`);
+      if (act.name) wordSet.add(act.name);
+    }
+
+    // Format output
+    const sortedEndpoints = [...endpointSet].sort();
+    const sortedParams = [...paramSet].sort();
+    const sortedWords = [...wordSet].sort();
+    const sortedHeaders = [...headerSet].sort();
+
+    const lines: string[] = [
+      `# DeepScope Target-Specific Custom Wordlist`,
+      `# Target Origin: ${sessionOrigin || '(local session)'}`,
+      `# Discovered Endpoints: ${sortedEndpoints.length} · Parameters: ${sortedParams.length} · Unique Tokens: ${sortedWords.length}`,
+      `# Generated: ${new Date().toISOString()}`,
+      ``,
+      `# ======================================================================`,
+      `# 1. DISCOVERED ENDPOINTS & ROUTES (${sortedEndpoints.length})`,
+      `# ======================================================================`,
+      ...sortedEndpoints,
+      ``,
+      `# ======================================================================`,
+      `# 2. DISCOVERED PARAMETERS & PAYLOAD KEYS (${sortedParams.length})`,
+      `# ======================================================================`,
+      ...sortedParams,
+      ``,
+      `# ======================================================================`,
+      `# 3. TARGET PATH SEGMENTS & IDENTIFIERS (${sortedWords.length})`,
+      `# ======================================================================`,
+      ...sortedWords,
+      ``,
+    ];
+
+    if (sortedHeaders.length) {
+      lines.push(
+        `# ======================================================================`,
+        `# 4. OBSERVED HEADERS (${sortedHeaders.length})`,
+        `# ======================================================================`,
+        ...sortedHeaders,
+        ``
+      );
+    }
+
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const hostTag = (sessionOrigin || 'session').replace(/https?:\/\//i, '').replace(/[^a-z0-9]+/gi, '-');
+    a.download = `wordlist-${hostTag}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    diag(`Export Wordlist: ${sortedWords.length} words + ${sortedEndpoints.length} endpoints exported`);
+  } catch (err) {
+    diag(`Export Wordlist failed: ${String(err).slice(0, 140)}`);
+  }
+}
+
 const HARVEST_INLINE_SCRIPT = `(()=>{
   const identities = [];
   const tokens = [];
@@ -4654,6 +4872,7 @@ function wire(): void {
   on('btnApisCopyAll', 'click', () => void copyFilteredApiUrls());
   on('btnApisOpenApi', 'click', exportOpenApi);
   on('btnApisGraphQL', 'click', exportGraphQLRegistry);
+  on('btnApisWordlist', 'click', exportTargetWordlist);
   on('btnHarvestState', 'click', () => void runStateHarvest());
   on('btnStateClose', 'click', () => document.getElementById('stateModal')?.classList.add('hidden'));
   on('btnStateCopy', 'click', () => { if (lastHarvestSummary) void copyText(lastHarvestSummary, 'harvested state'); });
@@ -4766,6 +4985,7 @@ function clearSession(prompt = true): boolean {
   contentHash.clear(); netEntries.length = 0; routes.clear(); diags.length = 0;
   smOriginals.clear(); smRebuilt.clear();
   reconstructedSourceFiles.clear(); discoveredGraphQLOps.clear(); discoveredApiSchemas.clear();
+  discoveredServerActions.clear(); discoveredPersistedQueries.clear(); discoveredValidationSchemas.length = 0;
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   secShowAll = false; routeShowAll = false; anaKind = 'ALL';
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0; discoveredUrlSet.clear();

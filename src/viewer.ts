@@ -14,6 +14,9 @@ export type ContentCategory =
   | 'xml'
   | 'gzip'
   | 'zip'
+  | 'protobuf'
+  | 'msgpack'
+  | 'rsc'
   | 'binary'
   | 'text';
 
@@ -118,6 +121,15 @@ export function detectContentCategory(
   if (mime.includes('zip') || u.endsWith('.zip')) {
     return { category: 'zip', mime: mime || 'application/zip', isMedia: false, isBinary: true, canDecompress: true, canBeautify: false, label: 'ZIP archive' };
   }
+  if (mime.includes('protobuf') || mime.includes('grpc-web') || mime.includes('connect+proto') || u.endsWith('.pb') || u.endsWith('.proto')) {
+    return { category: 'protobuf', mime: mime || 'application/x-protobuf', isMedia: false, isBinary: true, canDecompress: false, canBeautify: true, label: 'Protobuf / gRPC wire payload' };
+  }
+  if (mime.includes('msgpack') || mime.includes('x-msgpack') || mime.includes('cbor') || u.endsWith('.msgpack') || u.endsWith('.mpk')) {
+    return { category: 'msgpack', mime: mime || 'application/msgpack', isMedia: false, isBinary: true, canDecompress: false, canBeautify: true, label: 'MessagePack binary' };
+  }
+  if (mime.includes('text/x-component') || mime.includes('text/x-rsc') || u.includes('_rsc=') || u.endsWith('.rsc')) {
+    return { category: 'rsc', mime: mime || 'text/x-component', isMedia: false, isBinary: false, canDecompress: false, canBeautify: true, label: 'Next.js RSC Wire Stream' };
+  }
 
   // 3. Content Sniff (for responses with missing or generic text/plain headers)
   const trimmed = sampleText.trim();
@@ -132,6 +144,9 @@ export function detectContentCategory(
   }
   if (/^<svg[\s>]/i.test(trimmed)) {
     return { category: 'svg', mime: 'image/svg+xml', isMedia: true, isBinary: false, canDecompress: false, canBeautify: true, label: 'SVG vector image' };
+  }
+  if (trimmed.includes('self.__next_f.push') || /^\d+:[IHLDS$]?[\[{]/.test(trimmed)) {
+    return { category: 'rsc', mime: 'text/x-component', isMedia: false, isBinary: false, canDecompress: false, canBeautify: true, label: 'Next.js RSC Wire Stream' };
   }
 
   // 4. Pure Binary Detection
@@ -491,4 +506,407 @@ export function parseZipListing(data: Uint8Array | string): ZipEntry[] {
   }
 
   return entries;
+}
+
+export interface ProtobufField {
+  fieldNumber: number;
+  wireType: number;
+  wireTypeName: string;
+  value: any;
+  subMessage?: ProtobufField[];
+}
+
+/** Zero-dependency raw Protobuf & gRPC-Web wire decoder. */
+export function decodeRawProtobuf(data: Uint8Array | string): {
+  fields: ProtobufField[];
+  formatted: string;
+  isGrpcWeb: boolean;
+} {
+  const bytes = toUint8Array(data);
+  let offset = 0;
+  let isGrpcWeb = false;
+
+  // Check gRPC-Web frame (5 byte header: 1 byte flag, 4 bytes big-endian length)
+  if (bytes.length >= 5) {
+    const flag = bytes[0];
+    const len = (bytes[1] << 24) | (bytes[2] << 16) | (bytes[3] << 8) | bytes[4];
+    if ((flag === 0 || flag === 0x80) && len === bytes.length - 5) {
+      isGrpcWeb = true;
+      offset = 5;
+    }
+  }
+
+  function readVarint(pos: number): [bigint, number] {
+    let result = 0n;
+    let shift = 0n;
+    let p = pos;
+    while (p < bytes.length) {
+      const b = BigInt(bytes[p++]);
+      result |= (b & 0x7fn) << shift;
+      if ((b & 0x80n) === 0n) break;
+      shift += 7n;
+      if (shift > 70n) break;
+    }
+    return [result, p];
+  }
+
+  function parseFields(start: number, end: number, depth = 0): ProtobufField[] {
+    if (depth > 6) return [];
+    const fields: ProtobufField[] = [];
+    let p = start;
+    while (p < end && fields.length < 500) {
+      const [tag, nextP] = readVarint(p);
+      if (nextP === p) break;
+      p = nextP;
+      const wireType = Number(tag & 0x07n);
+      const fieldNum = Number(tag >> 3n);
+      if (fieldNum === 0) break;
+
+      if (wireType === 0) { // Varint
+        const [val, vP] = readVarint(p);
+        p = vP;
+        const numVal = val <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(val) : val.toString();
+        fields.push({ fieldNumber: fieldNum, wireType, wireTypeName: 'varint', value: numVal });
+      } else if (wireType === 1) { // 64-bit
+        if (p + 8 > end) break;
+        const view = new DataView(bytes.buffer, bytes.byteOffset + p, 8);
+        const floatVal = view.getFloat64(0, true);
+        const intVal = view.getBigUint64(0, true);
+        p += 8;
+        fields.push({
+          fieldNumber: fieldNum,
+          wireType,
+          wireTypeName: 'fixed64',
+          value: isFinite(floatVal) && Math.abs(floatVal) < 1e12 && Math.abs(floatVal) > 1e-6 ? floatVal : intVal.toString(),
+        });
+      } else if (wireType === 2) { // Length-delimited
+        const [lenBig, lP] = readVarint(p);
+        p = lP;
+        const len = Number(lenBig);
+        if (p + len > end || len < 0) break;
+        const slice = bytes.slice(p, p + len);
+        p += len;
+
+        let sub: ProtobufField[] | null = null;
+        if (len > 1) {
+          try {
+            const parsedSub = parseFields(0, slice.length, depth + 1);
+            if (parsedSub.length > 0) sub = parsedSub;
+          } catch { /* not a sub-message */ }
+        }
+
+        let strVal: string | null = null;
+        try {
+          const dec = new TextDecoder('utf-8', { fatal: true }).decode(slice);
+          if (!/[\x00-\x08\x0E-\x1F]/.test(dec)) strVal = dec;
+        } catch { /* not utf-8 */ }
+
+        fields.push({
+          fieldNumber: fieldNum,
+          wireType,
+          wireTypeName: 'length-delimited',
+          value: strVal ?? (sub ? undefined : Array.from(slice.slice(0, 32)).map((b) => b.toString(16).padStart(2, '0')).join(' ')),
+          subMessage: sub || undefined,
+        });
+      } else if (wireType === 5) { // 32-bit
+        if (p + 4 > end) break;
+        const view = new DataView(bytes.buffer, bytes.byteOffset + p, 4);
+        const floatVal = view.getFloat32(0, true);
+        const intVal = view.getUint32(0, true);
+        p += 4;
+        fields.push({
+          fieldNumber: fieldNum,
+          wireType,
+          wireTypeName: 'fixed32',
+          value: isFinite(floatVal) && Math.abs(floatVal) < 1e6 && Math.abs(floatVal) > 1e-4 ? floatVal : intVal,
+        });
+      } else {
+        break; // Unsupported or invalid wire type
+      }
+    }
+    return fields;
+  }
+
+  const fields = parseFields(offset, bytes.length);
+
+  function formatProto(flist: ProtobufField[], indent = '  '): string {
+    let out = '';
+    for (const f of flist) {
+      if (f.subMessage && f.subMessage.length) {
+        out += `${indent}message field_${f.fieldNumber} {\n`;
+        out += formatProto(f.subMessage, indent + '  ');
+        out += `${indent}}\n`;
+      } else if (typeof f.value === 'string' && f.wireType === 2) {
+        out += `${indent}string field_${f.fieldNumber} = ${JSON.stringify(f.value)};\n`;
+      } else {
+        out += `${indent}${f.wireTypeName} field_${f.fieldNumber} = ${f.value};\n`;
+      }
+    }
+    return out;
+  }
+
+  let formatted = `// DeepScope Protobuf Wire Decoder${isGrpcWeb ? ' (gRPC-Web framing stripped)' : ''}\n// Discovered Fields: ${fields.length}\n\nmessage ReconstructedMessage {\n`;
+  formatted += formatProto(fields, '  ');
+  formatted += '}\n';
+
+  return { fields, formatted: addLineNumbers(formatted), isGrpcWeb };
+}
+
+/** Zero-dependency MessagePack wire decoder. */
+export function decodeMsgPack(data: Uint8Array | string): { value: any; formatted: string } {
+  const bytes = toUint8Array(data);
+  let pos = 0;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  function decodeNext(): any {
+    if (pos >= bytes.length) return undefined;
+    const b = bytes[pos++];
+
+    // positive fixint
+    if (b <= 0x7f) return b;
+    // fixmap
+    if (b >= 0x80 && b <= 0x8f) {
+      const size = b & 0x0f;
+      const obj: Record<string, any> = {};
+      for (let i = 0; i < size; i++) {
+        const k = String(decodeNext() ?? '');
+        obj[k] = decodeNext();
+      }
+      return obj;
+    }
+    // fixarray
+    if (b >= 0x90 && b <= 0x9f) {
+      const size = b & 0x0f;
+      const arr: any[] = [];
+      for (let i = 0; i < size; i++) arr.push(decodeNext());
+      return arr;
+    }
+    // fixstr
+    if (b >= 0xa0 && b <= 0xbf) {
+      const len = b & 0x1f;
+      const s = new TextDecoder().decode(bytes.slice(pos, pos + len));
+      pos += len;
+      return s;
+    }
+    // nil
+    if (b === 0xc0) return null;
+    // bool
+    if (b === 0xc2) return false;
+    if (b === 0xc3) return true;
+    // bin 8/16/32
+    if (b === 0xc4) { const len = bytes[pos++]; const s = bytes.slice(pos, pos + len); pos += len; return s; }
+    if (b === 0xc5) { const len = view.getUint16(pos); pos += 2; const s = bytes.slice(pos, pos + len); pos += len; return s; }
+    if (b === 0xc6) { const len = view.getUint32(pos); pos += 4; const s = bytes.slice(pos, pos + len); pos += len; return s; }
+    // float 32 / 64
+    if (b === 0xca) { const v = view.getFloat32(pos); pos += 4; return v; }
+    if (b === 0xcb) { const v = view.getFloat64(pos); pos += 8; return v; }
+    // uint 8/16/32/64
+    if (b === 0xcc) return bytes[pos++];
+    if (b === 0xcd) { const v = view.getUint16(pos); pos += 2; return v; }
+    if (b === 0xce) { const v = view.getUint32(pos); pos += 4; return v; }
+    if (b === 0xcf) { const v = view.getBigUint64(pos); pos += 8; return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString(); }
+    // int 8/16/32/64
+    if (b === 0xd0) return view.getInt8(pos++);
+    if (b === 0xd1) { const v = view.getInt16(pos); pos += 2; return v; }
+    if (b === 0xd2) { const v = view.getInt32(pos); pos += 4; return v; }
+    if (b === 0xd3) { const v = view.getBigInt64(pos); pos += 8; return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString(); }
+    // str 8/16/32
+    if (b === 0xd9) { const len = bytes[pos++]; const s = new TextDecoder().decode(bytes.slice(pos, pos + len)); pos += len; return s; }
+    if (b === 0xda) { const len = view.getUint16(pos); pos += 2; const s = new TextDecoder().decode(bytes.slice(pos, pos + len)); pos += len; return s; }
+    if (b === 0xdb) { const len = view.getUint32(pos); pos += 4; const s = new TextDecoder().decode(bytes.slice(pos, pos + len)); pos += len; return s; }
+    // array 16/32
+    if (b === 0xdc) {
+      const len = view.getUint16(pos); pos += 2;
+      const arr: any[] = [];
+      for (let i = 0; i < len; i++) arr.push(decodeNext());
+      return arr;
+    }
+    if (b === 0xdd) {
+      const len = view.getUint32(pos); pos += 4;
+      const arr: any[] = [];
+      for (let i = 0; i < len; i++) arr.push(decodeNext());
+      return arr;
+    }
+    // map 16/32
+    if (b === 0xde) {
+      const len = view.getUint16(pos); pos += 2;
+      const obj: Record<string, any> = {};
+      for (let i = 0; i < len; i++) {
+        const k = String(decodeNext() ?? '');
+        obj[k] = decodeNext();
+      }
+      return obj;
+    }
+    if (b === 0xdf) {
+      const len = view.getUint32(pos); pos += 4;
+      const obj: Record<string, any> = {};
+      for (let i = 0; i < len; i++) {
+        const k = String(decodeNext() ?? '');
+        obj[k] = decodeNext();
+      }
+      return obj;
+    }
+    // negative fixint (0xe0 - 0xff) -> -32 to -1
+    if (b >= 0xe0) return b - 0x100;
+
+    return null;
+  }
+
+  let value: any = null;
+  try {
+    value = decodeNext();
+  } catch {
+    value = '(MessagePack decoding error)';
+  }
+  const formatted = addLineNumbers(JSON.stringify(value, (k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
+  return { value, formatted };
+}
+
+export interface RscEntry {
+  id: string;
+  tag: string;
+  data: any;
+  raw: string;
+}
+
+/** Zero-dependency Next.js App Router RSC flight stream decoder. */
+export function decodeRscStream(text: string): {
+  entries: RscEntry[];
+  formatted: string;
+  serverActions: string[];
+  sensitiveProps: Array<{ key: string; sample: string }>;
+} {
+  if (typeof text !== 'string') return { entries: [], formatted: '', serverActions: [], sensitiveProps: [] };
+
+  const pushChunks: string[] = [];
+  const PUSH_RE = /self\.__next_f\.push\s*\(\s*\[\s*\d+\s*,\s*(["'])([\s\S]*?)\1\s*\]\s*\)/g;
+  let pm: RegExpExecArray | null;
+  while ((pm = PUSH_RE.exec(text))) {
+    try {
+      const rawStr = JSON.parse(`"${pm[2].replace(/"/g, '\\"')}"`);
+      pushChunks.push(rawStr);
+    } catch {
+      pushChunks.push(pm[2].replace(/\\n/g, '\n').replace(/\\"/g, '"'));
+    }
+  }
+
+  const rawLines = pushChunks.length ? pushChunks.join('\n').split('\n') : text.split('\n');
+  const entries: RscEntry[] = [];
+  const serverActions = new Set<string>();
+  const sensitiveProps: Array<{ key: string; sample: string }> = [];
+
+  const SENSITIVE_KEY_RE = /(password|token|secret|auth|admin|role|credit|stripe|session|hash|key|email|private)/i;
+  const ACTION_HASH_RE = /^[0-9a-fA-F]{40,42}$/;
+
+  for (const line of rawLines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const colonIdx = trimmed.indexOf(':');
+    if (colonIdx === -1) continue;
+
+    const id = trimmed.slice(0, colonIdx);
+    const rest = trimmed.slice(colonIdx + 1);
+    let tag = '';
+    let payload = rest;
+
+    if (/^[IHLDS$]/.test(rest)) {
+      tag = rest[0];
+      payload = rest.slice(1);
+    }
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      parsed = payload;
+    }
+
+    if (typeof parsed === 'object' && parsed !== null) {
+      if (typeof parsed.id === 'string' && ACTION_HASH_RE.test(parsed.id)) {
+        serverActions.add(parsed.id);
+      }
+      try {
+        const str = JSON.stringify(parsed);
+        const matches = str.match(/"([^"]+)":\s*(?:("[^"]*")|(\d+)|(true|false)|null)/g);
+        if (matches) {
+          for (const m of matches) {
+            const k = m.split(':')[0].replace(/"/g, '');
+            if (SENSITIVE_KEY_RE.test(k) && !sensitiveProps.some((s) => s.key === k)) {
+              sensitiveProps.push({ key: k, sample: m.slice(0, 100) });
+            }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    entries.push({ id, tag, data: parsed, raw: trimmed });
+  }
+
+  let formatted = `// DeepScope React Server Components (RSC) Wire Inspector\n// Parsed Lines: ${entries.length} · Server Actions: ${serverActions.size} · Sensitive Props: ${sensitiveProps.length}\n`;
+  if (serverActions.size > 0) {
+    formatted += `\n// Discovered Server Action Hashes (Next-Action):\n`;
+    for (const a of serverActions) formatted += `//   - ${a}\n`;
+  }
+  if (sensitiveProps.length > 0) {
+    formatted += `\n// Surface-Exposed Server Props in Client Boundary:\n`;
+    for (const p of sensitiveProps) formatted += `//   - ${p.key}: ${p.sample}\n`;
+  }
+  formatted += '\n' + '='.repeat(70) + '\n\n';
+
+  for (const entry of entries) {
+    const tagDesc = entry.tag === 'I' ? ' [Client Reference / Module Import]'
+      : entry.tag === 'H' ? ' [Resource Hint]'
+      : entry.tag === 'S' ? ' [Symbol / Server Action]'
+      : '';
+    formatted += `[Chunk ${entry.id}]${tagDesc}\n`;
+    formatted += (typeof entry.data === 'object' ? JSON.stringify(entry.data, null, 2) : entry.data) + '\n\n';
+  }
+
+  return { entries, formatted: addLineNumbers(formatted), serverActions: [...serverActions], sensitiveProps };
+}
+
+/** Zero-dependency WebSocket frame inspector & unframer (Socket.IO / Phoenix / GraphQL-WS). */
+export function decodeWsFrame(payload: string): { protocol: string; event?: string; data: any; formatted: string } {
+  if (typeof payload !== 'string' || !payload.trim()) {
+    return { protocol: 'raw', data: payload, formatted: payload };
+  }
+
+  const s = payload.trim();
+
+  // 1. Socket.IO engine.io frame (e.g. 42["event", {...}])
+  if (/^4[0-9]/.test(s)) {
+    const rest = s.slice(2);
+    try {
+      const arr = JSON.parse(rest);
+      if (Array.isArray(arr) && arr.length >= 1) {
+        const event = String(arr[0]);
+        const data = arr.length > 1 ? arr[1] : null;
+        const formatted = addLineNumbers(`// Socket.IO Frame · Event: "${event}"\n` + JSON.stringify(data ?? arr, null, 2));
+        return { protocol: 'socket.io', event, data, formatted };
+      }
+    } catch { /* keep checking */ }
+  }
+
+  // 2. GraphQL-WS / subscriptions-transport-ws ({"type":"subscribe", ...})
+  if (s.startsWith('{') && (s.includes('"type"') || s.includes('"payload"'))) {
+    try {
+      const obj = JSON.parse(s);
+      if (obj && typeof obj.type === 'string') {
+        const formatted = addLineNumbers(`// GraphQL-WS Message · Type: "${obj.type}"\n` + JSON.stringify(obj, null, 2));
+        return { protocol: 'graphql-ws', event: obj.type, data: obj, formatted };
+      }
+    } catch { /* keep checking */ }
+  }
+
+  // 3. Generic JSON WS frame
+  if (s.startsWith('{') || s.startsWith('[')) {
+    try {
+      const obj = JSON.parse(s);
+      const formatted = addLineNumbers('// WebSocket JSON Frame\n' + JSON.stringify(obj, null, 2));
+      return { protocol: 'json', data: obj, formatted };
+    } catch { /* raw */ }
+  }
+
+  return { protocol: 'raw', data: s, formatted: addLineNumbers(s) };
 }

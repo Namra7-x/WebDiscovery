@@ -1432,3 +1432,342 @@ export function formatGraphQLRegistry(ops: GraphQLOperation[]): string {
   }).join('\n');
   return header + formatted;
 }
+
+export interface ServerActionDef {
+  id: string;
+  name?: string;
+  source: string;
+}
+
+/**
+ * Extracts Next.js App Router Server Actions (Next-Action IDs) and function names.
+ */
+export function extractServerActions(src: string): ServerActionDef[] {
+  const actions: ServerActionDef[] = [];
+  if (typeof src !== 'string' || src.length < 20) return actions;
+  const seen = new Set<string>();
+
+  // 1. createServerReference("40-char-hex", ...)
+  const CSR_RE = /createServerReference\s*\(\s*['"]([0-9a-fA-F]{40,42}|[A-Za-z0-9_-]{40,64})['"](?:\s*,\s*(?:[A-Za-z0-9_$.]+|void 0|null))?(?:\s*,\s*['"]([^'"]+)['"])?/g;
+  let m: RegExpExecArray | null;
+  while ((m = CSR_RE.exec(src))) {
+    const id = m[1];
+    const name = m[2] || undefined;
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      actions.push({ id, name, source: 'createServerReference' });
+    }
+  }
+
+  // 2. $$ACTION_0 = "40-char-hex" or {"id": "40-char-hex", "bound": ...}
+  const ACT_RE = /(?:\$\$ACTION_\d+\s*=\s*['"]([0-9a-fA-F]{40,42})['"]|['"]id['"]\s*:\s*['"]([0-9a-fA-F]{40,42})['"]\s*,\s*['"]bound['"])/g;
+  while ((m = ACT_RE.exec(src))) {
+    const id = m[1] || m[2];
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      actions.push({ id, source: 'action-descriptor' });
+    }
+  }
+
+  // 3. Header next-action: "..."
+  const HDR_RE = /['"]next-action['"]\s*:\s*['"]([0-9a-fA-F]{40,42})['"]/gi;
+  while ((m = HDR_RE.exec(src))) {
+    const id = m[1];
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      actions.push({ id, source: 'next-action-header' });
+    }
+  }
+
+  return actions;
+}
+
+export interface ValidationField {
+  field: string;
+  type: string;
+  rules?: string[];
+}
+
+export interface ValidationSchema {
+  kind: 'zod' | 'yup' | 'trpc';
+  name?: string;
+  fields: ValidationField[];
+  raw: string;
+}
+
+/**
+ * Extracts client-side validation schemas (Zod, Yup, tRPC) from JS bundles.
+ */
+export function extractValidationSchemas(src: string): ValidationSchema[] {
+  const schemas: ValidationSchema[] = [];
+  if (typeof src !== 'string' || src.length < 20) return schemas;
+  const seen = new Set<string>();
+
+  // 1. Zod: z.object({ ... })
+  const ZOD_RE = /z(?:od)?\.object\s*\(\s*\{([\s\S]*?)\}\s*\)/g;
+  let zm: RegExpExecArray | null;
+  while ((zm = ZOD_RE.exec(src)) && schemas.length < 150) {
+    const rawBody = zm[1];
+    const fields: ValidationField[] = [];
+    const FIELD_RE = /([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:\s*z(?:od)?\.([a-zA-Z]+)\s*\(([^)]*)\)((?:\.[a-zA-Z]+\s*\([^)]*\))*)/g;
+    let fm: RegExpExecArray | null;
+    while ((fm = FIELD_RE.exec(rawBody)) && fields.length < 50) {
+      const fieldName = fm[1];
+      const baseType = fm[2];
+      const arg = fm[3];
+      const chained = fm[4] || '';
+      const rules: string[] = [];
+
+      if (baseType === 'enum') {
+        const enumVals = arg.replace(/[\[\]'"`\s]/g, '').split(',');
+        rules.push(`enum(${enumVals.join('|')})`);
+      }
+      if (chained.includes('.optional')) rules.push('optional');
+      if (chained.includes('.email')) rules.push('email');
+      if (chained.includes('.min')) {
+        const minM = chained.match(/\.min\((\d+)\)/);
+        if (minM) rules.push(`min(${minM[1]})`);
+      }
+      if (chained.includes('.max')) {
+        const maxM = chained.match(/\.max\((\d+)\)/);
+        if (maxM) rules.push(`max(${maxM[1]})`);
+      }
+
+      fields.push({ field: fieldName, type: baseType, rules: rules.length ? rules : undefined });
+    }
+
+    if (fields.length > 0) {
+      const hash = fields.map((f) => f.field).sort().join(',');
+      if (!seen.has(hash)) {
+        seen.add(hash);
+        schemas.push({ kind: 'zod', fields, raw: zm[0].slice(0, 1000) });
+      }
+    }
+  }
+
+  // 2. Yup: yup.object({ ... })
+  const YUP_RE = /yup\.object\s*\(\s*\{([\s\S]*?)\}\s*\)/g;
+  let ym: RegExpExecArray | null;
+  while ((ym = YUP_RE.exec(src)) && schemas.length < 200) {
+    const rawBody = ym[1];
+    const fields: ValidationField[] = [];
+    const FIELD_RE = /([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:\s*yup\.([a-zA-Z]+)\s*\(([^)]*)\)((?:\.[a-zA-Z]+\s*\([^)]*\))*)/g;
+    let fm: RegExpExecArray | null;
+    while ((fm = FIELD_RE.exec(rawBody)) && fields.length < 50) {
+      const fieldName = fm[1];
+      const baseType = fm[2];
+      const chained = fm[4] || '';
+      const rules: string[] = [];
+      if (chained.includes('.required')) rules.push('required');
+      if (chained.includes('.email')) rules.push('email');
+      fields.push({ field: fieldName, type: baseType, rules: rules.length ? rules : undefined });
+    }
+    if (fields.length > 0) {
+      const hash = 'yup:' + fields.map((f) => f.field).sort().join(',');
+      if (!seen.has(hash)) {
+        seen.add(hash);
+        schemas.push({ kind: 'yup', fields, raw: ym[0].slice(0, 1000) });
+      }
+    }
+  }
+
+  return schemas;
+}
+
+export interface PersistedQueryDef {
+  id: string;
+  name?: string;
+  kind: 'relay' | 'apollo-apq';
+}
+
+/**
+ * Extracts GraphQL Relay Persisted Queries (`doc_id`) and Apollo APQ (`sha256Hash`).
+ */
+export function extractPersistedQueries(src: string): PersistedQueryDef[] {
+  const out: PersistedQueryDef[] = [];
+  if (typeof src !== 'string' || src.length < 20) return out;
+  const seen = new Set<string>();
+
+  // 1. Relay doc_id: "..." or id: "..."
+  const RELAY_RE = /(?:doc_id|id)\s*:\s*['"]([0-9a-fA-F]{32,64}|\d{10,24})['"](?:\s*,\s*name\s*:\s*['"]([A-Za-z0-9_]+)['"])?/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = RELAY_RE.exec(src)) && out.length < 200) {
+    const id = rm[1];
+    const name = rm[2] || undefined;
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push({ id, name, kind: 'relay' });
+    }
+  }
+
+  // 2. Apollo APQ sha256Hash: "..."
+  const APQ_RE = /sha256Hash\s*:\s*['"]([0-9a-fA-F]{64})['"]/g;
+  let am: RegExpExecArray | null;
+  while ((am = APQ_RE.exec(src)) && out.length < 200) {
+    const id = am[1];
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push({ id, kind: 'apollo-apq' });
+    }
+  }
+
+  return out;
+}
+
+export interface ModernBundlerManifest {
+  turbopackChunks: string[];
+  federationRemotes: Array<{ name: string; url: string }>;
+  vitePreloads: string[];
+  workboxPrecache: string[];
+}
+
+/**
+ * Extracts Turbopack, Webpack Module Federation, Vite, and Workbox manifests.
+ */
+export function extractModernBundlerManifests(src: string): ModernBundlerManifest {
+  const turbopackChunks: string[] = [];
+  const federationRemotes: Array<{ name: string; url: string }> = [];
+  const vitePreloads: string[] = [];
+  const workboxPrecache: string[] = [];
+
+  if (typeof src !== 'string' || src.length < 20) {
+    return { turbopackChunks, federationRemotes, vitePreloads, workboxPrecache };
+  }
+
+  // 1. Turbopack chunk arrays
+  if (src.includes('TURBOPACK')) {
+    const TURBO_CHUNK_RE = /["'](static\/chunks\/[a-zA-Z0-9_\-./]+?\.js)["']/g;
+    let tm: RegExpExecArray | null;
+    while ((tm = TURBO_CHUNK_RE.exec(src)) && turbopackChunks.length < 300) {
+      if (!turbopackChunks.includes(tm[1])) turbopackChunks.push(tm[1]);
+    }
+  }
+
+  // 2. Webpack Module Federation remotes
+  const FED_RE = /remotes\s*[:=]\s*\{([\s\S]*?)\}/g;
+  let fm: RegExpExecArray | null;
+  while ((fm = FED_RE.exec(src)) && federationRemotes.length < 100) {
+    const inner = fm[1];
+    const PAIR_RE = /["']?([a-zA-Z0-9_$-]+)["']?\s*:\s*["'](https?:\/\/[^"']+|[^"']+\.js)["']/g;
+    let pm: RegExpExecArray | null;
+    while ((pm = PAIR_RE.exec(inner))) {
+      const name = pm[1];
+      const url = pm[2];
+      if (name && url && !federationRemotes.some((r) => r.name === name)) {
+        federationRemotes.push({ name, url });
+      }
+    }
+  }
+
+  // 3. Vite preload arrays
+  const VITE_RE = /__vite__mapDeps\s*\(\s*\[([\s\S]*?)\]\s*\)/g;
+  let vm: RegExpExecArray | null;
+  while ((vm = VITE_RE.exec(src)) && vitePreloads.length < 200) {
+    const inner = vm[1];
+    const DEP_RE = /["']([a-zA-Z0-9_\-./]+?\.js)["']/g;
+    let dm: RegExpExecArray | null;
+    while ((dm = DEP_RE.exec(inner))) {
+      if (!vitePreloads.includes(dm[1])) vitePreloads.push(dm[1]);
+    }
+  }
+
+  // 4. Workbox Service Worker manifest
+  if (src.includes('__WB_MANIFEST') || src.includes('precacheAndRoute')) {
+    const WB_RE = /["']url["']\s*:\s*["']([^"']+)["']/g;
+    let wm: RegExpExecArray | null;
+    while ((wm = WB_RE.exec(src)) && workboxPrecache.length < 300) {
+      if (!workboxPrecache.includes(wm[1])) workboxPrecache.push(wm[1]);
+    }
+  }
+
+  return { turbopackChunks, federationRemotes, vitePreloads, workboxPrecache };
+}
+
+/**
+ * Worker-side string de-obfuscation and constant folding.
+ * Evaluates string concatenation, resolves hex & unicode escapes, and decodes atob Base64 literals.
+ */
+export function deobfuscateJsStrings(src: string, maxLen = 300_000): string {
+  if (typeof src !== 'string' || src.length < 10) return src;
+  let out = src.length > maxLen ? src.slice(0, maxLen) : src;
+
+  // 1. Fold string concatenation in up to 3 passes
+  let prev = '';
+  let passes = 0;
+  while (passes < 3 && out !== prev) {
+    prev = out;
+    out = out.replace(/(['"`])([^'"`\n\\]{1,120})\1\s*\+\s*(['"`])([^'"`\n\\]{1,120})\3/g, '$1$2$4$1');
+    passes++;
+  }
+
+  // 2. Decode hex escapes: \x2f -> /
+  out = out.replace(/\\x([0-9a-fA-F]{2})/g, (match, hex) => {
+    const code = parseInt(hex, 16);
+    return (code >= 32 && code <= 126) ? String.fromCharCode(code) : match;
+  });
+
+  // 3. Decode unicode escapes: \u002f -> /
+  out = out.replace(/\\u([0-9a-fA-F]{4})/g, (match, hex) => {
+    const code = parseInt(hex, 16);
+    return (code >= 32 && code <= 126) ? String.fromCharCode(code) : match;
+  });
+
+  // 4. Resolve inline atob("...") Base64 literals
+  out = out.replace(/\batob\s*\(\s*['"]([A-Za-z0-9+/=]{4,160})['"]\s*\)/g, (match, b64) => {
+    try {
+      const decoded = atob(b64);
+      if (/^[\x20-\x7E]+$/.test(decoded)) {
+        return JSON.stringify(decoded);
+      }
+    } catch { /* keep original */ }
+    return match;
+  });
+
+  return out;
+}
+
+export interface CloudConfigFinding {
+  provider: 'firebase' | 'supabase' | 'aws' | 'sentry';
+  details: Record<string, string>;
+}
+
+/**
+ * Extracts Firebase, Supabase, AWS, and Sentry client configuration blocks.
+ */
+export function extractCloudConfigs(src: string): CloudConfigFinding[] {
+  const out: CloudConfigFinding[] = [];
+  if (typeof src !== 'string' || src.length < 30) return out;
+
+  // 1. Firebase config
+  const FB_KEY = /apiKey\s*:\s*['"](AIza[0-9A-Za-z_-]{35})['"]/;
+  const fbMatch = FB_KEY.exec(src);
+  if (fbMatch) {
+    const details: Record<string, string> = { apiKey: fbMatch[1] };
+    const authM = /authDomain\s*:\s*['"]([^'"]+)['"]/.exec(src);
+    if (authM) details.authDomain = authM[1];
+    const projM = /projectId\s*:\s*['"]([^'"]+)['"]/.exec(src);
+    if (projM) details.projectId = projM[1];
+    const bucketM = /storageBucket\s*:\s*['"]([^'"]+)['"]/.exec(src);
+    if (bucketM) details.storageBucket = bucketM[1];
+    out.push({ provider: 'firebase', details });
+  }
+
+  // 2. Supabase config
+  const SUPA_RE = /supabaseUrl\s*:\s*['"](https:\/\/[a-z0-9-]+\.supabase\.co)['"]/i;
+  const supaMatch = SUPA_RE.exec(src);
+  if (supaMatch) {
+    const details: Record<string, string> = { url: supaMatch[1] };
+    const keyM = /supabase(?:AnonKey|Key)\s*:\s*['"](eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)['"]/.exec(src);
+    if (keyM) details.anonKey = keyM[1];
+    out.push({ provider: 'supabase', details });
+  }
+
+  // 3. Sentry DSN
+  const SENTRY_RE = /dsn\s*:\s*['"](https:\/\/[a-f0-9]+@[a-z0-9.]+\/\d+)['"]/;
+  const sentryMatch = SENTRY_RE.exec(src);
+  if (sentryMatch) {
+    out.push({ provider: 'sentry', details: { dsn: sentryMatch[1] } });
+  }
+
+  return out;
+}

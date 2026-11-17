@@ -3,7 +3,13 @@
 import assert from 'node:assert/strict';
 import { normalize, hashStr, normalizeWithMap, snippetWithSpans } from '../dist/normalize.js';
 import { fuzzyScore, fuzzyMatch } from '../dist/fuzzy.js';
-import { extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint, collectLiterals, extractJsAdvanced, parseBuildManifest, parseWebpackChunkMap, extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry } from '../dist/extractors.js';
+import {
+  extractJs, extractJson, extractCss, extractHtml, classifyPath, isApiEndpoint,
+  collectLiterals, extractJsAdvanced, parseBuildManifest, parseWebpackChunkMap,
+  extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry,
+  extractServerActions, extractValidationSchemas, extractPersistedQueries,
+  extractModernBundlerManifests, deobfuscateJsStrings
+} from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
 import { searchIndex, displayNameFor } from '../dist/search.js';
 import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody, isBinaryText } from '../dist/tables.js';
@@ -24,7 +30,8 @@ import { DiscoveryGraph } from '../dist/graph.js';
 import { defaultScope } from '../dist/types.js';
 import {
   detectContentCategory, beautifyJs, beautifyJson, beautifyCss, beautifyHtml,
-  formatHexDump, parseZipListing, isNonPrintableBinary, addLineNumbers
+  formatHexDump, parseZipListing, isNonPrintableBinary, addLineNumbers,
+  decodeRawProtobuf, decodeMsgPack, decodeRscStream, decodeWsFrame
 } from '../dist/viewer.js';
 
 let pass = 0;
@@ -970,6 +977,120 @@ ok('Reverse Engineering: Feature Flag Tampering Rewriter', () => {
   assert.equal(tampered.flags['admin-access'].value, true, 'flipped admin-access to true');
   assert.equal(tampered.flags['dark-mode'].value, true, 'kept dark-mode true');
   assert.equal(tampered.userCanAdminister, true, 'flipped userCanAdminister to true');
+});
+
+// 57. Protobuf & gRPC-Web Wire Decoder
+ok('Reverse Engineering: Protobuf & gRPC-Web Wire Decoder', () => {
+  const pbBytes = new Uint8Array([0x0A, 5, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x10, 42]);
+  const pb = decodeRawProtobuf(pbBytes);
+  assert.equal(pb.fields.length, 2);
+  assert.equal(pb.fields[0].value, 'admin');
+  assert.equal(pb.fields[1].value, 42);
+  assert.ok(pb.formatted.includes('string field_1 = "admin";'));
+  assert.ok(pb.formatted.includes('varint field_2 = 42;'));
+
+  // Test gRPC-Web 5-byte header stripping
+  const grpcHeader = [0x00, 0x00, 0x00, 0x00, pbBytes.length];
+  const grpcBytes = new Uint8Array([...grpcHeader, ...pbBytes]);
+  const grpcRes = decodeRawProtobuf(grpcBytes);
+  assert.equal(grpcRes.isGrpcWeb, true);
+  assert.equal(grpcRes.fields.length, 2);
+});
+
+// 58. MessagePack Wire Decoder
+ok('Reverse Engineering: MessagePack Wire Decoder', () => {
+  const mpBytes = new Uint8Array([
+    0x83,
+    0xa2, 0x69, 0x64, 0x01,
+    0xa4, 0x72, 0x6f, 0x6c, 0x65, 0xa5, 0x61, 0x64, 0x6d, 0x69, 0x6e,
+    0xa6, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0xc3
+  ]);
+  const mp = decodeMsgPack(mpBytes);
+  assert.equal(mp.value.id, 1);
+  assert.equal(mp.value.role, 'admin');
+  assert.equal(mp.value.active, true);
+  assert.ok(mp.formatted.includes('"admin"'));
+});
+
+// 59. Next.js App Router RSC Flight Stream Decoder
+ok('Reverse Engineering: Next.js RSC Flight Stream Decoder', () => {
+  const rscStream = `1:I["(app-pages-browser)/./src/Header.tsx",["Header.js"],"default"]\n2:{"id":"7c4e58f001c9053fa28965c7198bb4b067d025ea","bound":null}\n3:{"user":{"id":42,"email":"admin@target.io","role":"superadmin"}}\n4:["$","div",null,{"children":"Welcome Admin"}]`;
+  const rsc = decodeRscStream(rscStream);
+  assert.equal(rsc.entries.length, 4);
+  assert.ok(rsc.serverActions.includes('7c4e58f001c9053fa28965c7198bb4b067d025ea'));
+  assert.ok(rsc.sensitiveProps.some((p) => p.key === 'email'));
+  assert.ok(rsc.sensitiveProps.some((p) => p.key === 'role'));
+  assert.ok(rsc.formatted.includes('Discovered Server Action Hashes'));
+  assert.ok(rsc.formatted.includes('admin@target.io'));
+});
+
+// 60. Next.js Server Actions Extractor
+ok('Reverse Engineering: Next.js Server Actions Extractor', () => {
+  const bundle = `
+    var $$ACTION_0 = createServerReference("7c4e58f001c9053fa28965c7198bb4b067d025ea", $$ACTION_0_NAME, "updateUserRole");
+    var $$ACTION_1 = createServerReference("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", null, "deleteOrg");
+    const h = { "next-action": "88776655443322110099887766554433221100aa" };
+  `;
+  const actions = extractServerActions(bundle);
+  assert.equal(actions.length, 3);
+  assert.equal(actions[0].id, '7c4e58f001c9053fa28965c7198bb4b067d025ea');
+  assert.equal(actions[0].name, 'updateUserRole');
+  assert.equal(actions[1].id, 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678');
+  assert.equal(actions[2].id, '88776655443322110099887766554433221100aa');
+});
+
+// 61. Client-Side Validator Schema Miner (Zod & Yup)
+ok('Reverse Engineering: Client-Side Validator Schema Miner', () => {
+  const code = `
+    const userSchema = z.object({
+      username: z.string().min(3).max(20),
+      email: z.string().email(),
+      role: z.enum(["admin", "user", "editor"]),
+      isActive: z.boolean().optional()
+    });
+    const orgSchema = yup.object({
+      orgName: yup.string().required(),
+      orgEmail: yup.string().email()
+    });
+  `;
+  const schemas = extractValidationSchemas(code);
+  assert.equal(schemas.length, 2);
+  const zod = schemas.find((s) => s.kind === 'zod');
+  assert.ok(zod);
+  assert.equal(zod.fields.length, 4);
+  assert.equal(zod.fields[0].field, 'username');
+  assert.ok(zod.fields[2].rules.includes('enum(admin|user|editor)'));
+
+  const yup = schemas.find((s) => s.kind === 'yup');
+  assert.ok(yup);
+  assert.equal(yup.fields.length, 2);
+  assert.equal(yup.fields[0].field, 'orgName');
+});
+
+// 62. Modern Bundlers & De-obfuscation
+ok('Reverse Engineering: Modern Bundlers & String De-obfuscation', () => {
+  const obf = 'const path = "/api/" + "v1/" + "users"; const hex = "\\x2f\\x61\\x70\\x69";';
+  const deobf = deobfuscateJsStrings(obf);
+  assert.ok(deobf.includes('"/api/v1/users"'));
+  assert.ok(deobf.includes('"/api"'));
+
+  const bmfCode = `
+    globalThis.TURBOPACK = ["static/chunks/app_dashboard.js", "static/chunks/vendor.js"];
+    const remotes = { "billingApp": "https://billing.internal.net/remoteEntry.js" };
+    __vite__mapDeps(["assets/vendor.hash.js"]);
+  `;
+  const manifests = extractModernBundlerManifests(bmfCode);
+  assert.equal(manifests.turbopackChunks.length, 2);
+  assert.equal(manifests.turbopackChunks[0], 'static/chunks/app_dashboard.js');
+  assert.equal(manifests.federationRemotes.length, 1);
+  assert.equal(manifests.federationRemotes[0].name, 'billingApp');
+  assert.equal(manifests.vitePreloads.length, 1);
+
+  const relayCode = 'const op = { doc_id: "839201928374659102938475", name: "UserBillingQuery" };';
+  const pqs = extractPersistedQueries(relayCode);
+  assert.equal(pqs.length, 1);
+  assert.equal(pqs[0].id, '839201928374659102938475');
+  assert.equal(pqs[0].name, 'UserBillingQuery');
 });
 
 console.log(`\n${pass} checks passed.`);
