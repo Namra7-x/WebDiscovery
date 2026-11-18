@@ -4741,6 +4741,11 @@ function exportAiDossierFile(): void {
       apiSchemas: discoveredApiSchemas,
       serverActions: [...discoveredServerActions.values()],
       graphqlOps: [...discoveredGraphQLOps.values()],
+      validationSchemas: discoveredValidationSchemas.map((vs) => ({
+        name: vs.name,
+        fields: vs.fields.map((f) => ({ field: f.field, type: f.type })),
+      })),
+      stateStores: lastHarvestedStores,
       cloudConfigs: discoveredCloudConfigs,
       cspReport: {
         domains: [...discoveredCspDomains],
@@ -5094,6 +5099,7 @@ const HARVEST_INLINE_SCRIPT = `(()=>{
 })()`;
 
 let lastHarvestSummary = '';
+let lastHarvestedStores: Array<{ name: string; keys: string[] }> = [];
 async function runStateHarvest(): Promise<void> {
   diag('Harvesting client-side runtime state & memory...');
   try {
@@ -5103,6 +5109,10 @@ async function runStateHarvest(): Promise<void> {
       endpoints?: Array<{ url: string; source: string }>;
       stores?: Array<{ name: string; keys: string[] }>;
     }>(HARVEST_INLINE_SCRIPT);
+
+    if (res?.stores?.length) {
+      lastHarvestedStores = res.stores;
+    }
 
     const idCount = res?.identities?.length ?? 0;
     const tokenCount = res?.tokens?.length ?? 0;
@@ -5412,8 +5422,6 @@ function wire(): void {
     anaActiveFilter = anaActiveFilter === filter ? 'ALL' : filter;
     renderAnalyze();
   });
-  on('btnAnaAiDossier', 'click', exportAiDossierFile);
-  on('btnApisAiDossier', 'click', exportAiDossierFile);
   on('btnOverviewAiDossier', 'click', exportAiDossierFile);
   on('secList', 'click', secClick);
   on('homeStorageSel', 'change', (e) => {
@@ -5486,6 +5494,7 @@ function clearSession(prompt = true): boolean {
   reconstructedSourceFiles.clear(); discoveredGraphQLOps.clear(); discoveredApiSchemas.clear();
   discoveredServerActions.clear(); discoveredPersistedQueries.clear(); discoveredValidationSchemas.length = 0;
   discoveredCloudConfigs.length = 0; discoveredCspDomains.clear(); discoveredInternalDomains.clear(); discoveredCloudBuckets.clear();
+  lastHarvestedStores.length = 0;
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   secShowAll = false; routeShowAll = false; anaKind = 'ALL';
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0; discoveredUrlSet.clear();

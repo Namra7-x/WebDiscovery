@@ -1270,6 +1270,8 @@ ok('AI Export: Build Structured AI Dossier with Endpoints & Leaks', () => {
     ]),
     serverActions: [{ id: 'action_hash_1234', name: 'updateProfile' }],
     graphqlOps: [{ name: 'GetUser', type: 'query' }],
+    validationSchemas: [{ name: 'UserSchema', fields: [{ field: 'role', type: 'string' }] }],
+    stateStores: [{ name: 'zustand/authStore', keys: ['currentUser', 'authToken'] }],
     cloudConfigs: [{ provider: 'firebase', details: { apiKey: 'AIzaSyD-123' } }],
     cspReport: {
       domains: ['api.target.com', 'vault.internal'],
@@ -1286,6 +1288,10 @@ ok('AI Export: Build Structured AI Dossier with Endpoints & Leaks', () => {
   assert.equal(dossier.summary.calledEndpoints, 1);
   assert.equal(dossier.summary.uncalledEndpoints, 2); // /api/v1/users and /api/v1/admin/uncalled (not /about)
   assert.equal(dossier.serverActions.length, 1);
+  assert.equal(dossier.validationSchemas.length, 1);
+  assert.equal(dossier.clientStateStores.length, 1);
+  assert.equal(dossier.summary.validationSchemasCount, 1);
+  assert.equal(dossier.summary.clientStateStoresCount, 1);
   assert.equal(dossier.cloudBaaS.length, 1);
   assert.equal(dossier.infrastructure.internalDomains[0], 'vault.internal');
 

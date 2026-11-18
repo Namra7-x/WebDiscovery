@@ -26,6 +26,8 @@ export interface AiDossierInput {
   apiSchemas?: Map<string, { method?: string; params?: string[]; bodyKeys?: string[] }>;
   serverActions?: Array<{ id: string; name?: string; source?: string }>;
   graphqlOps?: Array<{ name: string; type?: string; query?: string; hash?: string }>;
+  validationSchemas?: Array<{ name?: string; fields: Array<{ field: string; type: string }> }>;
+  stateStores?: Array<{ name: string; keys: string[] }>;
   cloudConfigs?: Array<{ provider: string; details: Record<string, string> }>;
   cspReport?: { domains: string[]; internalDomains: string[]; cloudBuckets: string[] };
   findings?: Array<{ rule: string; sev: string; label?: string; text: string; prov?: { resourceUrl?: string; route?: string; method?: string } }>;
@@ -77,6 +79,8 @@ export interface AiDossierOutput {
     graphqlOperationsCount: number;
     securityFindingsCount: number;
     cloudConfigsCount: number;
+    validationSchemasCount: number;
+    clientStateStoresCount: number;
   };
   securityFindings: Array<{
     severity: string;
@@ -88,6 +92,8 @@ export interface AiDossierOutput {
   endpoints: AiDossierEndpoint[];
   serverActions: Array<{ id: string; name?: string; source?: string }>;
   graphqlOperations: Array<{ name: string; type?: string; query?: string; hash?: string }>;
+  validationSchemas: Array<{ name?: string; fields: Array<{ field: string; type: string }> }>;
+  clientStateStores: Array<{ name: string; keys: string[] }>;
   cloudBaaS: Array<{ provider: string; details: Record<string, string> }>;
   infrastructure: {
     internalDomains: string[];
@@ -279,11 +285,15 @@ export function buildAiDossier(input: AiDossierInput): AiDossierOutput {
       graphqlOperationsCount: input.graphqlOps?.length ?? 0,
       securityFindingsCount: safeFindings.length,
       cloudConfigsCount: input.cloudConfigs?.length ?? 0,
+      validationSchemasCount: input.validationSchemas?.length ?? 0,
+      clientStateStoresCount: input.stateStores?.length ?? 0,
     },
     securityFindings: safeFindings,
     endpoints: endpointList,
     serverActions: input.serverActions || [],
     graphqlOperations: input.graphqlOps || [],
+    validationSchemas: input.validationSchemas || [],
+    clientStateStores: input.stateStores || [],
     cloudBaaS: input.cloudConfigs || [],
     infrastructure: {
       internalDomains: input.cspReport?.internalDomains || [],
