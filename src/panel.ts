@@ -30,7 +30,7 @@ import { buildHarDoc, validateHar, normalizeHarEntry, HAR_MAX_ENTRIES } from './
 import { parseFilterDsl, matchDslAll } from './filter-dsl.js';
 import type { DslRecord } from './filter-dsl.js';
 import { fuzzyScore } from './fuzzy.js';
-import { normalize } from './normalize.js';
+import { normalize, snippet } from './normalize.js';
 import { newSessionId, idbPutBody, idbGetBody, idbDeleteBody, idbOldestUrls, idbDeleteSession, idbListSessions, idbSessionBytes } from './idb.js';
 import type { CdpNetEvent, CdpTargetInfo } from './cdp.js';
 import { isSubdomainOf } from './types.js';
@@ -506,9 +506,10 @@ async function ingestText(
     } else if (!storeCanRetain(len, 'raw-bodies')) {
       diagOnce('body-budget', 'body-retention budget full — kept metadata only', targetUrl);
       meta.error = 'body skipped: retention budget full';
-    } else if (len > 64 * 1024) {
-      void retainOverflow(targetUrl, capped); // temp-disk overflow, RAM stays flat
     } else {
+      if (len > 64 * 1024) {
+        void retainOverflow(targetUrl, capped); // temp-disk overflow backup
+      }
       rawBodies.set(targetUrl, capped);
       rawOrder.push(targetUrl);
       ledger.rawBytes += len;
@@ -1694,14 +1695,107 @@ function hookDevtoolsNetwork(): void {
         for (const e of (har.entries ?? []).slice(-120)) {
           const url = e.request.url;
           if (/^(chrome-extension|devtools|data):/.test(url)) continue;
-          const he: NetEntry = { id: `har-${netEntries.length}`, url, method: e.request.method, status: e.response.status, mime: e.response.content?.mimeType, route: sessionRoute, bodyKept: false, bodyTruncated: false, bodyChars: e.response.content?.size ?? 0, ts: Date.now(), reqId: `har-${netEntries.length}-${Date.now()}`, note: 'from HAR snapshot' };
+          let contentText = e.response.content?.text;
+          const mime = e.response.content?.mimeType;
+          if (contentText && e.response.content?.encoding === 'base64') {
+            try { contentText = atob(contentText); } catch { /* keep raw */ }
+          }
+          const hasBody = Boolean(contentText);
+          const he: NetEntry = {
+            id: `har-${netEntries.length}`,
+            url,
+            method: e.request.method,
+            status: e.response.status,
+            mime,
+            route: sessionRoute,
+            bodyKept: hasBody && settings.retainRaw,
+            bodyTruncated: false,
+            bodyChars: contentText ? contentText.length : (e.response.content?.size ?? 0),
+            ts: Date.now(),
+            reqId: `har-${netEntries.length}-${Date.now()}`,
+            note: 'from HAR snapshot',
+          };
           unshiftNet(he);
           recordNetworkEvidence(he.method, url, { status: he.status, mime: he.mime ?? undefined, workerKind: 'unknown', route: he.route });
+          if (contentText) {
+            void ingestText(url, contentText, { mime, route: sessionRoute, method: 'devtools-network', status: e.response.status });
+          }
         }
         scheduleRender('network'); scheduleRender('apis'); scheduleRender('overview');
       } catch { /* ignore */ }
     });
+    chrome.devtools.network.onNavigated?.addListener((navUrl) => {
+      try {
+        sessionRoute = new URL(navUrl).pathname || '/';
+        hookDevtoolsResources();
+      } catch { /* ignore */ }
+    });
   } catch { diag('devtools.network unavailable in this context'); }
+}
+
+function hookDevtoolsResources(): void {
+  try {
+    if (!chrome?.devtools?.inspectedWindow?.getResources) return;
+    chrome.devtools.inspectedWindow.getResources((resList) => {
+      try {
+        for (const res of resList || []) {
+          ingestDevtoolsResource(res);
+        }
+      } catch { /* ignore */ }
+    });
+    chrome.devtools.inspectedWindow.onResourceAdded?.addListener((res) => {
+      try {
+        ingestDevtoolsResource(res);
+      } catch { /* ignore */ }
+    });
+  } catch {
+    diag('devtools.inspectedWindow.getResources unavailable');
+  }
+}
+
+function ingestDevtoolsResource(res: chrome.devtools.inspectedWindow.Resource): void {
+  if (!res || !res.url) return;
+  const url = res.url;
+  if (/^(chrome-extension|devtools|data|blob):/i.test(url)) return;
+  if (resources.has(url) && rawBodies.has(url)) return;
+
+  let mime = 'text/plain';
+  let kind: ResourceKind = 'script';
+  if (/\.js(\?|$)/i.test(url)) {
+    mime = 'application/javascript';
+    kind = 'script';
+  } else if (/\.css(\?|$)/i.test(url)) {
+    mime = 'text/css';
+    kind = 'stylesheet';
+  } else if (/\.html?(\?|$)/i.test(url) || (!url.includes('.') && !url.includes('/api/'))) {
+    mime = 'text/html';
+    kind = 'document';
+  } else if (/\.json(\?|$)/i.test(url)) {
+    mime = 'application/json';
+    kind = 'api-json';
+  } else if (/\.map(\?|$)/i.test(url)) {
+    mime = 'application/json';
+    kind = 'source-map';
+  }
+
+  try {
+    res.getContent((content, encoding) => {
+      if (content == null || paused) return;
+      let text = content;
+      if (encoding === 'base64') {
+        if (kind === 'script' || kind === 'stylesheet' || kind === 'document' || kind === 'api-json' || kind === 'source-map') {
+          try { text = atob(content); } catch { return; }
+        } else {
+          return;
+        }
+      }
+      void ingestText(url, text, {
+        mime,
+        route: sessionRoute,
+        method: 'devtools-resources',
+      });
+    });
+  } catch { /* ignore */ }
 }
 
 function headersToObj(h: Array<{ name: string; value: string }>): Record<string, string> {
@@ -1926,24 +2020,9 @@ function buildScopeRow(): void {
 let lastResults: SearchResult[] = [];
 const lastResultsById = new Map<number, SearchResult>();
 
-function runSearch(): void {
-  const q = ($('q') as HTMLInputElement).value;
-  const mode = ($('mode') as HTMLSelectElement).value as SearchMode;
-  const t0 = performance.now();
-  const res = searchAllSurfaces({
-    index,
-    rawBodies,
-    netEntries,
-    reconstructedSourceFiles,
-    routes,
-    harvestData: lastHarvestData,
-    secFindings,
-  }, q, { mode, scope, limit: 200 });
-  const dt = performance.now() - t0;
-  lastResults = res;
-  lastResultsById.clear();
-  for (const r of res) lastResultsById.set(r.recordId, r);
-  $('resultMeta').textContent = q ? `${res.length} results in ${dt.toFixed(1)} ms · ${mode} · scanned across all surfaces (bodies, network, source code, memory)` : `scanned across all surfaces — type to search`;
+function renderSearchResults(q: string, mode: string, dt: number): void {
+  const res = lastResults;
+  $('resultMeta').textContent = q ? `${res.length} results in ${dt.toFixed(1)} ms · ${mode} · scanned across all surfaces (bodies, network, DOM, source code, memory)` : `scanned across all surfaces — type to search`;
   const box = $('results');
   box.innerHTML = res.map((r) => {
     const p = r.prov;
@@ -1961,6 +2040,112 @@ function runSearch(): void {
       + `<div class="ctx-line">${hl}</div>`
       + `<div class="prov">${sub} ${jp}</div></div>`;
   }).join('');
+}
+
+async function searchLivePageDom(query: string): Promise<SearchResult[]> {
+  if (!query || query.length < 2) return [];
+  const safeQ = JSON.stringify(query);
+  const expr = `(() => {
+    try {
+      const q = ${safeQ}.toLowerCase();
+      const results = [];
+      const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+      let node;
+      let count = 0;
+      while ((node = walker.nextNode()) && count < 30) {
+        const val = node.nodeValue;
+        if (!val || val.length < 2) continue;
+        const lower = val.toLowerCase();
+        const idx = lower.indexOf(q);
+        if (idx !== -1) {
+          const el = node.parentElement;
+          if (el && (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'NOSCRIPT')) continue;
+          const tag = el ? el.tagName.toLowerCase() : 'text';
+          const id = el?.id ? '#' + el.id : '';
+          const cls = el?.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\\s+/)[0] : '';
+          results.push({
+            text: val.slice(0, 300),
+            selector: tag + id + cls,
+            at: idx,
+            len: q.length,
+          });
+          count++;
+        }
+      }
+      return results;
+    } catch { return []; }
+  })()`;
+
+  try {
+    const rawMatches = await evalInPage<Array<{ text: string; selector: string; at: number; len: number }>>(expr, sessionGen);
+    if (!Array.isArray(rawMatches)) return [];
+    let synId = -9000;
+    return rawMatches.map((m) => {
+      const snip = snippet(m.text, m.at, m.len);
+      return {
+        recordId: synId--,
+        text: m.text,
+        score: 0.96,
+        mode: 'substring' as SearchMode,
+        prov: {
+          resourceUrl: '[dom:live]',
+          resourceKind: 'dom' as ResourceKind,
+          route: sessionRoute,
+          method: 'dom-link' as DiscoveryMethod,
+          detail: `live-dom <${m.selector}>`,
+        },
+        context: snip.context,
+        matchStart: snip.matchStart,
+        matchLen: snip.matchLen,
+        marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function runSearch(): void {
+  const q = ($('q') as HTMLInputElement).value;
+  const mode = ($('mode') as HTMLSelectElement).value as SearchMode;
+  const t0 = performance.now();
+  const res = searchAllSurfaces({
+    index,
+    rawBodies,
+    netEntries,
+    reconstructedSourceFiles,
+    routes,
+    harvestData: lastHarvestData,
+    secFindings,
+  }, q, { mode, scope, limit: 200 });
+  const dt = performance.now() - t0;
+  lastResults = res;
+  lastResultsById.clear();
+  for (const r of res) lastResultsById.set(r.recordId, r);
+  renderSearchResults(q, mode, dt);
+
+  // Live page DOM inspection: evaluate live active DOM nodes
+  if (scope.dom && q.trim().length >= 2) {
+    const curQ = q;
+    void searchLivePageDom(q.trim()).then((domHits) => {
+      if (($('q') as HTMLInputElement).value !== curQ || !domHits.length) return;
+      const seen = new Set(lastResults.map((r) => `${r.prov.resourceUrl}::${r.context}`));
+      let added = false;
+      for (const dh of domHits) {
+        const k = `${dh.prov.resourceUrl}::${dh.context}`;
+        if (!seen.has(k)) {
+          seen.add(k);
+          lastResults.push(dh);
+          lastResultsById.set(dh.recordId, dh);
+          added = true;
+        }
+      }
+      if (added) {
+        lastResults.sort((a, b) => b.score - a.score);
+        renderSearchResults(curQ, mode, performance.now() - t0);
+      }
+    });
+  }
 }
 
 /** Render escaped context with ALL fuzzy spans wrapped in <mark>. */
@@ -3232,6 +3417,11 @@ async function viewUrl(url: string, forceLive = false): Promise<void> {
   }
   if (!rawText && url.startsWith('[state:') && lastHarvestSummary) {
     rawText = lastHarvestSummary;
+    fromStore = true;
+  }
+  if (!rawText && url.startsWith('[dom:')) {
+    const rec = [...lastResultsById.values()].find((r) => r.prov.resourceUrl === url);
+    rawText = `// Live Page DOM Text Match\n// Route: ${sessionRoute}\n// Matched node: ${rec?.prov?.detail || 'live text'}\n\n${rec?.context || rec?.text || ''}`;
     fromStore = true;
   }
   if (!rawText && !forceLive && idbReady) {
@@ -5368,6 +5558,12 @@ function wire(): void {
     try { document.getElementById(`tab-${(b as HTMLElement).dataset.tab}`)?.classList.add('active'); } catch { /* ignore */ }
   }));
   on('q', 'input', () => { clearTimeout(searchTimer); searchTimer = window.setTimeout(runSearch, 160); });
+  on('q', 'keydown', (e) => {
+    if ((e as KeyboardEvent).key === 'Enter') {
+      clearTimeout(searchTimer);
+      runSearch();
+    }
+  });
   on('btnSearch', 'click', runSearch);
   on('topStatus', 'click', () => {
     try { (document.querySelector('#tabs button[data-tab="settings"]') as HTMLElement | null)?.click(); } catch { /* ignore */ }
@@ -5849,7 +6045,7 @@ async function enableDebugger(): Promise<void> {
 async function boot(): Promise<void> {
   buildScopeRow(); buildSettings(); wire(); initWorker();
   await initStore();
-  connectBackground(); hookDevtoolsNetwork();
+  connectBackground(); hookDevtoolsNetwork(); hookDevtoolsResources();
   ledger.setBudget(settings.budgetMB);
   try {
     const href = await evalInPage<string>('location.href');

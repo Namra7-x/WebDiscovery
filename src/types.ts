@@ -10,7 +10,8 @@ export type DiscoveryMethod =
   | 'router' | 'history-api' | 'js-string' | 'dynamic-import' | 'static-import'
   | 'fetch-target' | 'css-reference' | 'css-import' | 'sourcemap-ref'
   | 'manifest-ref' | 'iframe' | 'sitemap' | 'deep-scan' | 'manual' | 'unknown'
-  | 'cdp-body' | 'live-fetch' | 'server-action' | 'wasm-data' | 'csp-domain'; // response body pulled via Deep Capture or live on-demand fetch, Next.js server-action, WASM linear memory, or CSP infrastructure header
+  | 'cdp-body' | 'live-fetch' | 'server-action' | 'wasm-data' | 'csp-domain'
+  | 'devtools-resources'; // response body pulled via Deep Capture or live on-demand fetch, Next.js server-action, WASM linear memory, or CSP infrastructure header
 
 export interface Provenance {
   resourceUrl: string;

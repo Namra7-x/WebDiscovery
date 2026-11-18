@@ -7,7 +7,8 @@
 //     source maps, client state stores, and AST tokens.
 import { fuzzyMatch } from './fuzzy.js';
 import { normalize, normalizeWithMap, snippet, snippetWithSpans } from './normalize.js';
-import type { NetEntry, Provenance, ResourceKind, SearchMode, SearchResult, SearchScope, Severity, TextRecord } from './types.js';
+export { snippet };
+import type { DiscoveryMethod, NetEntry, Provenance, ResourceKind, SearchMode, SearchResult, SearchScope, Severity, TextRecord } from './types.js';
 import { scopeAllows } from './types.js';
 import type { RamIndex } from './indexer.js';
 import type { SourceMapFile } from './sourcemap.js';
@@ -24,7 +25,7 @@ export interface MultiSurfaceSearchInputs {
   rawBodies?: Map<string, string>;
   netEntries?: NetEntry[];
   reconstructedSourceFiles?: Map<string, SourceMapFile>;
-  routes?: Map<string, { method: string; count: number }>;
+  routes?: Map<string, { method: DiscoveryMethod | string; count: number }>;
   harvestData?: {
     identities?: Array<{ key: string; val: string; source: string }>;
     tokens?: Array<{ key: string; val: string; source: string }>;
@@ -172,7 +173,7 @@ function findMatchesInText(
   text: string,
   query: string,
   mode: SearchMode,
-  maxMatches = 3,
+  maxMatches = 5,
 ): Array<{ at: number; len: number; score: number }> {
   if (!text || !query) return [];
   const results: Array<{ at: number; len: number; score: number }> = [];
@@ -194,15 +195,27 @@ function findMatchesInText(
       }
     } catch { /* invalid regex */ }
   } else {
-    // substring, normalized, fuzzy fallback
-    const lowerText = text.toLowerCase();
-    const lowerQuery = query.toLowerCase();
-    let pos = 0;
-    while ((pos = lowerText.indexOf(lowerQuery, pos)) !== -1) {
-      const score = text.slice(pos, pos + query.length) === query ? 1.0 : 0.92;
-      results.push({ at: pos, len: query.length, score });
-      pos += Math.max(1, query.length);
-      if (results.length >= maxMatches) break;
+    // Zero-allocation case-insensitive search via native V8 RegExp engine
+    try {
+      const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(escaped, 'gi');
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const score = m[0] === query ? 1.0 : 0.92;
+        results.push({ at: m.index, len: m[0].length, score });
+        if (results.length >= maxMatches) break;
+      }
+    } catch {
+      // Fallback if RegExp construction fails
+      const lowerQuery = query.toLowerCase();
+      const lowerText = text.toLowerCase();
+      let pos = 0;
+      while ((pos = lowerText.indexOf(lowerQuery, pos)) !== -1) {
+        const score = text.slice(pos, pos + query.length) === query ? 1.0 : 0.92;
+        results.push({ at: pos, len: query.length, score });
+        pos += Math.max(1, query.length);
+        if (results.length >= maxMatches) break;
+      }
     }
   }
   return results;
@@ -222,7 +235,7 @@ export function searchAllSurfaces(
   let q = (rawQuery || '').trim();
   if (!q) return [];
 
-  let targetSurface: 'all' | 'body' | 'req' | 'source' | 'state' | 'header' | 'url' = 'all';
+  let targetSurface: 'all' | 'body' | 'req' | 'source' | 'state' | 'header' | 'url' | 'route' = 'all';
   const prefixMatch = /^(?:in|scope|surface):(body|res|response|req|request|source|code|state|store|header|url|route)\s+/i.exec(q);
   if (prefixMatch) {
     const p = prefixMatch[1].toLowerCase();
@@ -231,7 +244,8 @@ export function searchAllSurfaces(
     else if (p === 'source' || p === 'code') targetSurface = 'source';
     else if (p === 'state' || p === 'store') targetSurface = 'state';
     else if (p === 'header') targetSurface = 'header';
-    else if (p === 'url' || p === 'route') targetSurface = 'url';
+    else if (p === 'url') targetSurface = 'url';
+    else if (p === 'route') targetSurface = 'route';
     q = q.slice(prefixMatch[0].length).trim();
   }
   if (!q) return [];
@@ -374,6 +388,36 @@ export function searchAllSurfaces(
         };
         if (opts.scope.reqHeaders !== false) checkHeaders(entry.reqHeaders, false);
         if (opts.scope.resHeaders !== false) checkHeaders(entry.resHeaders, true);
+      }
+    }
+  }
+
+  // 3b. Search Discovered Routes
+  if ((targetSurface === 'all' || targetSurface === 'url' || targetSurface === 'route') && opts.scope.routes !== false && inputs.routes) {
+    let routeHits = 0;
+    for (const [rUrl, rInfo] of inputs.routes) {
+      if (routeHits >= 40 || out.length >= limit) break;
+      const rMatches = findMatchesInText(rUrl, q, opts.mode, 1);
+      if (rMatches.length) {
+        const snip = snippet(rUrl, rMatches[0].at, rMatches[0].len);
+        out.push({
+          recordId: syntheticId--,
+          text: rUrl,
+          score: 0.99,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: rUrl,
+            resourceKind: 'route',
+            route: rUrl,
+            method: (rInfo.method as DiscoveryMethod) || 'router',
+            detail: 'discovered-route',
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+        routeHits++;
       }
     }
   }

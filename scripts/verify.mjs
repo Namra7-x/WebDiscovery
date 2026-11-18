@@ -1355,6 +1355,10 @@ ok('Universal Search: Multi-surface search across rawBodies, reqBody, source map
     tokens: [{ key: 'API_KEY', val: 'sk-carbon-secret-key-12345', source: 'window.__ENV' }],
   };
 
+  const routes = new Map([
+    ['/models/carbon-custom', { method: 'router', count: 1 }]
+  ]);
+
   const scope = {
     dom: true, js: true, chunks: true, css: true, json: true,
     sourcemaps: true, routes: true, urls: true,
@@ -1368,10 +1372,11 @@ ok('Universal Search: Multi-surface search across rawBodies, reqBody, source map
     rawBodies,
     netEntries,
     reconstructedSourceFiles,
+    routes,
     harvestData,
   }, 'carbon', { mode: 'substring', scope, limit: 50 });
 
-  assert.ok(allHits.length >= 6, `Expected >= 6 hits across surfaces, got ${allHits.length}`);
+  assert.ok(allHits.length >= 7, `Expected >= 7 hits across surfaces, got ${allHits.length}`);
 
   // Response body hit (models JSON and home page HTML)
   const bodyHit = allHits.find(h => h.prov.resourceUrl === 'https://openrouter.ai/api/v1/models');
@@ -1398,6 +1403,11 @@ ok('Universal Search: Multi-surface search across rawBodies, reqBody, source map
   const storeHit = allHits.find(h => h.prov.detail?.includes('client-store'));
   assert.ok(storeHit, 'Must find carbon in client memory store');
   assert.ok(storeHit.context.includes('carbonToken'));
+
+  // Route hit (discovered SPA route)
+  const routeHit = allHits.find(h => h.prov.resourceKind === 'route' && h.prov.resourceUrl === '/models/carbon-custom');
+  assert.ok(routeHit, 'Must find carbon in discovered routes');
+  assert.equal(routeHit.prov.detail, 'discovered-route');
 
   // 2. Surface-scoped query: in:body carbon
   const scopedBodyHits = searchAllSurfaces({
