@@ -4,7 +4,7 @@
 import { DiscoveryGraph } from './graph.js';
 import { RamIndex } from './indexer.js';
 import { MemoryLedger, formatBytes } from './memory.js';
-import { displayNameFor, searchIndex } from './search.js';
+import { displayNameFor, searchIndex, searchAllSurfaces } from './search.js';
 import {
   extractHtml, resolveUrl, parseBuildManifest, parseWebpackChunkMap,
   extractApiCallSchemas, extractGraphQLOperations, formatGraphQLRegistry,
@@ -1930,12 +1930,20 @@ function runSearch(): void {
   const q = ($('q') as HTMLInputElement).value;
   const mode = ($('mode') as HTMLSelectElement).value as SearchMode;
   const t0 = performance.now();
-  const res = searchIndex(index, q, { mode, scope, limit: 200 });
+  const res = searchAllSurfaces({
+    index,
+    rawBodies,
+    netEntries,
+    reconstructedSourceFiles,
+    routes,
+    harvestData: lastHarvestData,
+    secFindings,
+  }, q, { mode, scope, limit: 200 });
   const dt = performance.now() - t0;
   lastResults = res;
   lastResultsById.clear();
   for (const r of res) lastResultsById.set(r.recordId, r);
-  $('resultMeta').textContent = q ? `${res.length} results in ${dt.toFixed(1)} ms · ${mode} · indexed ${index.size} strings` : `indexed ${index.size} strings — type to search`;
+  $('resultMeta').textContent = q ? `${res.length} results in ${dt.toFixed(1)} ms · ${mode} · scanned across all surfaces (bodies, network, source code, memory)` : `scanned across all surfaces — type to search`;
   const box = $('results');
   box.innerHTML = res.map((r) => {
     const p = r.prov;
@@ -3214,6 +3222,18 @@ async function viewUrl(url: string, forceLive = false): Promise<void> {
   // 1. Body retrieval from RAM or IDB
   let rawText = forceLive ? '' : (rawBodies.get(targetUrl) ?? rawBodies.get(url) ?? '');
   let fromStore = !!rawText;
+  if (!rawText && url.startsWith('#')) {
+    const sf = reconstructedSourceFiles.get(url.slice(1));
+    if (sf?.content) { rawText = sf.content; fromStore = true; }
+  }
+  if (!rawText && url.startsWith('[req:') && netEntry?.reqBody) {
+    rawText = netEntry.reqBody;
+    fromStore = true;
+  }
+  if (!rawText && url.startsWith('[state:') && lastHarvestSummary) {
+    rawText = lastHarvestSummary;
+    fromStore = true;
+  }
   if (!rawText && !forceLive && idbReady) {
     try {
       const disk = (await idbGetBody(sessionId, targetUrl)) ?? (await idbGetBody(sessionId, url));

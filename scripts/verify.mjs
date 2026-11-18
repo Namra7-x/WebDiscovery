@@ -12,7 +12,7 @@ import {
   parseCspDomains, diffEndpointFields, normalizeDynamicPath, extractCloudConfigs
 } from '../dist/extractors.js';
 import { RamIndex } from '../dist/indexer.js';
-import { searchIndex, displayNameFor } from '../dist/search.js';
+import { searchIndex, displayNameFor, searchAllSurfaces } from '../dist/search.js';
 import { groupMime, netGroupCounts, netMethodCounts, optionsHtml, resourceKindCounts, buildCurl, severityRank, hostOf, groupByHost, snippetBody, isBinaryText } from '../dist/tables.js';
 import { SECRET_RULES, scanTextForSecrets, isPlaceholder, decodeJwtAlg, shannon } from '../dist/rules.js';
 import { classifyApiKind, findExposures } from '../dist/exposure.js';
@@ -1318,6 +1318,108 @@ ok('AI Export: Build Structured AI Dossier with Endpoints & Leaks', () => {
   assert.ok(!JSON.stringify(ep.requestSample).includes('target.user@company.com'));
   assert.ok(JSON.stringify(ep.requestSample).includes('[USER_EMAIL_REDACTED]'));
   assert.ok(!JSON.stringify(dossier.securityFindings).includes('admin@gmail.com'));
+});
+
+// 73. Universal Multi-Surface Search Engine
+ok('Universal Search: Multi-surface search across rawBodies, reqBody, source maps, client stores', () => {
+  const idx = new RamIndex();
+  idx.add('/api/v1/carbon-metrics', { resourceUrl: 'https://openrouter.ai/app.js', resourceKind: 'script', route: '/', method: 'js-string' });
+
+  const rawBodies = new Map([
+    ['https://openrouter.ai/api/v1/models', JSON.stringify({ models: [{ id: 'carbon-preview', name: 'Carbon Intelligence' }] })],
+    ['https://openrouter.ai/', '<!doctype html><html><head><title>OpenRouter: Carbon Powered AI</title></head><body><h1>Carbon Gateway</h1></body></html>'],
+  ]);
+
+  const netEntries = [
+    {
+      id: 'net-1',
+      url: 'https://openrouter.ai/api/v1/chat',
+      method: 'POST',
+      route: '/',
+      reqBody: JSON.stringify({ model: 'carbon-4o', prompt: 'hello' }),
+      reqHeaders: { 'Authorization': 'Bearer test', 'X-Engine': 'carbon-v2' },
+      bodyKept: true,
+      bodyTruncated: false,
+      bodyChars: 100,
+      ts: Date.now(),
+    }
+  ];
+
+  const reconstructedSourceFiles = new Map([
+    ['src/components/CarbonSelector.tsx', { path: 'src/components/CarbonSelector.tsx', content: 'export const CarbonSelector = () => <div>Carbon Engine</div>;' }]
+  ]);
+
+  const harvestData = {
+    stores: [{ name: 'zustand/modelStore', keys: ['selectedModel', 'carbonToken'] }],
+    identities: [{ key: 'user.role', val: 'carbon-admin', source: 'localStorage' }],
+    tokens: [{ key: 'API_KEY', val: 'sk-carbon-secret-key-12345', source: 'window.__ENV' }],
+  };
+
+  const scope = {
+    dom: true, js: true, chunks: true, css: true, json: true,
+    sourcemaps: true, routes: true, urls: true,
+    reqHeaders: true, reqBody: true, resHeaders: true, resBody: true,
+    frames: true, meta: true,
+  };
+
+  // 1. General search for "carbon" matches ALL surfaces
+  const allHits = searchAllSurfaces({
+    index: idx,
+    rawBodies,
+    netEntries,
+    reconstructedSourceFiles,
+    harvestData,
+  }, 'carbon', { mode: 'substring', scope, limit: 50 });
+
+  assert.ok(allHits.length >= 6, `Expected >= 6 hits across surfaces, got ${allHits.length}`);
+
+  // Response body hit (models JSON and home page HTML)
+  const bodyHit = allHits.find(h => h.prov.resourceUrl === 'https://openrouter.ai/api/v1/models');
+  assert.ok(bodyHit, 'Must find carbon in response body');
+  assert.equal(bodyHit.prov.detail, 'response-body');
+  assert.ok(bodyHit.context.includes('carbon-preview'));
+
+  // Request payload hit (POST body)
+  const reqHit = allHits.find(h => h.prov.detail?.includes('request-body'));
+  assert.ok(reqHit, 'Must find carbon in sent request body');
+  assert.ok(reqHit.context.includes('carbon-4o'));
+
+  // Header hit (X-Engine: carbon-v2)
+  const hdrHit = allHits.find(h => h.prov.detail === 'request-header');
+  assert.ok(hdrHit, 'Must find carbon in request header');
+  assert.ok(hdrHit.context.includes('X-Engine: carbon-v2'));
+
+  // Source map hit (TypeScript original source)
+  const srcHit = allHits.find(h => h.prov.resourceUrl === '#src/components/CarbonSelector.tsx');
+  assert.ok(srcHit, 'Must find carbon in original source code');
+  assert.ok(srcHit.context.includes('CarbonSelector'));
+
+  // Client-state hit (Zustand store in RAM)
+  const storeHit = allHits.find(h => h.prov.detail?.includes('client-store'));
+  assert.ok(storeHit, 'Must find carbon in client memory store');
+  assert.ok(storeHit.context.includes('carbonToken'));
+
+  // 2. Surface-scoped query: in:body carbon
+  const scopedBodyHits = searchAllSurfaces({
+    index: idx,
+    rawBodies,
+    netEntries,
+    reconstructedSourceFiles,
+    harvestData,
+  }, 'in:body carbon', { mode: 'substring', scope, limit: 50 });
+  assert.ok(scopedBodyHits.length > 0);
+  assert.ok(scopedBodyHits.every(h => h.prov.detail === 'response-body'), 'in:body must only return response body hits');
+
+  // 3. Surface-scoped query: in:state carbon
+  const scopedStateHits = searchAllSurfaces({
+    index: idx,
+    rawBodies,
+    netEntries,
+    reconstructedSourceFiles,
+    harvestData,
+  }, 'in:state carbon', { mode: 'substring', scope, limit: 50 });
+  assert.ok(scopedStateHits.length > 0);
+  assert.ok(scopedStateHits.every(h => h.prov.detail?.includes('client-store') || h.prov.detail?.includes('user-identity') || h.prov.detail?.includes('token-credential')));
 });
 
 console.log(`\n${pass} checks passed.`);

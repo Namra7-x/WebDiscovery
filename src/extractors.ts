@@ -238,8 +238,17 @@ export function extractJs(src: string, starts?: number[]): Extracted[] {
     if (out.length >= MAX_UNITS_PER_RESOURCE) break;
     const v = lit.value.trim();
     if (v.length < 2 || v.length > 220) continue;
-    // Skip obvious non-paths fast: must contain a slash to be route/endpoint/asset.
-    if (!v.includes('/')) continue;
+    // Non-slash string literals: index as searchable JS strings if meaningful word/identifier
+    if (!v.includes('/')) {
+      if (v.length >= 3 && v.length <= 64 && /^[a-zA-Z0-9_\-\.]+$/.test(v) && !looksLikeNoise(v)) {
+        if (!seenPath.has(v) && out.length < MAX_UNITS_PER_RESOURCE) {
+          seenPath.add(v);
+          const [l, c] = lc(lit.index);
+          push(out, v, l, c, 'js-string');
+        }
+      }
+      continue;
+    }
     // Absolute URL inside a literal: index full URL + its pathname separately.
     if (/^https?:\/\//i.test(v) || /^wss?:\/\//i.test(v)) {
       try {

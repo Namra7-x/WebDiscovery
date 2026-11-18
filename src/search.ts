@@ -3,17 +3,35 @@
 //  2. normalized matching
 //  3. fuzzy ranking ONLY on reduced candidate set (typo-tolerant, spans kept)
 //  4. regex as separate explicit mode (bounded scan)
+//  5. Universal Multi-Surface Search: response bodies, request payloads, headers,
+//     source maps, client state stores, and AST tokens.
 import { fuzzyMatch } from './fuzzy.js';
 import { normalize, normalizeWithMap, snippet, snippetWithSpans } from './normalize.js';
-import type { SearchMode, SearchResult, SearchScope, TextRecord } from './types.js';
+import type { NetEntry, Provenance, ResourceKind, SearchMode, SearchResult, SearchScope, Severity, TextRecord } from './types.js';
 import { scopeAllows } from './types.js';
 import type { RamIndex } from './indexer.js';
+import type { SourceMapFile } from './sourcemap.js';
 
 export interface SearchOptions {
   mode: SearchMode;
   scope: SearchScope;
   limit?: number;
   fuzzyThreshold?: number;
+}
+
+export interface MultiSurfaceSearchInputs {
+  index: RamIndex;
+  rawBodies?: Map<string, string>;
+  netEntries?: NetEntry[];
+  reconstructedSourceFiles?: Map<string, SourceMapFile>;
+  routes?: Map<string, { method: string; count: number }>;
+  harvestData?: {
+    identities?: Array<{ key: string; val: string; source: string }>;
+    tokens?: Array<{ key: string; val: string; source: string }>;
+    endpoints?: Array<{ url: string; source: string }>;
+    stores?: Array<{ name: string; keys: string[] }>;
+  } | null;
+  secFindings?: Array<{ text: string; prov: Provenance; rule: string; sev: Severity; label: string }>;
 }
 
 function inScope(r: TextRecord, scope: SearchScope): boolean {
@@ -145,6 +163,354 @@ export function searchIndex(index: RamIndex, rawQuery: string, opts: SearchOptio
     });
   }
   return out;
+}
+
+/**
+ * Fast search helper that finds match offsets and scores inside arbitrary text.
+ */
+function findMatchesInText(
+  text: string,
+  query: string,
+  mode: SearchMode,
+  maxMatches = 3,
+): Array<{ at: number; len: number; score: number }> {
+  if (!text || !query) return [];
+  const results: Array<{ at: number; len: number; score: number }> = [];
+
+  if (mode === 'exact') {
+    let pos = 0;
+    while ((pos = text.indexOf(query, pos)) !== -1) {
+      results.push({ at: pos, len: query.length, score: 1.0 });
+      pos += Math.max(1, query.length);
+      if (results.length >= maxMatches) break;
+    }
+  } else if (mode === 'regex') {
+    try {
+      const re = new RegExp(query, 'gi');
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        results.push({ at: m.index, len: m[0].length, score: 0.95 });
+        if (results.length >= maxMatches) break;
+      }
+    } catch { /* invalid regex */ }
+  } else {
+    // substring, normalized, fuzzy fallback
+    const lowerText = text.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+    let pos = 0;
+    while ((pos = lowerText.indexOf(lowerQuery, pos)) !== -1) {
+      const score = text.slice(pos, pos + query.length) === query ? 1.0 : 0.92;
+      results.push({ at: pos, len: query.length, score });
+      pos += Math.max(1, query.length);
+      if (results.length >= maxMatches) break;
+    }
+  }
+  return results;
+}
+
+/**
+ * Universal Multi-Surface Search:
+ * Scans across Response Bodies, Request Payloads, Headers, Source Code,
+ * Client Memory Stores, and AST Tokens with 0 duplicate RAM overhead.
+ */
+export function searchAllSurfaces(
+  inputs: MultiSurfaceSearchInputs,
+  rawQuery: string,
+  opts: SearchOptions,
+): SearchResult[] {
+  const limit = Math.min(opts.limit ?? 200, 500);
+  let q = (rawQuery || '').trim();
+  if (!q) return [];
+
+  let targetSurface: 'all' | 'body' | 'req' | 'source' | 'state' | 'header' | 'url' = 'all';
+  const prefixMatch = /^(?:in|scope|surface):(body|res|response|req|request|source|code|state|store|header|url|route)\s+/i.exec(q);
+  if (prefixMatch) {
+    const p = prefixMatch[1].toLowerCase();
+    if (p === 'body' || p === 'res' || p === 'response') targetSurface = 'body';
+    else if (p === 'req' || p === 'request') targetSurface = 'req';
+    else if (p === 'source' || p === 'code') targetSurface = 'source';
+    else if (p === 'state' || p === 'store') targetSurface = 'state';
+    else if (p === 'header') targetSurface = 'header';
+    else if (p === 'url' || p === 'route') targetSurface = 'url';
+    q = q.slice(prefixMatch[0].length).trim();
+  }
+  if (!q) return [];
+
+  const out: SearchResult[] = [];
+  let syntheticId = -1;
+
+  // 1. Search Response Bodies (rawBodies: HTML home page, API JSON, scripts, text)
+  if ((targetSurface === 'all' || targetSurface === 'body') && opts.scope.resBody !== false && inputs.rawBodies) {
+    let bodyHits = 0;
+    for (const [url, bodyText] of inputs.rawBodies) {
+      if (bodyHits >= 100 || out.length >= limit) break;
+      if (!bodyText || typeof bodyText !== 'string') continue;
+      const matches = findMatchesInText(bodyText, q, opts.mode, 3);
+      for (const m of matches) {
+        const snip = snippet(bodyText, m.at, m.len);
+        let line = 1;
+        for (let j = 0; j < m.at; j++) if (bodyText.charCodeAt(j) === 10) line++;
+
+        const isJs = url.includes('.js') || url.includes('.mjs');
+        const isHtml = url.includes('.html') || (!url.includes('.') && !url.includes('/api/'));
+        const isCss = url.includes('.css');
+        const kind: ResourceKind = isJs ? 'script' : (isCss ? 'stylesheet' : (isHtml ? 'document' : 'api-json'));
+
+        out.push({
+          recordId: syntheticId--,
+          text: snip.context,
+          score: m.score,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: url,
+            resourceKind: kind,
+            route: '/',
+            method: 'devtools-network',
+            detail: 'response-body',
+            line,
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+        bodyHits++;
+        if (bodyHits >= 100 || out.length >= limit) break;
+      }
+    }
+  }
+
+  // 2. Search Request Payloads (netEntries.reqBody: sent POST/PUT/PATCH data)
+  if ((targetSurface === 'all' || targetSurface === 'req') && opts.scope.reqBody !== false && inputs.netEntries) {
+    let reqHits = 0;
+    for (const entry of inputs.netEntries) {
+      if (reqHits >= 50 || out.length >= limit) break;
+      if (!entry.reqBody) continue;
+      const matches = findMatchesInText(entry.reqBody, q, opts.mode, 2);
+      for (const m of matches) {
+        const snip = snippet(entry.reqBody, m.at, m.len);
+        out.push({
+          recordId: syntheticId--,
+          text: snip.context,
+          score: m.score,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: entry.url,
+            resourceKind: 'api-json',
+            route: entry.route || '/',
+            method: 'devtools-network',
+            detail: `request-body (${entry.method})`,
+            initiator: entry.initiator,
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+        reqHits++;
+        if (reqHits >= 50 || out.length >= limit) break;
+      }
+    }
+  }
+
+  // 3. Search Headers & URLs
+  if (inputs.netEntries) {
+    let headerHits = 0;
+    for (const entry of inputs.netEntries) {
+      if (headerHits >= 40 || out.length >= limit) break;
+      if ((targetSurface === 'all' || targetSurface === 'url') && opts.scope.urls !== false) {
+        const uMatches = findMatchesInText(entry.url, q, opts.mode, 1);
+        if (uMatches.length) {
+          const snip = snippet(entry.url, uMatches[0].at, uMatches[0].len);
+          out.push({
+            recordId: syntheticId--,
+            text: entry.url,
+            score: 0.98,
+            mode: opts.mode,
+            prov: {
+              resourceUrl: entry.url,
+              resourceKind: 'url',
+              route: entry.route || '/',
+              method: 'devtools-network',
+              detail: `url (${entry.method})`,
+            },
+            context: snip.context,
+            matchStart: snip.matchStart,
+            matchLen: snip.matchLen,
+            marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+          });
+          headerHits++;
+        }
+      }
+      if ((targetSurface === 'all' || targetSurface === 'header') && (opts.scope.reqHeaders !== false || opts.scope.resHeaders !== false)) {
+        const checkHeaders = (hdrs: Record<string, string> | undefined, isRes: boolean): void => {
+          if (!hdrs) return;
+          for (const [k, v] of Object.entries(hdrs)) {
+            const hLine = `${k}: ${v}`;
+            const hMatches = findMatchesInText(hLine, q, opts.mode, 1);
+            if (hMatches.length) {
+              const snip = snippet(hLine, hMatches[0].at, hMatches[0].len);
+              out.push({
+                recordId: syntheticId--,
+                text: hLine,
+                score: 0.92,
+                mode: opts.mode,
+                prov: {
+                  resourceUrl: entry.url,
+                  resourceKind: 'header',
+                  route: entry.route || '/',
+                  method: 'devtools-network',
+                  detail: isRes ? 'response-header' : 'request-header',
+                },
+                context: snip.context,
+                matchStart: snip.matchStart,
+                matchLen: snip.matchLen,
+                marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+              });
+              headerHits++;
+              if (headerHits >= 40 || out.length >= limit) break;
+            }
+          }
+        };
+        if (opts.scope.reqHeaders !== false) checkHeaders(entry.reqHeaders, false);
+        if (opts.scope.resHeaders !== false) checkHeaders(entry.resHeaders, true);
+      }
+    }
+  }
+
+  // 4. Search Reconstructed Source Code (original unminified .ts/.tsx files)
+  if ((targetSurface === 'all' || targetSurface === 'source') && opts.scope.sourcemaps !== false && inputs.reconstructedSourceFiles) {
+    let srcHits = 0;
+    for (const [path, sf] of inputs.reconstructedSourceFiles) {
+      if (srcHits >= 60 || out.length >= limit) break;
+      if (!sf.content) continue;
+      const matches = findMatchesInText(sf.content, q, opts.mode, 2);
+      for (const m of matches) {
+        const snip = snippet(sf.content, m.at, m.len);
+        let line = 1;
+        for (let j = 0; j < m.at; j++) if (sf.content.charCodeAt(j) === 10) line++;
+        out.push({
+          recordId: syntheticId--,
+          text: snip.context,
+          score: m.score,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: `#${path}`,
+            resourceKind: 'source-map',
+            route: '/',
+            method: 'sourcemap-ref',
+            detail: `source-code (${path})`,
+            line,
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+        srcHits++;
+        if (srcHits >= 60 || out.length >= limit) break;
+      }
+    }
+  }
+
+  // 5. Search Client State (Zustand, Redux, Pinia, Identities, Tokens)
+  if ((targetSurface === 'all' || targetSurface === 'state') && inputs.harvestData) {
+    const hd = inputs.harvestData;
+    for (const s of (hd.stores || [])) {
+      const storeStr = `${s.name}: ${s.keys.join(', ')}`;
+      const sMatches = findMatchesInText(storeStr, q, opts.mode, 1);
+      if (sMatches.length) {
+        const snip = snippet(storeStr, sMatches[0].at, sMatches[0].len);
+        out.push({
+          recordId: syntheticId--,
+          text: storeStr,
+          score: 0.95,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: `[state:${s.name}]`,
+            resourceKind: 'other-text',
+            route: '/',
+            method: 'live-fetch',
+            detail: `client-store (${s.name})`,
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+      }
+    }
+    for (const id of (hd.identities || [])) {
+      const idStr = `${id.key}: ${id.val}`;
+      const idMatches = findMatchesInText(idStr, q, opts.mode, 1);
+      if (idMatches.length) {
+        const snip = snippet(idStr, idMatches[0].at, idMatches[0].len);
+        out.push({
+          recordId: syntheticId--,
+          text: idStr,
+          score: 0.96,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: `[state:${id.source}]`,
+            resourceKind: 'other-text',
+            route: '/',
+            method: 'live-fetch',
+            detail: `user-identity (${id.key})`,
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+      }
+    }
+    for (const tok of (hd.tokens || [])) {
+      const tokStr = `${tok.key}: ${tok.val}`;
+      const tokMatches = findMatchesInText(tokStr, q, opts.mode, 1);
+      if (tokMatches.length) {
+        const snip = snippet(tokStr, tokMatches[0].at, tokMatches[0].len);
+        out.push({
+          recordId: syntheticId--,
+          text: tokStr,
+          score: 0.96,
+          mode: opts.mode,
+          prov: {
+            resourceUrl: `[state:${tok.source}]`,
+            resourceKind: 'other-text',
+            route: '/',
+            method: 'live-fetch',
+            detail: `token-credential (${tok.key})`,
+          },
+          context: snip.context,
+          matchStart: snip.matchStart,
+          matchLen: snip.matchLen,
+          marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
+        });
+      }
+    }
+  }
+
+  // 6. Pre-indexed AST tokens (RamIndex)
+  if (targetSurface === 'all' && inputs.index && out.length < limit) {
+    const idxHits = searchIndex(inputs.index, q, opts);
+    for (const h of idxHits) {
+      out.push(h);
+      if (out.length >= limit) break;
+    }
+  }
+
+  // Deduplicate by text + resourceUrl
+  const seen = new Set<string>();
+  const deduped: SearchResult[] = [];
+  for (const r of out) {
+    const key = `${r.prov.resourceUrl}::${r.context}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(r);
+    }
+  }
+  deduped.sort((a, b) => b.score - a.score);
+  return deduped.slice(0, limit);
 }
 
 /**
