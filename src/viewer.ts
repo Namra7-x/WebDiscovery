@@ -118,7 +118,11 @@ export function detectContentCategory(
     return { category: 'xml', mime: mime || 'application/xml', isMedia: false, isBinary: false, canDecompress: false, canBeautify: true, label: 'XML document' };
   }
   if (mime.includes('gzip') || u.endsWith('.gz') || u.endsWith('.tgz')) {
-    return { category: 'gzip', mime: mime || 'application/gzip', isMedia: false, isBinary: true, canDecompress: true, canBeautify: false, label: 'Gzip archive' };
+    if (hasMagic(bytes, [0x1f, 0x8b]) || (!sampleText && rawBytes && rawBytes.length > 0)) {
+      return { category: 'gzip', mime: mime || 'application/gzip', isMedia: false, isBinary: true, canDecompress: true, canBeautify: false, label: 'Gzip archive' };
+    }
+    // If the body is already uncompressed plain text/JSON (e.g. Chrome network API auto-decompression),
+    // do not force 'gzip' category; allow falling through to JSON/JS/HTML content sniff below.
   }
   if (mime.includes('zip') || u.endsWith('.zip')) {
     return { category: 'zip', mime: mime || 'application/zip', isMedia: false, isBinary: true, canDecompress: true, canBeautify: false, label: 'ZIP archive' };
@@ -459,6 +463,13 @@ export async function decompressPayload(
 ): Promise<{ text?: string; bytes?: Uint8Array; format: string; error?: string }> {
   const bytes = toUint8Array(data);
   const isGzip = hasMagic(bytes, [0x1f, 0x8b]);
+  const isDeflate = hasMagic(bytes, [0x78, 0x01]) || hasMagic(bytes, [0x78, 0x9c]) || hasMagic(bytes, [0x78, 0xda]);
+
+  if (!isGzip && !isDeflate) {
+    const text = typeof data === 'string' ? data : new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    return { text, bytes, format: 'plain' };
+  }
+
   const format = isGzip ? 'gzip' : 'deflate';
 
   const DS = (globalThis as unknown as { DecompressionStream?: new (f: string) => TransformStream }).DecompressionStream;

@@ -299,6 +299,34 @@ button.badge.kind { min-height: 36px; min-width: 36px; }
 .st-ok { color: var(--acc-deep); font-weight: 700; }
 .st-err { color: var(--red-t); font-weight: 700; }
 .st-mid { color: var(--amber-t); font-weight: 700; }
+
+/* ---------- analyze stats deck & cards ---------- */
+.ana-stats-deck {
+  display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0;
+}
+.ana-stat-card {
+  flex: 1 1 110px; background: var(--strip);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 8px 12px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; cursor: pointer;
+  transition: all 0.15s ease; min-height: 48px;
+}
+.ana-stat-card:hover { background: var(--strip-2); border-color: var(--acc); }
+.ana-stat-card.active { border-color: var(--acc); background: var(--strip-2); box-shadow: 0 0 0 1px var(--acc); }
+.ana-stat-num { font: 700 18px var(--mono); line-height: 1.2; }
+.ana-stat-lbl { font: 600 11px var(--sans); color: var(--mut); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+.ana-finding-card {
+  background: var(--strip); border-bottom: 1px solid var(--line);
+  padding: 10px 14px; display: flex; flex-direction: column; gap: 4px;
+}
+.ana-finding-card:hover { background: var(--strip-2); }
+.ana-val-box {
+  font: 12px var(--mono); background: var(--paper);
+  border: 1px solid var(--line); padding: 7px 10px;
+  border-radius: 3px; word-break: break-all; white-space: pre-wrap;
+  color: var(--ink); user-select: all;
+}
+
 #secList .grp { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: var(--strip-2); border-bottom: 2px solid var(--line); padding: 8px 12px; }
 #secList .grp b { font-size: 13px; color: var(--ink); }
 #secList .grp [data-act="atoggle"] { min-width: 36px; min-height: 36px; font-size: 15px; }

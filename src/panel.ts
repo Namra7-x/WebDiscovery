@@ -39,6 +39,7 @@ import type { ApiKind } from './exposure.js';
 import type { SearchResult, Severity, TextRecord } from './types.js';
 import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, probeOrphanSourceMapCandidates, type SourceMapFile } from './sourcemap.js';
 import { dissectWasmBinary } from './wasm.js';
+import { buildAiDossier, sanitizeForAi, sanitizeHeadersForAi, type AiDossierInput, type AiDossierOutput } from './ai-dossier.js';
 import {
   DEFAULT_SETTINGS, defaultScope,
   type DiscoveryMethod, type NetEntry, type ResourceKind, type ResourceMeta,
@@ -3266,12 +3267,24 @@ async function viewUrl(url: string, forceLive = false): Promise<void> {
 
   // Handle Decompression (Gzip / Deflate)
   if (category === 'gzip' && rawText) {
-    const decomp = await decompressPayload(rawText);
-    if (decomp.text && !decomp.error) {
-      decompressedNote = `decompressed ${decomp.format} (${formatBytes(rawText.length)} → ${formatBytes(decomp.text.length)})`;
-      rawText = decomp.text;
-      const subDet = detectContentCategory(targetUrl, mime, rawText);
-      category = subDet.category;
+    try {
+      const decomp = await decompressPayload(rawText);
+      if (decomp.text && !decomp.error) {
+        if (decomp.format !== 'plain') {
+          decompressedNote = `decompressed ${decomp.format} (${formatBytes(rawText.length)} → ${formatBytes(decomp.text.length)})`;
+        }
+        rawText = decomp.text;
+        const subDet = detectContentCategory(targetUrl, mime, rawText);
+        category = subDet.category;
+      } else {
+        const subDet = detectContentCategory(targetUrl, '', rawText);
+        if (subDet.category !== 'gzip' && subDet.category !== 'binary') {
+          category = subDet.category;
+        }
+      }
+    } catch {
+      const subDet = detectContentCategory(targetUrl, '', rawText);
+      if (subDet.category !== 'gzip') category = subDet.category;
     }
   }
 
@@ -4062,16 +4075,32 @@ function apiClick(e: Event): void {
 }
 
 // ---------- analyze (secret findings) ----------
+let anaActiveFilter = 'ALL';
+let anaSearchQuery = '';
+
 /** Finding family for the Analyze Show filter (rule-prefix based). */
 function anaFamily(f: SecFinding): string {
   try {
+    if (f.rule.startsWith('cloud-config-')) return 'cloud';
+    if (f.rule.startsWith('crypto-') || f.rule === 'ephemeral-oauth-token') return 'crypto';
+    if (f.rule.startsWith('csp-')) return 'csp';
+    if (f.rule.startsWith('postmessage-')) return 'dom';
     if (f.rule.startsWith('fw-')) return 'framework';
     if (f.rule.startsWith('hyg-')) return 'hygiene';
   } catch { /* fall through to secrets */ }
   return 'secrets';
 }
 function anaFamilyLabel(k: string): string {
-  return k === 'framework' ? 'frameworks' : k === 'hygiene' ? 'security & headers' : k === 'secrets' ? 'secrets' : k;
+  switch (k) {
+    case 'cloud': return 'cloud baas';
+    case 'crypto': return 'crypto & oauth';
+    case 'csp': return 'csp & infrastructure';
+    case 'dom': return 'dom & postmessage';
+    case 'framework': return 'frameworks';
+    case 'hygiene': return 'security & headers';
+    case 'secrets': return 'secrets & tokens';
+    default: return k;
+  }
 }
 let anaKind = 'ALL';
 /** Rebuild the Show dropdown with live counts; reset a selection that went empty. */
@@ -4081,13 +4110,37 @@ function syncAnaKindOptions(): void {
   const counts = new Map<string, number>();
   for (const f of secFindings) counts.set(anaFamily(f), (counts.get(anaFamily(f)) ?? 0) + 1);
   if (anaKind !== 'ALL' && (counts.get(anaKind) ?? 0) === 0) anaKind = 'ALL';
-  const order = ['ALL', 'secrets', 'framework', 'hygiene'];
-  const labels: Record<string, string> = { ALL: 'all findings', secrets: 'secrets', framework: 'frameworks', hygiene: 'security & headers' };
-  sel.innerHTML = order.map((k) => {
-    const n = k === 'ALL' ? secFindings.length : (counts.get(k) ?? 0);
-    return `<option value="${k}"${anaKind === k ? ' selected' : ''}>${labels[k]} (${n})</option>`;
-  }).join('');
+  const order = ['ALL', 'secrets', 'cloud', 'crypto', 'csp', 'dom', 'framework', 'hygiene'];
+  const labels: Record<string, string> = {
+    ALL: 'all findings',
+    secrets: 'secrets & tokens',
+    cloud: 'cloud baas',
+    crypto: 'crypto & oauth',
+    csp: 'csp & infra',
+    dom: 'dom & postmessage',
+    framework: 'frameworks',
+    hygiene: 'security & headers',
+  };
+  sel.innerHTML = order
+    .filter((k) => k === 'ALL' || (counts.get(k) ?? 0) > 0)
+    .map((k) => {
+      const n = k === 'ALL' ? secFindings.length : (counts.get(k) ?? 0);
+      return `<option value="${k}"${anaKind === k ? ' selected' : ''}>${labels[k] || k} (${n})</option>`;
+    }).join('');
 }
+
+function findingCategoryBadge(f: SecFinding): string {
+  if (f.rule.startsWith('cloud-config-')) return f.rule.replace('cloud-config-', '').toUpperCase();
+  if (f.rule === 'crypto-cleartext-or-key') return 'CRYPTO TAP';
+  if (f.rule === 'ephemeral-oauth-token') return 'OAUTH TOKEN';
+  if (f.rule === 'csp-internal-domain') return 'CSP INTERNAL';
+  if (f.rule === 'csp-cloud-bucket') return 'S3/CLOUD BUCKET';
+  if (f.rule.startsWith('postmessage-')) return 'POSTMESSAGE';
+  if (f.rule.startsWith('fw-')) return 'FRAMEWORK';
+  if (f.rule.startsWith('hyg-')) return 'HYGIENE';
+  return 'SECRET';
+}
+
 const SEC_BLURB: Record<Severity, string> = {
   critical: 'critical — likely live credentials or private keys; rotate immediately if exposed',
   high: 'high — sensitive tokens or session secrets; verify and revoke if leaked',
@@ -4100,14 +4153,63 @@ function renderAnalyze(): void {
   const pill = document.getElementById('cAnalyze');
   if (pill) pill.textContent = String(secFindings.length);
   syncAnaKindOptions();
+
+  // 1. Update quick stats metrics deck
+  const critCount = secFindings.filter((f) => f.sev === 'critical').length;
+  const highCount = secFindings.filter((f) => f.sev === 'high').length;
+  const medCount = secFindings.filter((f) => f.sev === 'medium').length;
+  const cloudCount = secFindings.filter((f) => f.rule.startsWith('cloud-config-')).length;
+  const cryptoCount = secFindings.filter((f) => f.rule.startsWith('crypto-') || f.rule === 'ephemeral-oauth-token').length;
+  const cspCount = secFindings.filter((f) => f.rule.startsWith('csp-')).length;
+
+  const elCrit = document.getElementById('anaStatCrit');
+  if (elCrit) elCrit.textContent = String(critCount);
+  const elHigh = document.getElementById('anaStatHigh');
+  if (elHigh) elHigh.textContent = String(highCount);
+  const elMed = document.getElementById('anaStatMed');
+  if (elMed) elMed.textContent = String(medCount);
+  const elCloud = document.getElementById('anaStatCloud');
+  if (elCloud) elCloud.textContent = String(cloudCount);
+  const elCrypto = document.getElementById('anaStatCrypto');
+  if (elCrypto) elCrypto.textContent = String(cryptoCount);
+  const elCsp = document.getElementById('anaStatCsp');
+  if (elCsp) elCsp.textContent = String(cspCount);
+
+  document.querySelectorAll('.ana-stat-card').forEach((el) => {
+    const f = (el as HTMLElement).dataset.anaFilter;
+    if (f === anaActiveFilter) el.classList.add('active');
+    else el.classList.remove('active');
+  });
+
   const box = document.getElementById('secList');
   if (!box) return;
-  const view = anaKind === 'ALL' ? secFindings : secFindings.filter((f) => anaFamily(f) === anaKind);
+
+  // 2. Filter view by active deck filter, family dropdown, and search query
+  let view = secFindings;
+  if (anaActiveFilter === 'critical') view = view.filter((f) => f.sev === 'critical');
+  else if (anaActiveFilter === 'high') view = view.filter((f) => f.sev === 'high');
+  else if (anaActiveFilter === 'medium') view = view.filter((f) => f.sev === 'medium');
+  else if (anaActiveFilter === 'cloud') view = view.filter((f) => f.rule.startsWith('cloud-config-'));
+  else if (anaActiveFilter === 'crypto') view = view.filter((f) => f.rule.startsWith('crypto-') || f.rule === 'ephemeral-oauth-token');
+  else if (anaActiveFilter === 'csp') view = view.filter((f) => f.rule.startsWith('csp-'));
+  else if (anaKind !== 'ALL') view = view.filter((f) => anaFamily(f) === anaKind);
+
+  if (anaSearchQuery) {
+    const sq = anaSearchQuery.toLowerCase();
+    view = view.filter((f) =>
+      f.text.toLowerCase().includes(sq) ||
+      (f.label && f.label.toLowerCase().includes(sq)) ||
+      f.rule.toLowerCase().includes(sq) ||
+      (f.prov?.resourceUrl && f.prov.resourceUrl.toLowerCase().includes(sq))
+    );
+  }
+
   const total = view.length;
   const cap = secShowAll ? Math.min(view.length, 2000) : 150;
   renderedSec.length = 0;
   renderedAnaGroups.clear();
   let html = '';
+
   for (const sev of ['critical', 'high', 'medium', 'info'] as Severity[]) {
     const items = view.filter((f) => f.sev === sev);
     if (!items.length) continue;
@@ -4130,27 +4232,34 @@ function renderAnalyze(): void {
         renderedSec.push(f);
         const p = f.prov;
         const loc = p.line && p.line > 0 ? ` · L${p.line}${p.column ? ':' + p.column : ''}` : '';
-        const rule = f.label && f.label !== f.rule ? `${f.rule} · ${f.label}` : f.rule;
-        const clean = displayNameFor(f.text, 120);
-        html += `<div class="res"><div class="head"><span class="badge sev-${f.sev}">${esc(f.sev)}</span>`
-          + `<span class="badge" title="rule">${esc(rule)}</span>`
-          + `<span class="orig" title="${esc(f.text.slice(0, 400))}">${esc(clean)}</span>`
-          + `<span class="open"><button data-act="open" data-i="${i}" title="Open source">Open</button> <button data-act="copy" data-i="${i}" title="Copy finding">Copy</button></span></div>`
-          + `<div class="prov">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div></div>`;
+        const catBadge = findingCategoryBadge(f);
+        const snippetText = f.text.length > 500 ? f.text.slice(0, 500) + '...' : f.text;
+        html += `<div class="ana-finding-card">`
+          + `<div class="head">`
+          + `<span class="badge sev-${f.sev}">${esc(f.sev.toUpperCase())}</span>`
+          + `<span class="badge kind" title="Category">${esc(catBadge)}</span>`
+          + `<b>${esc(f.label || f.rule)}</b>`
+          + `<span class="open">`
+          + `<button data-act="open" data-i="${i}" title="View source in Universal Viewer">View</button>`
+          + `<button data-act="copy" data-i="${i}" title="Copy finding value">Copy</button>`
+          + `</span></div>`
+          + `<div class="ana-val-box">${esc(snippetText)}</div>`
+          + `<div class="muted small">${esc(sourceLabel(p.resourceUrl))} · route ${esc(p.route)} · via ${esc(p.method)}${loc}</div>`
+          + `</div>`;
       }
       if (renderedSec.length >= cap) break;
     }
     if (renderedSec.length >= cap) break;
   }
-  if (!html) html = anaKind === 'ALL'
+  if (!html) html = anaKind === 'ALL' && !anaSearchQuery && anaActiveFilter === 'ALL'
     ? '<span class="muted">no secret findings — enable “scan for exposed secrets” in Settings, then browse or Deep Scan</span>'
-    : `<span class="muted">no ${anaFamilyLabel(anaKind)} findings in view — set Show to all findings</span>`;
+    : `<span class="muted">no findings matching current filter (${anaActiveFilter !== 'ALL' ? anaActiveFilter : anaKind !== 'ALL' ? anaFamilyLabel(anaKind) : anaSearchQuery}) — clear filter to see all</span>`;
   else if (total > renderedSec.length) html += secShowAll
     ? `<div class="muted small">showing ${renderedSec.length} of ${total} findings (Show-all on: full bounded list) — Copy findings exports this view</div>`
     : `<div class="muted small">showing ${renderedSec.length} of ${total} findings (bounded render) — Copy findings exports this view</div>`;
   box.innerHTML = html;
   const sc = document.getElementById('secCount');
-  if (sc) sc.textContent = `${total} findings${anaKind !== 'ALL' ? ` · ${anaFamilyLabel(anaKind)} only (of ${secFindings.length})` : ''} · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
+  if (sc) sc.textContent = `${total} findings${anaActiveFilter !== 'ALL' ? ` · [filter: ${anaActiveFilter}]` : ''}${anaKind !== 'ALL' ? ` · ${anaFamilyLabel(anaKind)} only` : ''}${anaSearchQuery ? ` · query: "${anaSearchQuery}"` : ''} · ${expoAdded} via exposure${secDropped ? ` · ${secDropped} dropped at cap` : ''}${secShowAll ? ' · Show-all on' : ''}`;
   const ssb = document.getElementById('btnSecShowAll');
   if (ssb) {
     ssb.textContent = secShowAll ? 'Show less' : 'Show all';
@@ -4604,6 +4713,57 @@ function exportTargetWordlist(): void {
     diag(`Export Wordlist: ${sortedWords.length} words + ${sortedEndpoints.length} endpoints exported`);
   } catch (err) {
     diag(`Export Wordlist failed: ${String(err).slice(0, 140)}`);
+  }
+}
+
+/**
+ * Exports complete structured AI-ready session context (endpoints, schemas,
+ * sanitized request/response bodies, cloud BaaS, CSP, leaks) with all personal
+ * cookies, login bearer tokens, Google session cookies, and emails automatically
+ * redacted.
+ */
+function exportAiDossierFile(): void {
+  try {
+    const input: AiDossierInput = {
+      origin: sessionOrigin,
+      frameworks: [],
+      routes: [...routes.keys()],
+      netEntries: netEntries.slice(0, 500).map((n) => ({
+        method: n.method,
+        url: n.url,
+        status: n.status,
+        mime: n.mime,
+        reqHeaders: n.reqHeaders,
+        resHeaders: n.resHeaders,
+        reqBody: n.reqBody,
+      })),
+      rawBodies,
+      apiSchemas: discoveredApiSchemas,
+      serverActions: [...discoveredServerActions.values()],
+      graphqlOps: [...discoveredGraphQLOps.values()],
+      cloudConfigs: discoveredCloudConfigs,
+      cspReport: {
+        domains: [...discoveredCspDomains],
+        internalDomains: [...discoveredInternalDomains],
+        cloudBuckets: [...discoveredCloudBuckets],
+      },
+      findings: secFindings.slice(0, 500),
+    };
+
+    const dossier = buildAiDossier(input);
+    const jsonStr = JSON.stringify(dossier, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const hostTag = (sessionOrigin || 'session').replace(/https?:\/\//i, '').replace(/[^a-z0-9]+/gi, '-');
+    a.download = `deepscope-ai-dossier-${hostTag}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    diag(`Export AI Dossier: ${dossier.endpoints.length} endpoints, ${dossier.securityFindings.length} findings (personal cookies & logins redacted)`);
+  } catch (err) {
+    diag(`Export AI Dossier failed: ${String(err).slice(0, 140)}`);
   }
 }
 
@@ -5241,6 +5401,20 @@ function wire(): void {
     try { anaKind = (document.getElementById('anaKind') as HTMLSelectElement).value; } catch { anaKind = 'ALL'; }
     renderAnalyze();
   });
+  on('anaSearch', 'input', (e) => {
+    anaSearchQuery = (e.target as HTMLInputElement).value;
+    renderAnalyze();
+  });
+  document.getElementById('anaStatsDeck')?.addEventListener('click', (e) => {
+    const card = (e.target as HTMLElement).closest('.ana-stat-card') as HTMLElement | null;
+    if (!card) return;
+    const filter = card.dataset.anaFilter || 'ALL';
+    anaActiveFilter = anaActiveFilter === filter ? 'ALL' : filter;
+    renderAnalyze();
+  });
+  on('btnAnaAiDossier', 'click', exportAiDossierFile);
+  on('btnApisAiDossier', 'click', exportAiDossierFile);
+  on('btnOverviewAiDossier', 'click', exportAiDossierFile);
   on('secList', 'click', secClick);
   on('homeStorageSel', 'change', (e) => {
     const v = (e.target as HTMLSelectElement).value;

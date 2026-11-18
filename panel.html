@@ -52,7 +52,7 @@
         <section class="card" aria-labelledby="h-session"><h3 id="h-session">Session</h3><div id="sessionInfo" class="mono small"></div>
           <div id="sessionStrip" class="torn-strip" data-state="live" role="status" aria-label="Capture timeline"></div>
           <details id="storageDetails"><summary>Storage details</summary><div id="storageBody" class="mono small"></div></details>
-          <div class="row"><button id="btnRecapture">Recapture / reload</button><button id="btnReindex">Reindex</button><button id="btnMemClean">Memory cleanup</button><button id="btnExport">Export JSON</button></div>
+          <div class="row"><button id="btnRecapture">Recapture / reload</button><button id="btnReindex">Reindex</button><button id="btnMemClean">Memory cleanup</button><button id="btnExport">Export JSON</button><button id="btnOverviewAiDossier" title="Export complete structured AI-ready session context (endpoints, schemas, sanitized request/response bodies, leaks) with personal cookies, auth, and logins safely redacted">Export AI Dossier</button></div>
           <div class="row"><button id="btnSaveSession" class="primary" title="Save this session to one .dsz file (explicit only)">Save session</button><button id="btnOpenSession" title="Open a saved .dsz session file">Open session</button><input id="fileOpenSession" type="file" accept=".dsz,.json,application/gzip,application/json" class="hidden" aria-label="Open session file" /><button id="btnHarvestState" title="Harvest client-side memory, state stores, auth tokens, and cached queries">Harvest State</button></div>
           <p class="muted small">RAM-only: everything below lives in this panel's memory and is destroyed when DevTools closes. Export only happens when you click it.</p>
         </section>
@@ -131,10 +131,44 @@
       <div class="table-wrap"><table id="netTable"><caption class="muted small">Observed requests grouped by domain.</caption><thead><tr><th scope="col">Method</th><th scope="col">URL</th><th scope="col">Status</th><th scope="col">MIME</th><th scope="col">Route</th><th scope="col">Body</th><th scope="col">Note</th><th scope="col">Actions</th></tr></thead><tbody></tbody></table></div>
     </section>
     <section id="tab-analyze" class="tab" role="tabpanel" aria-labelledby="h-analyze">
-      <h2 id="h-analyze">Analyze</h2>
-      <p class="muted small">Possible secrets found in captured text, grouped by severity — critical means likely live credentials, high sensitive tokens, medium review-worthy, info low-risk context. All analysis stays local in this panel's RAM.</p>
-      <div class="row"><label for="anaKind">Show</label><select id="anaKind" title="Filter findings by family"><option value="ALL">all findings</option></select><button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button><button id="btnSecShowAll" title="Lift the 150-row render cap" aria-expanded="false">Show all</button><span id="secCount" class="muted small" role="status" aria-live="polite"></span></div>
-      <div id="secList" class="results"></div>
+      <h2 id="h-analyze">Analyze & Security Findings</h2>
+      <p class="muted small">Real-time leak detector: crypto cleartext, ephemeral OAuth tokens, internal CSP domains, Cloud BaaS credentials, and postMessage warnings. RAM-only and private.</p>
+      <div class="ana-stats-deck" id="anaStatsDeck">
+        <button class="ana-stat-card" data-ana-filter="critical" title="Filter to Critical severity findings">
+          <span class="ana-stat-num st-err" id="anaStatCrit">0</span>
+          <span class="ana-stat-lbl">Critical</span>
+        </button>
+        <button class="ana-stat-card" data-ana-filter="high" title="Filter to High severity findings">
+          <span class="ana-stat-num st-mid" id="anaStatHigh">0</span>
+          <span class="ana-stat-lbl">High</span>
+        </button>
+        <button class="ana-stat-card" data-ana-filter="medium" title="Filter to Medium severity findings">
+          <span class="ana-stat-num st-ok" id="anaStatMed">0</span>
+          <span class="ana-stat-lbl">Medium</span>
+        </button>
+        <button class="ana-stat-card" data-ana-filter="cloud" title="Filter to Cloud BaaS configs (Firebase, Supabase, Sentry)">
+          <span class="ana-stat-num" id="anaStatCloud">0</span>
+          <span class="ana-stat-lbl">Cloud BaaS</span>
+        </button>
+        <button class="ana-stat-card" data-ana-filter="crypto" title="Filter to Crypto Tap events & cleartext">
+          <span class="ana-stat-num" id="anaStatCrypto">0</span>
+          <span class="ana-stat-lbl">Crypto Taps</span>
+        </button>
+        <button class="ana-stat-card" data-ana-filter="csp" title="Filter to CSP internal domains & storage buckets">
+          <span class="ana-stat-num" id="anaStatCsp">0</span>
+          <span class="ana-stat-lbl">CSP & Infra</span>
+        </button>
+      </div>
+      <div class="row" style="margin-top:8px; flex-wrap:wrap; gap:8px; align-items:center;">
+        <label for="anaKind">Family</label>
+        <select id="anaKind" title="Filter findings by family"><option value="ALL">all findings</option></select>
+        <input type="text" id="anaSearch" placeholder="Filter findings (e.g. firebase, key, token, admin)..." style="min-width:220px; flex:1;" title="Real-time filter for findings text, provider, or URL" />
+        <button id="btnSecCopy" title="Copy findings (up to 100 items)">Copy findings</button>
+        <button id="btnSecShowAll" title="Lift the 150-row render cap" aria-expanded="false">Show all</button>
+        <button id="btnAnaAiDossier" title="Export complete structured AI-ready session context (endpoints, schemas, sanitized request/response bodies, leaks) with personal cookies, auth, and logins safely redacted">Export AI Dossier</button>
+        <span id="secCount" class="muted small" role="status" aria-live="polite"></span>
+      </div>
+      <div id="secList" class="results" style="margin-top:8px;"></div>
     </section>
     <section id="tab-apis" class="tab" role="tabpanel" aria-labelledby="h-apis">
       <h2 id="h-apis">APIs</h2>
@@ -145,6 +179,7 @@
         <button id="btnApisOpenApi" title="Download observed endpoints as openapi.json">Export openapi.json</button>
         <button id="btnApisGraphQL" title="Download discovered GraphQL operations as operations.graphql">Export GraphQL</button>
         <button id="btnApisWordlist" title="Export all discovered endpoints, routes, paths, parameters, and headers as a target-specific custom wordlist">Export Wordlist</button>
+        <button id="btnApisAiDossier" title="Export complete structured AI-ready session context (endpoints, schemas, sanitized request/response bodies, leaks) with personal cookies, auth, and logins safely redacted">Export AI Dossier</button>
         <button data-wrap-table="apisTable" aria-pressed="false" title="Wrap rows to show full URLs (default: clipped one-liners)">Wrap</button>
         <span id="apiCount" class="muted small" role="status" aria-live="polite"></span>
       </div>

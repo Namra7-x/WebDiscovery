@@ -20,6 +20,7 @@ import { findFrameworkFindings } from '../dist/framework.js';
 import { findHygieneFindings } from '../dist/hygiene.js';
 import { parseSourceMap, resolveSourceUrl, buildSourceMapZip, crc32, probeOrphanSourceMapCandidates } from '../dist/sourcemap.js';
 import { dissectWasmBinary } from '../dist/wasm.js';
+import { buildAiDossier, sanitizeForAi, sanitizeHeadersForAi } from '../dist/ai-dossier.js';
 import { MemoryLedger } from '../dist/memory.js';
 import { CaptureStore } from '../dist/store.js';
 import { sanitizeReplayHeaders, truncateReplayBody, matchInterceptRule } from '../dist/replay.js';
@@ -1221,6 +1222,82 @@ ok('Cloud BaaS: Extract Firebase, Supabase, and Sentry Configs', () => {
   assert.equal(supa.details.url, 'https://xyzcompany.supabase.co');
   assert.ok(sentry);
   assert.ok(sentry.details.dsn.includes('sentry.io'));
+});
+
+// 71. AI Dossier Privacy & Sanitization Engine
+ok('AI Export: Privacy & Sensitive Data Redaction Engine', () => {
+  const sensitiveText = 'User logged in: alice.smith+dev@gmail.com with password: "superSecretPassword123!" and token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.xyz';
+  const clean = sanitizeForAi(sensitiveText);
+  assert.ok(!clean.includes('alice.smith+dev@gmail.com'));
+  assert.ok(clean.includes('[USER_EMAIL_REDACTED]'));
+  assert.ok(!clean.includes('superSecretPassword123!'));
+  assert.ok(clean.includes('[REDACTED_SECRET]'));
+  assert.ok(!clean.includes('eyJhbGciOiJIUzI1NiJ9'));
+  assert.ok(clean.includes('[REDACTED_JWT]'));
+
+  const headers = {
+    'Cookie': 'SID=googleSessionToken123456789; HSID=secretHsid; user_id=42',
+    'Set-Cookie': '__Secure-3PSID=xyzToken987654321; Path=/',
+    'Authorization': 'Bearer ya29.a0AfH6SM-personalGoogleAccessToken123456789',
+    'Content-Type': 'application/json',
+  };
+  const cleanHeaders = sanitizeHeadersForAi(headers);
+  assert.equal(cleanHeaders['Cookie'], '[REDACTED_COOKIES]');
+  assert.equal(cleanHeaders['Set-Cookie'], '[REDACTED_COOKIES]');
+  assert.equal(cleanHeaders['Authorization'], 'Bearer [REDACTED_AUTH_TOKEN]');
+  assert.equal(cleanHeaders['Content-Type'], 'application/json');
+});
+
+// 72. Full AI Dossier JSON Generation
+ok('AI Export: Build Structured AI Dossier with Endpoints & Leaks', () => {
+  const dossier = buildAiDossier({
+    origin: 'https://api.target.com',
+    frameworks: ['Next.js 15'],
+    routes: ['/api/v1/users', '/api/v1/admin/uncalled', '/about'],
+    netEntries: [
+      {
+        method: 'POST',
+        url: 'https://api.target.com/api/v1/users/123',
+        status: 200,
+        mime: 'application/json',
+        reqHeaders: { 'Authorization': 'Bearer secret123456789012345', 'Content-Type': 'application/json' },
+        resHeaders: { 'Content-Type': 'application/json' },
+        reqBody: JSON.stringify({ email: 'target.user@company.com', name: 'Bob' }),
+      }
+    ],
+    rawBodies: new Map([
+      ['https://api.target.com/api/v1/users/123', JSON.stringify({ id: 123, email: 'target.user@company.com', name: 'Bob', internal_hash: 'abc', role: 'admin' })]
+    ]),
+    serverActions: [{ id: 'action_hash_1234', name: 'updateProfile' }],
+    graphqlOps: [{ name: 'GetUser', type: 'query' }],
+    cloudConfigs: [{ provider: 'firebase', details: { apiKey: 'AIzaSyD-123' } }],
+    cspReport: {
+      domains: ['api.target.com', 'vault.internal'],
+      internalDomains: ['vault.internal'],
+      cloudBuckets: ['data.s3.amazonaws.com'],
+    },
+    findings: [
+      { rule: 'jwt', sev: 'high', label: 'Exposed JWT', text: 'token for admin@gmail.com' }
+    ]
+  });
+
+  assert.equal(dossier.$schema, 'DeepScope-AI-Dossier-v1');
+  assert.equal(dossier.meta.targetOrigin, 'https://api.target.com');
+  assert.equal(dossier.summary.calledEndpoints, 1);
+  assert.equal(dossier.summary.uncalledEndpoints, 2); // /api/v1/users and /api/v1/admin/uncalled (not /about)
+  assert.equal(dossier.serverActions.length, 1);
+  assert.equal(dossier.cloudBaaS.length, 1);
+  assert.equal(dossier.infrastructure.internalDomains[0], 'vault.internal');
+
+  // Verify personal email was redacted from body & finding
+  const ep = dossier.endpoints.find(e => e.method === 'POST');
+  assert.ok(ep);
+  assert.equal(ep.normalizedPath, '/api/v1/users/{id}');
+  assert.ok(ep.schemaDiff);
+  assert.ok(ep.schemaDiff.responseOnlyFields.includes('internal_hash'));
+  assert.ok(!JSON.stringify(ep.requestSample).includes('target.user@company.com'));
+  assert.ok(JSON.stringify(ep.requestSample).includes('[USER_EMAIL_REDACTED]'));
+  assert.ok(!JSON.stringify(dossier.securityFindings).includes('admin@gmail.com'));
 });
 
 console.log(`\n${pass} checks passed.`);
