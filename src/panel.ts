@@ -2029,16 +2029,29 @@ function renderSearchResults(q: string, mode: string, dt: number): void {
     const loc = p.line && p.line > 0 ? `L${p.line}${p.column ? ':' + p.column : ''}` : '';
     const jp = p.jsonPath ? `<span class="badge" title="JSON path">${esc(p.jsonPath)}</span>` : '';
     const kindBadge = `<span class="badge kind">${esc(p.detail && p.detail !== p.resourceKind ? `${p.resourceKind}/${p.detail}` : p.resourceKind)}</span>`;
-    const name = esc(displayNameFor(r.text, 120));
     const from = esc(sourceLabel(p.resourceUrl));
     const hl = renderHighlighted(r.context, r.marks ?? [[r.matchStart, r.matchStart + Math.max(1, r.matchLen)]]);
-    const sub = `${kindBadge} <span title="${esc(p.resourceUrl)}">${from}</span> · route ${esc(p.route)} · via ${esc(p.method)}${loc ? ` · ${loc}` : ''}${p.initiator ? ` · init ${esc(shortLabel(p.initiator))}` : ''}`;
     return `<div class="res" data-rid="${r.recordId}">`
-      + `<div class="head"><span class="score">${r.score.toFixed(3)}</span><span class="orig" title="${esc(r.text.slice(0, 400))}">${name}</span>`
-      + `<div class="res-acts"><button class="view-hit" data-view-rec="${r.recordId}" title="View in Universal Viewer">View</button>`
-      + `<button class="open" data-open="${r.recordId}" title="Open source: ${esc(p.resourceUrl)}${loc ? ' @ ' + loc : ''}">Open ↗</button></div></div>`
-      + `<div class="ctx-line">${hl}</div>`
-      + `<div class="prov">${sub} ${jp}</div></div>`;
+      + `<div class="res-head">`
+      +   `<div class="res-title-group">`
+      +     `${kindBadge}`
+      +     `<span class="res-url" title="${esc(p.resourceUrl)}">${from}</span>`
+      +     `${loc ? `<span class="res-loc">${loc}</span>` : ''}`
+      +     `${jp}`
+      +   `</div>`
+      +   `<div class="res-acts">`
+      +     `<button class="view-hit" data-view-rec="${r.recordId}" title="View in Universal Viewer">View</button>`
+      +     `<button class="open" data-open="${r.recordId}" title="Open source: ${esc(p.resourceUrl)}${loc ? ' @ ' + loc : ''}">Open ↗</button>`
+      +   `</div>`
+      + `</div>`
+      + `<div class="res-snippet"><div class="res-code">${hl}</div></div>`
+      + `<div class="res-meta">`
+      +   `<span>route <b>${esc(p.route || '/')}</b></span>`
+      +   `<span>via <b>${esc(p.method)}</b></span>`
+      +   `${p.initiator ? `<span>init ${esc(shortLabel(p.initiator))}</span>` : ''}`
+      +   `<span class="res-score">match ${(r.score * 100).toFixed(0)}%</span>`
+      + `</div>`
+      + `</div>`;
   }).join('');
 }
 
@@ -2151,7 +2164,7 @@ function runSearch(): void {
 /** Render escaped context with ALL fuzzy spans wrapped in <mark>. */
 function renderHighlighted(context: string, marks: Array<[number, number]>): string {
   const sorted = [...marks].filter(([s, e]) => e > s).sort((a, b) => a[0] - b[0]).slice(0, 8);
-  if (!sorted.length) return `<span class="ctx">${esc(context)}</span>`;
+  if (!sorted.length) return esc(context);
   let html = '';
   let cur = 0;
   for (const [s, e] of sorted) {
@@ -2162,7 +2175,7 @@ function renderHighlighted(context: string, marks: Array<[number, number]>): str
     cur = b;
   }
   if (cur < context.length) html += esc(context.slice(cur));
-  return `<span class="ctx">${html}</span>`;
+  return html;
 }
 
 /** "where it came from": host + short path (keeps query string when short). */
