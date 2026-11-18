@@ -173,7 +173,7 @@ function findMatchesInText(
   text: string,
   query: string,
   mode: SearchMode,
-  maxMatches = 5,
+  maxMatches = 10,
 ): Array<{ at: number; len: number; score: number }> {
   if (!text || !query) return [];
   const results: Array<{ at: number; len: number; score: number }> = [];
@@ -255,11 +255,10 @@ export function searchAllSurfaces(
 
   // 1. Search Response Bodies (rawBodies: HTML home page, API JSON, scripts, text)
   if ((targetSurface === 'all' || targetSurface === 'body') && opts.scope.resBody !== false && inputs.rawBodies) {
-    let bodyHits = 0;
     for (const [url, bodyText] of inputs.rawBodies) {
-      if (bodyHits >= 100 || out.length >= limit) break;
+      if (out.length >= limit) break;
       if (!bodyText || typeof bodyText !== 'string') continue;
-      const matches = findMatchesInText(bodyText, q, opts.mode, 3);
+      const matches = findMatchesInText(bodyText, q, opts.mode, 10);
       for (const m of matches) {
         const snip = snippet(bodyText, m.at, m.len);
         let line = 1;
@@ -288,19 +287,17 @@ export function searchAllSurfaces(
           matchLen: snip.matchLen,
           marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
         });
-        bodyHits++;
-        if (bodyHits >= 100 || out.length >= limit) break;
+        if (out.length >= limit) break;
       }
     }
   }
 
   // 2. Search Request Payloads (netEntries.reqBody: sent POST/PUT/PATCH data)
   if ((targetSurface === 'all' || targetSurface === 'req') && opts.scope.reqBody !== false && inputs.netEntries) {
-    let reqHits = 0;
     for (const entry of inputs.netEntries) {
-      if (reqHits >= 50 || out.length >= limit) break;
+      if (out.length >= limit) break;
       if (!entry.reqBody) continue;
-      const matches = findMatchesInText(entry.reqBody, q, opts.mode, 2);
+      const matches = findMatchesInText(entry.reqBody, q, opts.mode, 10);
       for (const m of matches) {
         const snip = snippet(entry.reqBody, m.at, m.len);
         out.push({
@@ -321,8 +318,7 @@ export function searchAllSurfaces(
           matchLen: snip.matchLen,
           marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
         });
-        reqHits++;
-        if (reqHits >= 50 || out.length >= limit) break;
+        if (out.length >= limit) break;
       }
     }
   }
@@ -380,23 +376,21 @@ export function searchAllSurfaces(
                 matchStart: snip.matchStart,
                 matchLen: snip.matchLen,
                 marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
-              });
-              headerHits++;
-              if (headerHits >= 40 || out.length >= limit) break;
-            }
+            });
+            if (out.length >= limit) break;
           }
-        };
-        if (opts.scope.reqHeaders !== false) checkHeaders(entry.reqHeaders, false);
-        if (opts.scope.resHeaders !== false) checkHeaders(entry.resHeaders, true);
-      }
+        }
+      };
+      if (opts.scope.reqHeaders !== false) checkHeaders(entry.reqHeaders, false);
+      if (opts.scope.resHeaders !== false) checkHeaders(entry.resHeaders, true);
     }
   }
+}
 
   // 3b. Search Discovered Routes
   if ((targetSurface === 'all' || targetSurface === 'url' || targetSurface === 'route') && opts.scope.routes !== false && inputs.routes) {
-    let routeHits = 0;
     for (const [rUrl, rInfo] of inputs.routes) {
-      if (routeHits >= 40 || out.length >= limit) break;
+      if (out.length >= limit) break;
       const rMatches = findMatchesInText(rUrl, q, opts.mode, 1);
       if (rMatches.length) {
         const snip = snippet(rUrl, rMatches[0].at, rMatches[0].len);
@@ -417,18 +411,17 @@ export function searchAllSurfaces(
           matchLen: snip.matchLen,
           marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
         });
-        routeHits++;
+        if (out.length >= limit) break;
       }
     }
   }
 
   // 4. Search Reconstructed Source Code (original unminified .ts/.tsx files)
   if ((targetSurface === 'all' || targetSurface === 'source') && opts.scope.sourcemaps !== false && inputs.reconstructedSourceFiles) {
-    let srcHits = 0;
     for (const [path, sf] of inputs.reconstructedSourceFiles) {
-      if (srcHits >= 60 || out.length >= limit) break;
+      if (out.length >= limit) break;
       if (!sf.content) continue;
-      const matches = findMatchesInText(sf.content, q, opts.mode, 2);
+      const matches = findMatchesInText(sf.content, q, opts.mode, 10);
       for (const m of matches) {
         const snip = snippet(sf.content, m.at, m.len);
         let line = 1;
@@ -451,8 +444,7 @@ export function searchAllSurfaces(
           matchLen: snip.matchLen,
           marks: [[snip.matchStart, snip.matchStart + snip.matchLen]],
         });
-        srcHits++;
-        if (srcHits >= 60 || out.length >= limit) break;
+        if (out.length >= limit) break;
       }
     }
   }

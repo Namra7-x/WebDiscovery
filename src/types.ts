@@ -175,7 +175,7 @@ export const DEFAULT_SETTINGS: SessionSettings = {
   budgetMB: 64,
   theme: 'light',
   maxResponseBytes: 2_000_000,
-  maxIndexedChars: 400_000,
+  maxIndexedChars: 1_000_000,
   maxResources: 3000,
   retainRaw: true,
   analyzeSourceMaps: true,
@@ -184,7 +184,7 @@ export const DEFAULT_SETTINGS: SessionSettings = {
   includeBinaryMeta: true,
   onBudget: 'discard-oldest-raw',
   storageMB: 60,
-  maxBodyBytes: 524288,
+  maxBodyBytes: 2_000_000,
   retainBinary: false,
   deep: { concurrency: 3, captureWsFrames: true, runtimeHook: true },
   deepScan: {
