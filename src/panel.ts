@@ -507,11 +507,13 @@ async function ingestText(
       diagOnce('body-budget', 'body-retention budget full — kept metadata only', targetUrl);
       meta.error = 'body skipped: retention budget full';
     } else {
-      if (len > 64 * 1024) {
-        void retainOverflow(targetUrl, capped); // temp-disk overflow backup
+      const old = rawBodies.get(targetUrl);
+      if (old) {
+        ledger.rawBytes = Math.max(0, ledger.rawBytes - old.length);
+        storeRelease('raw-bodies', old.length);
       }
       rawBodies.set(targetUrl, capped);
-      rawOrder.push(targetUrl);
+      if (!old) rawOrder.push(targetUrl);
       ledger.rawBytes += len;
       storeAdd('raw-bodies', len);
     }
@@ -602,7 +604,9 @@ async function ingestText(
       }
     }
 
-    const cleanJs = deobfuscateJsStrings(capped);
+    const cleanJs = (capped.indexOf('\\x') !== -1 || capped.indexOf('\\u') !== -1 || (capped.indexOf('+') !== -1 && capped.indexOf('"') !== -1))
+      ? deobfuscateJsStrings(capped)
+      : capped;
 
     // 2. AST / Token Parameter & Payload Schemas
     const schemas = extractApiCallSchemas(cleanJs);
@@ -1738,9 +1742,8 @@ function hookDevtoolsResources(): void {
     if (!chrome?.devtools?.inspectedWindow?.getResources) return;
     chrome.devtools.inspectedWindow.getResources((resList) => {
       try {
-        for (const res of resList || []) {
-          ingestDevtoolsResource(res);
-        }
+        const queue = (resList || []).slice(0, 300);
+        processDevtoolsResourceQueue(queue);
       } catch { /* ignore */ }
     });
     chrome.devtools.inspectedWindow.onResourceAdded?.addListener((res) => {
@@ -1750,6 +1753,19 @@ function hookDevtoolsResources(): void {
     });
   } catch {
     diag('devtools.inspectedWindow.getResources unavailable');
+  }
+}
+
+function processDevtoolsResourceQueue(queue: chrome.devtools.inspectedWindow.Resource[]): void {
+  if (!queue.length || paused) return;
+  const batch = queue.splice(0, 3);
+  for (const res of batch) {
+    try {
+      ingestDevtoolsResource(res);
+    } catch { /* ignore */ }
+  }
+  if (queue.length > 0) {
+    setTimeout(() => processDevtoolsResourceQueue(queue), 4);
   }
 }
 

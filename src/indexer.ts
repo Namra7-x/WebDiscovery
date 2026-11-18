@@ -26,6 +26,17 @@ function tokenize(norm: string): string[] {
   return toks.slice(0, 24);
 }
 
+function intersectSorted(a: number[], b: number[], cap: number): number[] {
+  const out: number[] = [];
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length && out.length < cap) {
+    if (a[i] === b[j]) { out.push(a[i]); i++; j++; }
+    else if (a[i] < b[j]) i++;
+    else j++;
+  }
+  return out;
+}
+
 export class RamIndex {
   records: TextRecord[] = [];
   /** token -> record ids (bounded postings) */
@@ -100,8 +111,7 @@ export class RamIndex {
       lists.sort((a, b) => a.length - b.length);
       cand = lists[0].slice(0, cap);
       for (let i = 1; i < lists.length && cand.length > 0; i++) {
-        const set = new Set(lists[i]);
-        cand = cand.filter((id) => set.has(id)).slice(0, cap);
+        cand = intersectSorted(cand, lists[i], cap);
       }
     }
     // Prefix sweep: query token 'gpt6' must also match indexed tokens like
