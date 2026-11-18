@@ -4769,24 +4769,38 @@ const HARVEST_INLINE_SCRIPT = `(()=>{
       for (const entry of nf) {
         if (Array.isArray(entry) && typeof entry[1] === 'string') {
           const raw = entry[1];
-          const SEG_RE = /["'](?:app\/)?([a-zA-Z0-9_\-\/\[\]]+?)\/(?:page|route|layout)["']/g;
-          let sm;
-          while ((sm = SEG_RE.exec(raw))) {
-            const seg = '/' + sm[1].replace(/^\/+/, '');
-            if (!seg.startsWith('/_') && !seg.startsWith('/api/') && !appRoutes.includes(seg)) {
-              appRoutes.push(seg);
-              addEndpoint(seg, 'next-app-router');
+          const rawLines = raw.split('"');
+          for (const piece of rawLines) {
+            if (piece.includes('/page') || piece.includes('/route') || piece.includes('/layout')) {
+              const cleaned = piece.replace(/^app\//, '').replace(/\/(?:page|route|layout)$/, '');
+              if (cleaned && !cleaned.startsWith('_') && !cleaned.startsWith('api/')) {
+                const seg = '/' + cleaned.replace(/^\/+/, '');
+                if (!appRoutes.includes(seg)) {
+                  appRoutes.push(seg);
+                  addEndpoint(seg, 'next-app-router');
+                }
+              }
             }
           }
-          const ACT_RE = /\$ACTION_ID_([a-zA-Z0-9_$]+)/g;
-          let am;
-          while ((am = ACT_RE.exec(raw))) {
-            if (!serverActions.includes(am[1])) serverActions.push(am[1]);
+          if (raw.includes('$ACTION_ID_')) {
+            const actParts = raw.split('$ACTION_ID_');
+            for (let i = 1; i < actParts.length; i++) {
+              const actId = actParts[i].split(/[^a-zA-Z0-9_$]/)[0];
+              if (actId && !serverActions.includes(actId)) serverActions.push(actId);
+            }
           }
-          const USER_RE = /["'](?:user|userId|email|username|role)["']\s*:\s*["']([^"']{1,80})["']/g;
-          let um;
-          while ((um = USER_RE.exec(raw))) {
-            addId('rsc_prop', um[1], 'next-rsc');
+          for (const propName of ['user', 'userId', 'email', 'username', 'role']) {
+            const searchKey = '"' + propName + '":"';
+            let idx = raw.indexOf(searchKey);
+            while (idx !== -1) {
+              const startVal = idx + searchKey.length;
+              const endVal = raw.indexOf('"', startVal);
+              if (endVal > startVal && endVal - startVal < 80) {
+                const val = raw.slice(startVal, endVal);
+                addId('rsc_prop', val, 'next-rsc');
+              }
+              idx = raw.indexOf(searchKey, startVal + 1);
+            }
           }
         }
       }
@@ -4803,10 +4817,13 @@ const HARVEST_INLINE_SCRIPT = `(()=>{
       if (src.includes('/_next/static/')) {
         const file = src.split('/').pop() || src;
         if (!nextChunks.includes(file)) nextChunks.push(file);
-        const appMatch = /\/_next\/static\/chunks\/app\/(.+?)\/(?:page|route)-/i.exec(src);
-        if (appMatch) {
-          const r = '/' + appMatch[1].replace(/^\/+/, '');
-          if (!r.startsWith('/_')) addEndpoint(r, 'next-chunk-dom');
+        if (src.includes('/chunks/app/')) {
+          const afterApp = src.split('/chunks/app/')[1] || '';
+          const routePart = afterApp.split('/page-')[0].split('/route-')[0];
+          if (routePart && routePart !== afterApp) {
+            const r = '/' + routePart.replace(/^\/+/, '');
+            if (!r.startsWith('/_')) addEndpoint(r, 'next-chunk-dom');
+          }
         }
       }
     }
