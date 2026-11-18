@@ -1270,8 +1270,12 @@ ok('AI Export: Build Structured AI Dossier with Endpoints & Leaks', () => {
     ]),
     serverActions: [{ id: 'action_hash_1234', name: 'updateProfile' }],
     graphqlOps: [{ name: 'GetUser', type: 'query' }],
+    persistedQueries: [{ id: 'query_hash_abc', name: 'ViewerQuery' }],
     validationSchemas: [{ name: 'UserSchema', fields: [{ field: 'role', type: 'string' }] }],
     stateStores: [{ name: 'zustand/authStore', keys: ['currentUser', 'authToken'] }],
+    resources: [{ url: 'https://api.target.com/static/js/bundle.js', kind: 'script', mime: 'application/javascript', size: 45000 }],
+    sourceFiles: [{ path: 'src/lib/api.ts', size: 1200 }],
+    webSockets: [{ url: 'wss://api.target.com/ws', frames: 42, bytes: 2048 }],
     cloudConfigs: [{ provider: 'firebase', details: { apiKey: 'AIzaSyD-123' } }],
     cspReport: {
       domains: ['api.target.com', 'vault.internal'],
@@ -1287,9 +1291,19 @@ ok('AI Export: Build Structured AI Dossier with Endpoints & Leaks', () => {
   assert.equal(dossier.meta.targetOrigin, 'https://api.target.com');
   assert.equal(dossier.summary.calledEndpoints, 1);
   assert.equal(dossier.summary.uncalledEndpoints, 2); // /api/v1/users and /api/v1/admin/uncalled (not /about)
+  assert.equal(dossier.pageRoutes.length, 1);
+  assert.equal(dossier.pageRoutes[0].route, '/about');
+  assert.equal(dossier.resources.length, 1);
+  assert.equal(dossier.resources[0].kind, 'script');
+  assert.equal(dossier.sourceFiles.length, 1);
+  assert.equal(dossier.sourceFiles[0].path, 'src/lib/api.ts');
+  assert.equal(dossier.webSockets.length, 1);
+  assert.equal(dossier.persistedQueries.length, 1);
   assert.equal(dossier.serverActions.length, 1);
   assert.equal(dossier.validationSchemas.length, 1);
   assert.equal(dossier.clientStateStores.length, 1);
+  assert.equal(dossier.summary.resourcesCount, 1);
+  assert.equal(dossier.summary.pageRoutesCount, 1);
   assert.equal(dossier.summary.validationSchemasCount, 1);
   assert.equal(dossier.summary.clientStateStoresCount, 1);
   assert.equal(dossier.cloudBaaS.length, 1);

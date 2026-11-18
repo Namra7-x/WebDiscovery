@@ -4724,35 +4724,88 @@ function exportTargetWordlist(): void {
  */
 function exportAiDossierFile(): void {
   try {
+    const fwSet = new Set<string>();
+    for (const f of secFindings) {
+      if (f.rule.startsWith('fw-')) {
+        const cleanName = f.label || f.rule.replace(/^fw-/, '');
+        if (cleanName) fwSet.add(cleanName);
+      }
+    }
+    for (const r of resources.keys()) {
+      const lr = r.toLowerCase();
+      if (lr.includes('/_next/') || lr.includes('/__next')) fwSet.add('Next.js');
+      if (lr.includes('/_nuxt/') || lr.includes('/__nuxt')) fwSet.add('Nuxt');
+      if (lr.includes('wp-content') || lr.includes('wp-includes')) fwSet.add('WordPress');
+      if (lr.includes('vue.runtime') || lr.includes('vue.min.js')) fwSet.add('Vue');
+      if (lr.includes('react.production') || lr.includes('react-dom')) fwSet.add('React');
+      if (lr.includes('angular') || lr.includes('@angular')) fwSet.add('Angular');
+      if (lr.includes('svelte')) fwSet.add('Svelte');
+      if (lr.includes('astro')) fwSet.add('Astro');
+      if (lr.includes('tailwind')) fwSet.add('Tailwind CSS');
+      if (lr.includes('supabase')) fwSet.add('Supabase');
+      if (lr.includes('firebase')) fwSet.add('Firebase');
+    }
+
     const input: AiDossierInput = {
       origin: sessionOrigin,
-      frameworks: [],
-      routes: [...routes.keys()],
-      netEntries: netEntries.slice(0, 500).map((n) => ({
+      frameworks: [...fwSet],
+      routes: [...routes.entries()].map(([route, info]) => ({
+        route,
+        method: info.method,
+        count: info.count,
+      })),
+      netEntries: netEntries.map((n) => ({
         method: n.method,
         url: n.url,
         status: n.status,
         mime: n.mime,
+        protocol: n.protocol,
+        initiator: n.initiator,
         reqHeaders: n.reqHeaders,
         resHeaders: n.resHeaders,
         reqBody: n.reqBody,
+      })),
+      resources: [...resources.values()].map((r) => ({
+        url: r.url,
+        kind: r.kind,
+        mime: r.mime,
+        size: r.size,
+        status: r.status,
+        hasSourceMap: r.hasSourceMap,
+        fromCache: r.fromCache,
+        initiator: r.initiator,
+      })),
+      sourceFiles: [...reconstructedSourceFiles.values()].map((sf) => ({
+        path: sf.path,
+        size: sf.content?.length || 0,
+      })),
+      webSockets: [...wsFramesByUrl.entries()].map(([url, frames]) => ({
+        url,
+        frames,
+        bytes: wsBytesByUrl.get(url) || 0,
       })),
       rawBodies,
       apiSchemas: discoveredApiSchemas,
       serverActions: [...discoveredServerActions.values()],
       graphqlOps: [...discoveredGraphQLOps.values()],
+      persistedQueries: [...discoveredPersistedQueries.values()].map((pq) => ({
+        id: pq.id,
+        name: pq.name,
+        kind: pq.kind,
+      })),
       validationSchemas: discoveredValidationSchemas.map((vs) => ({
         name: vs.name,
         fields: vs.fields.map((f) => ({ field: f.field, type: f.type })),
       })),
       stateStores: lastHarvestedStores,
+      harvestData: lastHarvestData || undefined,
       cloudConfigs: discoveredCloudConfigs,
       cspReport: {
         domains: [...discoveredCspDomains],
         internalDomains: [...discoveredInternalDomains],
         cloudBuckets: [...discoveredCloudBuckets],
       },
-      findings: secFindings.slice(0, 500),
+      findings: secFindings,
     };
 
     const dossier = buildAiDossier(input);
@@ -4766,7 +4819,7 @@ function exportAiDossierFile(): void {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    diag(`Export AI Dossier: ${dossier.endpoints.length} endpoints, ${dossier.securityFindings.length} findings (personal cookies & logins redacted)`);
+    diag(`Export AI Dossier: ${dossier.endpoints.length} endpoints, ${dossier.pageRoutes.length} page routes, ${dossier.resources.length} resources, ${dossier.securityFindings.length} findings (personal cookies & logins redacted)`);
   } catch (err) {
     diag(`Export AI Dossier failed: ${String(err).slice(0, 140)}`);
   }
@@ -5100,6 +5153,12 @@ const HARVEST_INLINE_SCRIPT = `(()=>{
 
 let lastHarvestSummary = '';
 let lastHarvestedStores: Array<{ name: string; keys: string[] }> = [];
+let lastHarvestData: {
+  identities?: Array<{ key: string; val: string; source: string }>;
+  tokens?: Array<{ key: string; val: string; source: string }>;
+  endpoints?: Array<{ url: string; source: string }>;
+  stores?: Array<{ name: string; keys: string[] }>;
+} | null = null;
 async function runStateHarvest(): Promise<void> {
   diag('Harvesting client-side runtime state & memory...');
   try {
@@ -5110,8 +5169,11 @@ async function runStateHarvest(): Promise<void> {
       stores?: Array<{ name: string; keys: string[] }>;
     }>(HARVEST_INLINE_SCRIPT);
 
-    if (res?.stores?.length) {
-      lastHarvestedStores = res.stores;
+    if (res) {
+      lastHarvestData = res;
+      if (res.stores?.length) {
+        lastHarvestedStores = res.stores;
+      }
     }
 
     const idCount = res?.identities?.length ?? 0;
@@ -5495,6 +5557,7 @@ function clearSession(prompt = true): boolean {
   discoveredServerActions.clear(); discoveredPersistedQueries.clear(); discoveredValidationSchemas.length = 0;
   discoveredCloudConfigs.length = 0; discoveredCspDomains.clear(); discoveredInternalDomains.clear(); discoveredCloudBuckets.clear();
   lastHarvestedStores.length = 0;
+  lastHarvestData = null;
   secFindings.length = 0; secDropped = 0; secDiagOnce = false; renderedSec.length = 0;
   secShowAll = false; routeShowAll = false; anaKind = 'ALL';
   scanVisited = new Set(); scanQueue = []; scanFetched = 0; discoveredUrls.length = 0; discoveredUrlSet.clear();
